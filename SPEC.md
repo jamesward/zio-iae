@@ -40,10 +40,11 @@ The project has two parts:
   steps unless policy calls for an approval.
 - **An always-on, stateful agent.** One long-running process handles pushes, approvals, conversations, monitors,
   drift, cleanup and cost. Its in-memory state is a working set it can rebuild from git, AWS and Slack.
-- **The agent can change infra; the user's policy decides when a human must approve.** Policy is code in the
-  user's repo, matched against each concrete change (env, resource, change type, risk, who authored it). The
-  agent never holds approval authority, and every mutation goes through the deterministic engine, which enforces
-  the policy.
+- **The agent can change infra; the user's policy decides when a human must approve.** For now the policy is plain
+  English in the user's repo (`.iae/POLICY.md`), applied by an LLM to the structured facts of each change (env,
+  resource, change type, risk, who authored it), inside a fixed floor of built-in rules that fails safe toward
+  asking a human. The agent never holds approval authority, and every mutation goes through the engine, which
+  enforces the verdict.
 - **Slack is the human channel.** Approval requests, questions to humans, and status notices all happen in Slack
   threads. Approvals are reactions by people in a configured Slack user group, verified by the engine through
   Slack's API.
@@ -75,7 +76,7 @@ The project has two parts:
 | **Environment (env)** | A deployment target such as `dev` (Floci), `staging` or `prod`. One AWS account + region per env. |
 | **Observed state** | What the provider reads from AWS for a resource address. |
 | **Plan** | An ordered DAG of `Change`s that takes observed state to the manifest, with a risk level per change. Content-addressed by a hash. |
-| **Policy** | User-written rules in the repo that map each change (env, resource, change type, risk, origin) to `Auto`, `Approve(n, group)` or `Deny`. |
+| **Policy** | The user's approval rules, written in plain English in `.iae/POLICY.md`. Applied to each change (env, resource, change type, risk, origin) to give `Auto`, `Approve(n, groups)` or `Deny`. |
 | **Approval** | Reactions from enough members of the required Slack group on an engine-posted approval request, bound to one env, target manifest and change set, with an expiry. |
 | **Run thread** | The Slack thread for one (app, env, target manifest). All approvals, questions and notices for that rollout go there. |
 | **Engine** | The deterministic library (used by the agent and the `iae` CLI) that does manifest, plan, policy, apply, deploy, verify and evidence. It's the only path that mutates AWS. |
@@ -272,13 +273,14 @@ Alternative: generated clients ([zio-aws](https://github.com/zio/zio-aws)) for t
 
 | Level | What | Backend |
 |---|---|---|
-| Unit | `diff`, `risk`, policy, plan ordering, manifest codec round trip, IAM generation | pure, property-based (zio-test `Gen`) |
+| Unit | `diff`, `risk`, verdict combination and the built-in floor, plan ordering, manifest codec round trip, IAM generation | pure, property-based (zio-test `Gen`) |
 | Client | Each AWS op | Floci |
 | Provider | create, then observe, then diff is empty; update; replace; delete; `apply` idempotency | Floci |
 | Capability | `Bucket[Id]` etc. used by a sample program | Floci with `Cloud.autoProvision` |
 | Engine end-to-end | manifest, plan, apply, re-plan gives an empty plan (`assertConverges`); crash mid-apply then re-run converges; an older commit can't overwrite a newer one (commit guard) | Floci |
 | Agent | Inbox routing and coalescing, reconciler flow, approval verification, restart rehydration, job candidate detection | Floci + `SlackFake` + webhook fixtures |
-| LLM tasks | Tool dispatch, budgets, safety rules (no mutation without policy), prompt-injection fixtures | `ScriptedModel` (zio-bedrock custom origin) |
+| LLM tasks | Tool dispatch, budgets, safety rules (no mutation without policy), prompt-injection fixtures; `EvaluatePolicy` fail-safe paths (bad output, unknown group, unconfident, made-up clause) | `ScriptedModel` (zio-bedrock custom origin) |
+| Policy evals | `EvaluatePolicy` against the example policy and `.iae/policy-examples` | Real model (gated, paid) |
 | Audit Manager | evidence import | in-memory fake; real AWS gated (`IAE_AWS_CONTRACT_TESTS=1`) |
 | Real AWS smoke | One sandbox account, nightly | AWS (gated, paid) |
 
@@ -329,7 +331,8 @@ Split of responsibilities inside the process:
 | Deterministic (engine + router + jobs) | LLM (zio-bedrock tasks) |
 |---|---|
 | Receive and route events; decide what to reconcile | Explain plans in plain language in the run thread |
-| Build manifest, observe, plan, classify risk, evaluate the user's policy | Diagnose failed builds, tests, applies and canaries |
+| Build manifest, observe, plan, classify risk; build change facts; combine verdicts and enforce the built-in floor | Apply the user's natural-language policy to change facts (`EvaluatePolicy`) |
+| | Diagnose failed builds, tests, applies and canaries |
 | Post approval requests; verify approvals through Slack's API | Converse in Slack threads: answer questions, ask for guidance |
 | Apply idempotently with the commit guard; deploy; canary; auto-rollback | Author changes (code, `Infra` declarations, config) as PRs |
 | Detect drift, orphans, idle resources, cost anomalies | Triage alerts; judge cleanup and cost recommendations |
@@ -418,6 +421,7 @@ on the Converse backend with a Claude model on Bedrock (`BEDROCK_MODEL_ID`). Eac
 
 | Task | Started by | Tools (beyond the read-only set) | Ends with |
 |---|---|---|---|
+| `EvaluatePolicy` | Every plan, preview and gated action | none (structured output only) | A `ChangeVerdict` per change |
 | `ExplainPlan` | Approval request posted | — | A thread reply explaining the plan |
 | `DiagnoseFailure` | Failed build, test, apply or canary | workspace edit, `runBuild`, `openPr`, `ask` | A diagnosis, plus a fix PR or a question |
 | `Converse` | Human message in a run thread or a mention of the bot | `ask`, `notify`, `openPr`, `requestReconcile` | A reply |
@@ -433,7 +437,7 @@ on the Converse backend with a Claude model on Bedrock (`BEDROCK_MODEL_ID`). Eac
 - **Effectful tools** never mutate infra directly: editing files in a local workspace, `runBuild` (CodeBuild on a
   `iae/` branch), `openPr` / `updatePr` through the GitHub App, `ask` / `notify` in Slack, `requestReconcile`.
   The gated tools (`rollback`, `proposeCleanup`) go through the engine's policy evaluation and come back with
-  `Done`, `NeedsApproval(requestLink)` or `Denied(rules)`.
+  `Done`, `NeedsApproval(requestLink)` or `Denied(clauses)`.
 - **There is no `apply` tool and no raw AWS or shell tool.** Infra changes reach AWS only by becoming code on
   `main` or a policy-approved engine action.
 - **Untrusted input:** Slack messages, PR text, logs, alert payloads and file contents are passed as data in
@@ -445,13 +449,38 @@ on the Converse backend with a Claude model on Bedrock (`BEDROCK_MODEL_ID`). Eac
   scripted model turns. Task tests are deterministic and check tool dispatch, budgets and the safety rules. For
   local runs against a real model, point it at Bedrock or at [acprock](https://github.com/jamesward/acprock).
 
-### 5.5 Approval policy (user-configured)
+### 5.5 Approval policy (user-configured, natural language)
 
-The user decides what needs a human. zio-iae ships risk classes and a conservative default, but the policy is code
-in the user's repo (`.iae/Policy.scala`), type-checked, unit-testable, and reviewed like any other code.
+The user decides what needs a human, and for now writes it in plain English in `.iae/POLICY.md`. An LLM task
+(`EvaluatePolicy`) reads the policy and the plan and returns a structured verdict. Deterministic code around it
+supplies the facts, enforces a fixed floor of rules, and fails safe.
 
-Risk classes, assigned by providers with these defaults (a provider can raise a specific change's risk; the user
-can't lower a built-in `Critical`):
+Example `.iae/POLICY.md`:
+
+```markdown
+# Approval policy
+
+Approvers are the @infra-approvers Slack group. Owners are @platform-owners.
+
+- Anything in dev can go ahead without asking.
+- Never make a bucket public. Refuse that outright.
+- In prod, deleting or replacing anything needs two owners.
+- Any change that gives an app more IAM permissions needs one approver.
+- If you (the agent) wrote the change and it's more than a low-risk change in prod, ask an approver.
+- Changes to the `orders` table always need an owner, in every env.
+- From Dec 20 to Jan 3 nothing goes to prod without an owner.
+- Cleanup of old container images and task definitions is fine without asking.
+- Otherwise: low and medium risk changes are fine; high risk needs an approver; critical needs two owners.
+```
+
+**Facts, not prose.** The engine builds a structured, typed description of each change and passes only that to
+`EvaluatePolicy`: env; resource kind and id; change type (`Create`, `Update(fields)`, `Replace`, `Delete`, `Move`,
+`Deploy`, `Rollback`, `Cleanup`); risk; derived flags (`iamWidening`, `publicAccess`, `encryptionChange`,
+`dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert`,
+`Drift`, `Cleanup` and `Cost` for changes the background jobs propose, §5.10); author; current date and time. PR
+descriptions, commit messages, Slack text and logs are not included, so they can't argue for a weaker verdict.
+
+Risk classes, assigned by providers with these defaults (a provider can raise a specific change's risk):
 
 | Risk | Examples |
 |---|---|
@@ -460,53 +489,54 @@ can't lower a built-in `Critical`):
 | `High` | Replace of a stateless resource; IAM widening; public-access, encryption or network change; new prod service |
 | `Critical` | Delete or replace of a stateful resource; anything touching data retention |
 
-A policy is a list of rules plus a default. Each rule matches on facts about one change and gives a verdict:
+**Verdict.** `EvaluatePolicy` uses zio-bedrock structured output (`.as[PolicyVerdict]`), one verdict per change:
 
 ```scala
-object Policy extends IaePolicy:
-  val approvers = SlackGroup("infra-approvers")   // Slack user group handle
-  val owners    = SlackGroup("platform-owners")
+enum Decision:
+  case Auto
+  case Approve(count: Int, groups: Set[SlackGroup])
+  case Deny
 
-  val rules = List(
-    rule("dev is free")       .when(env("dev"))                                   .auto,
-    rule("no public buckets") .when(kind(Bucket) && publicAccess)                 .deny,
-    rule("prod deletes")      .when(env("prod") && changeType(Delete, Replace))   .approve(2, owners),
-    rule("iam widening")      .when(iamWidening)                                  .approve(1, approvers),
-    rule("agent in prod")     .when(env("prod") && origin(Agent) && risk >= Medium).approve(1, approvers),
-    rule("hot tables")        .when(resource("orders"))                           .approve(1, owners),
-    rule("holiday freeze")    .when(env("prod") && during(Freeze.holidays))       .approve(1, owners),
-  )
-
-  val default = byRisk(
-    Low      -> Auto,
-    Medium   -> Auto,
-    High     -> Approve(1, approvers),
-    Critical -> Approve(2, owners),
-  )
+final case class ChangeVerdict(
+  change:    ChangeId,
+  decision:  Decision,
+  clauses:   List[String],   // the policy sentences it relied on, quoted
+  reasoning: String,
+  confident: Boolean,
+) derives Schema
 ```
 
-Facts a rule can match: env; resource kind and id; change type (`Create`, `Update(fields)`, `Replace`, `Delete`,
-`Move`, `Deploy`, `Rollback`); risk; derived flags (`iamWidening`, `publicAccess`, `encryptionChange`,
-`dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert`, `Drift`, `Cleanup` and
-`Cost` for changes the background jobs propose, §5.10); time windows.
+The engine then combines and checks it deterministically:
 
-Evaluation:
+- **Most restrictive wins** across the plan's changes: `Deny` beats `Approve`, a larger count beats a smaller one,
+  groups are combined.
+- **Fail safe.** If the call fails, the output doesn't decode, a change has no verdict, `confident` is false,
+  or a quoted clause isn't actually in `POLICY.md`, that change becomes `Approve(1, owners)` and the request says
+  the policy was unclear. Groups must be Slack user groups listed in `.iae/config.json`; any other group becomes
+  `owners`.
+- **Built-in floor.** Code that the policy text can't override:
+  - changes to `.iae/POLICY.md` need `Approve(1, owners)`, where `owners` is set at bootstrap;
+  - changes to the agent's own deployment (§5.12) need `Approve(1, owners)`;
+  - in prod, `Critical` changes need at least `Approve(1, owners)`;
+  - the agent's own policy proposals are never `Auto`.
+  The policy can only add to the floor.
+- **Stable per plan.** The verdict is computed once per (policy text hash, change facts hash) and kept in memory,
+  so re-running a reconcile doesn't re-roll the dice. The executor (§5.11) evaluates independently; if the two
+  differ, the more restrictive one wins.
+- **Visible.** The approval request quotes the clauses and the reasoning, so a human can see *why* approval is
+  needed, and the verdict, clauses and transcript go into evidence (§6). `iae policy explain` runs the same
+  evaluation against a plan without applying anything.
 
-- Every change is evaluated. The plan's verdict is the **most restrictive** across all matching rules (and the
-  default for changes no rule matches): `Deny` beats `Approve`, a larger `n` beats a smaller one, and the required
-  groups are combined. Order doesn't matter, so adding a rule can only tighten things.
-- Each verdict carries the rules that produced it, so the approval request can say *why* approval is needed.
-- `iae policy explain` evaluates the policy against a plan without applying anything, and `iae-testkit` has
-  helpers to unit-test a policy against sample plans.
+**Testing the policy.** `.iae/policy-examples/*.json` holds example change facts with the expected decision.
+When `POLICY.md` changes, the agent runs `EvaluatePolicy` over every example and posts the results in the
+policy-change approval request, so the owners see how the new wording behaves before approving it. Examples
+whose result changed are highlighted.
 
-Guarding the policy itself:
+**Guarding the policy itself.** The policy used for an env is the text at the commit **currently deployed**
+there (read from the `iae:commit` tags, §5.3), not the one being deployed. A change can't loosen its own gate.
 
-- The policy used for an env is the one at the commit **currently deployed** there (read from the `iae:commit`
-  tags, §5.3), not the one being deployed. A change can't loosen its own gate.
-- Any change to `.iae/Policy.scala` is itself a change the engine plans (`PolicyChange`), and a built-in rule that
-  the user can't override requires `Approve(1, owners)` for it, where `owners` is set at bootstrap.
-- The agent may propose policy changes but they never count as `Auto`.
-- Changes to the agent's own deployment (§5.12) always need `Approve(1, owners)`, also built in.
+A typed policy DSL (`.iae/Policy.scala`) can replace or complement the text later. Since both produce the same
+`ChangeVerdict`s, nothing downstream changes (open question Q16).
 
 Agent-authored changes. The agent can change infra by opening PRs (a fix, a tuning change, a new resource). For an
 agent PR the engine previews the plan for each env at the PR head and evaluates policy with `origin = Agent`:
@@ -527,8 +557,8 @@ A stateful resource removed from the manifest isn't deleted by default. It's **o
 When a plan's verdict is `Approve(n, groups)`:
 
 1. The engine posts an **approval request** in the run thread for (app, env, target manifest). It is a structured
-   Slack message from the iae bot: env, commit and PR, the change table with risks, the policy rules that require
-   approval, the required group and count, the expiry, and a footer with the plan hash. If an open request for the
+   Slack message from the iae bot: env, commit and PR, the change table with risks, the policy clauses and reasoning
+   that require approval, the required group and count, the expiry, and a footer with the plan hash. If an open request for the
    same plan exists, the engine reuses it. Older requests for the env are edited to say "superseded".
 2. The agent replies in the thread with a plain-language explanation: what changes, why, blast radius, how to roll
    back, and anything it's unsure about.
@@ -546,7 +576,7 @@ The engine's checks, made with its own Slack token and never trusting the agent:
 - `reactions.get` shows ✅ from at least `n` distinct users who are members of every required group
   (`usergroups.users.list`), are human (not bots), and aren't the change's author (GitHub-to-Slack identity
   mapping in `.iae/config.json`). Any ❌ from a member of a required group rejects it.
-- Not expired (default 24h for prod, configurable in policy).
+- Not expired (default 24h for prod; the policy text can say otherwise).
 - Reuse is impossible without a record: once applied, the recomputed plan is empty and there's nothing left for
   the approval to cover.
 
@@ -554,7 +584,7 @@ Slack attributes each reaction to the real user who added it. So even though the
 bot, it can't produce a human approval.
 
 Evidence (§6) captures the request permalink, the approvers' Slack and mapped GitHub identities, reaction times
-and the matched rules.
+and the policy verdicts with their quoted clauses.
 
 Alternatives considered:
 
@@ -579,7 +609,7 @@ work happens in its thread, so the thread is the conversation's durable record.
 
 | Kind | Posted by | Content | Expects |
 |---|---|---|---|
-| Approval request | engine | Structured plan, matched rules, required group/count, expiry, plan hash | ✅ / ❌ reactions |
+| Approval request | engine | Structured plan, quoted policy clauses and reasoning, required group/count, expiry, plan hash | ✅ / ❌ reactions |
 | Question | agent (`ask` tool) | The situation, the options, the agent's recommendation, and what happens with no answer | A threaded reply |
 | Notice | engine or agent | Applied, deployed, canary step, verified, rolled back, failed, drift found, with links | Nothing |
 | Report | cost / cleanup jobs | Periodic summary with proposals | Reactions or replies per proposal |
@@ -735,7 +765,8 @@ Other credentials, in Secrets Manager in the tooling account:
 - A custom framework **"IAE Change Management"** with custom controls (manual evidence sources):
   - `IAE-CM-1` change originates from a reviewed commit on `main`
   - `IAE-CM-2` automated tests passed for that commit
-  - `IAE-CM-3` plan approved as required by policy: matched rules, policy commit, Slack request permalink,
+  - `IAE-CM-3` plan approved as required by policy: policy commit, verdicts with quoted clauses and the
+    `EvaluatePolicy` transcript, Slack request permalink,
     approvers and reaction times (or auto-approved by policy commit X)
   - `IAE-CM-4` deployment verified (health and canary results)
   - `IAE-CM-5` exceptions: break-glass, rollbacks, failed applies, drift reverts
@@ -795,8 +826,9 @@ A repo managed by zio-iae has:
 ```
 .iae/config.json               # app entry points, envs + accounts/regions, promotion order,
                                #   Slack channel, responder group, GitHub-to-Slack identity mapping
-.iae/Policy.scala              # the user's approval policy (§5.5)
-CODEOWNERS                     # policy owners for .iae/Policy.scala
+.iae/POLICY.md                 # the user's approval policy, plain English (§5.5)
+.iae/policy-examples/*.json    # example changes with expected decisions
+CODEOWNERS                     # policy owners for .iae/POLICY.md
 ```
 
 and the "iae" GitHub App installed.
@@ -809,8 +841,8 @@ and the "iae" GitHub App installed.
 |---|---|---|
 | M0 | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
-| M2 | Engine: plan, policy DSL + evaluation + `iae policy explain`, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
-| M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, approval requests + verification, notices, rehydrate on restart; staging account | A push to `main` converges staging; a gated change waits for ✅; killing the agent mid-run and restarting it converges with no lost approval |
+| M2 | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
+| M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, `EvaluatePolicy` with `POLICY.md` + policy examples, approval requests + verification, notices, rehydrate on restart; staging account | A push to `main` converges staging; a gated change waits for ✅; killing the agent mid-run and restarting it converges with no lost approval |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback | A bad build in staging is rolled back automatically by an alarm |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
@@ -837,6 +869,8 @@ and the "iae" GitHub App installed.
 | Q13 | Bedrock auth for zio-bedrock: short-term API keys minted from the task role vs a long-term key | Short-term keys if minting from role credentials works reliably; otherwise a rotated key in Secrets Manager |
 | Q14 | Mapping GitHub authors to Slack users for the "author can't approve" rule | Explicit mapping in `.iae/config.json`; fall back to email match through Slack's `users.lookupByEmail` |
 | Q15 | Floci coverage for Cost Explorer, Compute Optimizer, Config and Bedrock | Fakes in `iae-testkit` where Floci lacks them; `ScriptedModel` for Bedrock |
+| Q16 | When to add a typed policy DSL alongside or instead of `POLICY.md` | When the examples show the text giving inconsistent verdicts, or when a team wants rules checked at compile time. Same `ChangeVerdict` output, so it's additive |
+| Q17 | Consistency of LLM verdicts across model versions | Pin the model per policy evaluation; re-run `.iae/policy-examples` on a model change and treat differences like a policy change |
 
 ---
 
