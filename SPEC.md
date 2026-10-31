@@ -1,6 +1,6 @@
 # zio-iae: Infrastructure as Effects
 
-Status: **Draft v0.1** (2026-10-31)
+Status: **Draft v0.2** (2026-10-31)
 
 zio-iae makes cloud infrastructure part of a ZIO program's type. An app that needs an S3 bucket asks for one in its
 environment (`ZIO[Bucket[Uploads], ...]`) the same way it asks for any other service. The infrastructure is
@@ -10,19 +10,21 @@ declared once and used for three things:
 2. **At deploy time** it is the desired-state description that an engine reconciles against AWS.
 3. **For security** it generates the app's least-privilege IAM policy from the capabilities the program uses.
 
-A Claude Code scheduled task (routine) runs the pipeline. It reacts to changes on `main`, plans and applies
-infrastructure changes (including changes it authors itself), deploys the app (later with canaries), and records
-evidence in AWS Audit Manager. **The user configures a policy** that says which kinds of changes need a human
+An always-on, stateful agent process runs the pipeline. It receives git pushes through its own GitHub webhook,
+plans and applies infrastructure changes (including changes it authors itself), deploys the app with canaries, and
+records evidence in AWS Audit Manager. The same process runs monitors, drift detection, resource cleanup and cost
+optimisation. Deterministic code makes the decisions that can be made by code; an LLM loop built on
+[zio-bedrock](https://github.com/jamesward/zio-bedrock) handles judgement, conversation and code changes. **The user configures a policy** that says which kinds of changes need a human
 approval. The agent talks to people in **Slack**: it asks for approvals there, asks for guidance when it's unsure,
-and reports what it did. Later the same agent takes production alerts, triages them and proposes
-fixes, which then go through the same pipeline.
+and reports what it did. When production alerts fire, it triages them and proposes fixes, which go through the
+same pipeline.
 
 The project has two parts:
 
 | Part | What it is | Who uses it |
 |---|---|---|
 | **Library** (`iae-core`, `iae-aws`, `iae-aws-client`, `iae-testkit`) | Resource traits, the infra description model, AWS providers, a thin ZIO AWS client, Floci test layers | App developers, in their ZIO programs |
-| **Agent** (`iae-engine`, `iae-agent`, routine prompt, Slack relay) | Deterministic plan/apply/deploy engine exposed as a CLI and MCP server, the Claude Code routine that drives it, and the Slack integration | The routine; humans approving and guiding in Slack |
+| **Agent** (`iae-engine`, `iae-cli`, `iae-agent`, `iae-webhook`) | Deterministic plan/apply/deploy engine, the `iae` CLI, and the always-on agent process (inbox, reconcilers, background jobs, Slack, zio-bedrock LLM tasks) | Runs in a tooling AWS account; humans approve and guide it in Slack |
 
 ---
 
@@ -34,8 +36,10 @@ The project has two parts:
   declared resource that is never used shows up as a warning in the plan.
 - **One declaration, three uses:** runtime layer, desired state, IAM policy.
 - **Capability-scoped traits** (`BucketReader` vs `Bucket`) that map directly to IAM actions.
-- **Agent-managed delivery.** Every merge to `main` converges each environment to `main` HEAD with no human
+- **Agent-managed delivery.** Every push to `main` converges each environment to `main` HEAD with no human
   steps unless policy calls for an approval.
+- **An always-on, stateful agent.** One long-running process handles pushes, approvals, conversations, monitors,
+  drift, cleanup and cost. Its in-memory state is a working set it can rebuild from git, AWS and Slack.
 - **The agent can change infra; the user's policy decides when a human must approve.** Policy is code in the
   user's repo, matched against each concrete change (env, resource, change type, risk, who authored it). The
   agent never holds approval authority, and every mutation goes through the deterministic engine, which enforces
@@ -46,7 +50,7 @@ The project has two parts:
 - **Auditable by construction.** Every change links commit, tests, plan, approval, apply result and deploy
   verification, and is recorded as AWS Audit Manager evidence.
 - **No state file.** State is what is provisioned, read through the cloud's own APIs. The engine keeps no
-  table, file or database of its own to decide what to do (§5.8).
+  table, file or database of its own to decide what to do (§5.3).
 - **Local-first testing.** The whole stack, from the app's use of `Bucket` up to the engine's plan/apply, runs
   against [Floci](https://github.com/floci-io/floci) through Testcontainers.
 
@@ -74,8 +78,9 @@ The project has two parts:
 | **Policy** | User-written rules in the repo that map each change (env, resource, change type, risk, origin) to `Auto`, `Approve(n, group)` or `Deny`. |
 | **Approval** | Reactions from enough members of the required Slack group on an engine-posted approval request, bound to one env, target manifest and change set, with an expiry. |
 | **Run thread** | The Slack thread for one (app, env, target manifest). All approvals, questions and notices for that rollout go there. |
-| **Engine** | The deterministic `iae` program that does manifest, plan, apply, deploy, verify and evidence. It's the only thing that mutates AWS. |
-| **Agent** | Claude in a scheduled task (routine) that calls the engine, explains plans, opens PRs, diagnoses failures, and later triages alerts. |
+| **Engine** | The deterministic library (used by the agent and the `iae` CLI) that does manifest, plan, policy, apply, deploy, verify and evidence. It's the only path that mutates AWS. |
+| **Agent** | The always-on `iae-agent` process: inbox, per-env reconcilers, background jobs, Slack, and LLM tasks built on zio-bedrock. |
+| **Task** | One bounded LLM job inside the agent (explain a plan, diagnose a failure, triage an alert, ...), run as a zio-bedrock loop with a fixed tool set and budget. |
 
 ---
 
@@ -152,7 +157,7 @@ MVP resource kinds and capabilities:
 | `Topic` | SNS | `TopicPublisher`, subscriptions declared in infra | no |
 
 Phase 2: `Service` (container on ECS Fargate behind an ALB, image in ECR). It is a deployable rather than a
-capability: the app *is* the service. See §5.7.
+capability: the app *is* the service. See §5.9.
 
 ### 3.4 Declaring infra: `Infra[R]`
 
@@ -219,7 +224,7 @@ Apps that aren't a single `main` (a library module of shared infra, or several s
   `iae:commit`.
 - **Tags are the ownership record.** There is no state file, so nothing can drift from reality. The engine
   discovers what it owns through the Resource Groups Tagging API and per-service list calls. `iae:commit` is
-  also the concurrency guard (§5.8).
+  also the concurrency guard (§5.3).
 - IAM policies for the deploy role are conditioned on `aws:ResourceTag/iae:managed = true`, so the engine
   can't touch resources it doesn't own.
 
@@ -227,7 +232,7 @@ Apps that aren't a single `main` (a library module of shared infra, or several s
 
 From `Infra.grants` the engine generates one runtime role per app per env, with one statement per (capability,
 resource), for example `BucketReader[Uploads]` gives `s3:GetObject` and `s3:ListBucket` on that bucket only.
-The role is itself a managed resource, so widening it is a plan change with its own risk class (see §5.3).
+The role is itself a managed resource, so widening it is a plan change with its own risk class (see §5.5).
 
 ### 3.8 Provider SPI
 
@@ -271,7 +276,9 @@ Alternative: generated clients ([zio-aws](https://github.com/zio/zio-aws)) for t
 | Client | Each AWS op | Floci |
 | Provider | create, then observe, then diff is empty; update; replace; delete; `apply` idempotency | Floci |
 | Capability | `Bucket[Id]` etc. used by a sample program | Floci with `Cloud.autoProvision` |
-| Engine end-to-end | manifest, plan, apply, re-plan gives an empty plan (`assertConverges`); crash mid-apply then re-run converges; two concurrent runs at different commits converge to the newer one | Floci |
+| Engine end-to-end | manifest, plan, apply, re-plan gives an empty plan (`assertConverges`); crash mid-apply then re-run converges; an older commit can't overwrite a newer one (commit guard) | Floci |
+| Agent | Inbox routing and coalescing, reconciler flow, approval verification, restart rehydration, job candidate detection | Floci + `SlackFake` + webhook fixtures |
+| LLM tasks | Tool dispatch, budgets, safety rules (no mutation without policy), prompt-injection fixtures | `ScriptedModel` (zio-bedrock custom origin) |
 | Audit Manager | evidence import | in-memory fake; real AWS gated (`IAE_AWS_CONTRACT_TESTS=1`) |
 | Real AWS smoke | One sandbox account, nightly | AWS (gated, paid) |
 
@@ -291,50 +298,154 @@ provider behaviour that matters (IAM evaluation, S3 consistency edge cases) also
 
 ---
 
-## 5. Agent and engine
+## 5. The agent
 
-### 5.1 Split of responsibilities
+### 5.1 Architecture
 
-| Engine (`iae`, deterministic Scala) | Agent (Claude in a routine) |
+The agent is an **always-on, stateful Scala/ZIO process** (`iae-agent`) running in a dedicated tooling AWS
+account. It contains the deterministic engine as a library and uses
+[zio-bedrock](https://github.com/jamesward/zio-bedrock) for the LLM parts. There is no Claude Code routine: we
+receive git pushes through our own GitHub webhook, and the long-running jobs (reconcilers, monitors, cleanup, cost
+optimizer) are fibers in the same process.
+
+```
+ GitHub ──webhook──▶ iae-webhook (Lambda, verifies signature) ──▶ SQS inbox ─┐
+ CloudWatch alarms / Config / CloudTrail / Cost Anomaly ──EventBridge──▶ SQS ─┤
+ Slack ◀──Socket Mode (outbound websocket)──────────────────────────────────┐ │
+                                                                            ▼ ▼
+                         ┌──────────────────── iae-agent (ECS Fargate, 1 task) ─────────────────────┐
+                         │ Inbox router ─▶ per-env reconciler fibers ─▶ engine (plan/policy/apply)  │
+                         │             ─▶ background jobs (monitor, drift, cleanup, cost)            │
+                         │             ─▶ LLM tasks (zio-bedrock loop) ─▶ tools (read, ask, PR, ...) │
+                         │ In-memory state: Ref/Queue/Hub; git workspaces on local disk             │
+                         └───────┬──────────────────────┬──────────────────────┬───────────────────┘
+                                 │ assume planner role  │ start builds         │ Bedrock (Claude)
+                                 ▼                      ▼                      ▼
+                         env accounts (staging, prod)  CodeBuild iae-build   Converse API
+```
+
+Split of responsibilities inside the process:
+
+| Deterministic (engine + router + jobs) | LLM (zio-bedrock tasks) |
 |---|---|
-| Build manifest at a commit | Decide which envs to reconcile; run the engine |
-| Observe, plan, classify risk, evaluate the user's policy | Explain plans in plain language in the run thread |
-| Post approval requests to Slack; verify approvals through Slack's API | Ask humans for guidance in Slack when it's unsure, and act on their answers |
-| Apply idempotently with the commit guard, re-observe and resume | Author changes (code, `Infra` declarations, config) as PRs; merge them only as policy allows (§5.3) |
-| Deploy, canary, auto-rollback on alarm | Diagnose failed builds, tests, applies and canaries; propose fixes |
-| Write evidence to S3 + Audit Manager | Summarise outcomes in Slack; later: triage alerts |
-| **Only component holding AWS write credentials** | **Never calls mutating AWS APIs directly** |
+| Receive and route events; decide what to reconcile | Explain plans in plain language in the run thread |
+| Build manifest, observe, plan, classify risk, evaluate the user's policy | Diagnose failed builds, tests, applies and canaries |
+| Post approval requests; verify approvals through Slack's API | Converse in Slack threads: answer questions, ask for guidance |
+| Apply idempotently with the commit guard; deploy; canary; auto-rollback | Author changes (code, `Infra` declarations, config) as PRs |
+| Detect drift, orphans, idle resources, cost anomalies | Triage alerts; judge cleanup and cost recommendations |
+| Write evidence to S3 + Audit Manager | |
+| **Only path to AWS mutations** | **Only gets tools; no raw AWS or shell access** |
 
-The engine is a published application (Scala Next) with two faces:
+Rule of thumb: anything that can be decided by code is decided by code. The LLM is called for judgement, language
+and code changes, and everything it wants to change goes back through the deterministic path and the policy.
 
-- CLI: `iae manifest | plan | apply | deploy | promote | rollback | drift | status | bootstrap`
-- MCP server: `iae --mcp`, the same operations as structured tools that return JSON (plan with risks, policy
-  verdict, per-change apply results), so the agent doesn't parse logs.
+Humans can use the same engine from a laptop through the `iae` CLI (`plan`, `policy explain`, `status`,
+`apply --break-glass`). An MCP server mode (`iae --mcp`) is kept for people who want to drive it from Claude
+Code, but the agent doesn't need it.
 
-The routine's environment setup script installs the engine (for example with coursier) and registers the MCP
-server. The routine's prompt lives in this repo (`agent/ROUTINE.md`) and tells the agent which tools to use and
-in what order.
+### 5.2 Inputs
 
-### 5.2 Triggers
-
-Scheduled tasks support schedule, API (`/fire` with a free-text payload) and GitHub triggers. The GitHub trigger
-covers **pull request, release and issue events, not `push`**. Each event starts its own session, and events
-above an hourly cap are dropped. So:
-
-| Trigger | Mechanism | Purpose |
+| Input | Mechanism | Handled by |
 |---|---|---|
-| **Merge to `main`** (primary) | GitHub trigger `pull_request.closed`, filter *is merged = true*, *base branch = main* | The "git push" event. `main` is protected with a ruleset (no direct pushes, no bypass), so every change arrives this way. |
-| Direct push (fallback) | `.github/workflows/iae-fire.yml` on `push` to `main` that POSTs `{"text": "<repo> <sha>"}` to the routine's `/fire` | Only if direct pushes are allowed. |
-| Reconcile safety net | Schedule, hourly | Catches dropped events, finishes interrupted runs, drift detection. |
-| **Slack activity** | Slack Events API, `iae-slack-relay` Lambda, `/fire` with `slack <channel> <thread_ts>` | A human reacted to an approval request or replied in a run thread (§5.5). |
-| Alerts (phase 3) | CloudWatch alarm, SNS, a small Lambda, `/fire` with the alarm summary | Triage, see §7. |
+| **Push to `main`** | GitHub App webhook (`push`), received by `iae-webhook`, a small Lambda with a Function URL that verifies `X-Hub-Signature-256` and enqueues to the SQS inbox (dedupe by `X-GitHub-Delivery`) | Reconciler for every env of the affected apps |
+| Pull requests | Same webhook (`pull_request`) | Plan preview + policy status check `iae/policy` on the PR; agent-authored PR flow (§5.5) |
+| Slack | Socket Mode: the agent opens an outbound websocket, so there's no public Slack endpoint | Approvals (§5.6), conversations (§5.7) |
+| Alarms | CloudWatch alarm state changes through EventBridge to the inbox | Monitor job (§5.10) |
+| Drift | AWS Config / CloudTrail events on `iae:managed` resources by a principal other than the deployer role, through EventBridge | Drift job (§5.10) |
+| Cost | Cost Anomaly Detection through EventBridge; scheduled Cost Explorer reads | Cost job (§5.10) |
+| Build results | CodeBuild state changes through EventBridge | Reconciler waiting on that build |
+| Timers | `Schedule`s in the process: periodic full reconcile (default 15 min), cleanup (daily), cost review (daily, weekly report), reminders and expiries | The owning job |
 
-**Runs are level-triggered.** An event is only a wake-up. Every run reconciles each env toward the *current*
-`main` HEAD, not the event's sha. Dropped, duplicated or out-of-order events are harmless, and concurrent sessions
-converge through idempotent, commit-guarded changes (§5.8). Fire payloads arrive as untrusted text, so the routine prompt uses them only as hints
-and re-derives everything from git and AWS.
+The agent has **no inbound network endpoint** of its own. GitHub reaches it through the webhook Lambda and SQS;
+Slack through a websocket the agent opens. SQS keeps events while the agent restarts or redeploys (up to 14
+days), and the periodic reconcile covers anything that's lost anyway.
 
-### 5.3 Approval policy (user-configured)
+### 5.3 State
+
+The agent is stateful in memory; infra state still lives only in the cloud.
+
+**What the agent holds** (ZIO `Ref`s, `Queue`s, `Hub`s, and local disk):
+
+- One **reconciler fiber per env**, with a mailbox. Reconciles of an env are serial, and pending triggers
+  coalesce: ten pushes while a reconcile runs cause one follow-up reconcile to the new `main` HEAD.
+- Waits: approvals and questions being waited on, with their reminder and expiry timers.
+- LLM conversations: message history per Slack thread or task, plus token usage against budgets.
+- Builds and deploys in progress (CodeBuild ids, canary step, bake timers).
+- Monitor baselines, recent alarms, cost history windows.
+- Git workspaces: a checkout per repo on local disk, for manifest builds and agent-authored changes.
+
+**What it never holds:** the source of truth for anything. Infra state is read from the cloud's APIs (tags,
+service APIs, CloudTrail), desired state and policy from git, approvals and conversations from Slack. The agent
+keeps no state file, table or database. Its in-memory state is a working set that can be thrown away.
+
+**Restart = rehydrate.** On start (or after a crash or its own redeploy) the agent:
+
+1. Reconciles every env from git + AWS, exactly as the periodic reconcile does.
+2. Lists its open run threads in Slack (recent iae bot messages) to restore pending approvals and questions, and
+   rebuilds each conversation's context from the thread text.
+3. Reads open PRs it authored, and in-progress CodeBuild builds and ECS deployments.
+4. Drains the SQS inbox, which redelivers anything not yet acknowledged.
+
+An LLM task interrupted by a restart isn't resumed mid-loop. It's restarted from its trigger with the context
+rebuilt above. Tasks are written so that re-running them is safe (their side effects are idempotent: same PR
+branch, same thread).
+
+Derived facts, as before:
+
+| Need | Derived from |
+|---|---|
+| What we own | Tags (`iae:app`, `iae:env`, `iae:id`) via the Tagging API and list calls (§3.6) |
+| Whether a resource is current | `iae:spec-hash` and `iae:commit` tags on the resource |
+| Crash recovery | Nothing to resume: every `apply` is idempotent, so a re-run re-observes and the remaining changes are simply the new plan (covered by the approval as a subset, §5.6) |
+| Approvals | Reactions on the engine's approval request, read through Slack's API (§5.6) |
+| Approval already used | The recomputed plan is empty once applied |
+| What is deployed | ECS service, its task definition and deployments (image tag = sha), ALB listener weights |
+| Canary progress | Observed listener weights and ECS deployment rollout state, so an interrupted canary resumes from where the cloud says it is |
+| Promotion gate | The previous env's service is observed running the sha, tagged `iae:verified=<sha>` after its bake window passed |
+| Already built | Image for the sha exists in ECR |
+| How long something has been orphaned or idle | `iae:orphaned=<date>` tag; CloudWatch metrics history |
+| History | CloudTrail, ECS deployment history, the evidence bucket, transcripts. **Write-only** for decisions: never read back to decide anything. |
+
+**Concurrency.** One agent task runs at a time and each env has one reconciler fiber, so applies are serialised
+without a lock. The **commit guard** stays as a safety net for the brief overlap while the agent itself is
+redeployed: before changing a resource, the engine re-reads its `iae:commit` tag and stops if a newer commit has
+already touched it, so an older process can never roll back a newer one.
+
+### 5.4 LLM tasks with zio-bedrock
+
+The agent uses zio-bedrock's `Bedrock.loop` (typed multi-turn loop with tools derived from `zio.schema.Schema`)
+on the Converse backend with a Claude model on Bedrock (`BEDROCK_MODEL_ID`). Each LLM use is a **task**:
+
+| Task | Started by | Tools (beyond the read-only set) | Ends with |
+|---|---|---|---|
+| `ExplainPlan` | Approval request posted | — | A thread reply explaining the plan |
+| `DiagnoseFailure` | Failed build, test, apply or canary | workspace edit, `runBuild`, `openPr`, `ask` | A diagnosis, plus a fix PR or a question |
+| `Converse` | Human message in a run thread or a mention of the bot | `ask`, `notify`, `openPr`, `requestReconcile` | A reply |
+| `Triage` | Alarm (§7) | `rollback` (policy-gated), workspace edit, `runBuild`, `openPr`, `ask` | Rollback, fix PR, or escalation |
+| `ReviewCleanup` | Cleanup job candidates | `proposeCleanup` | Proposals in Slack |
+| `ReviewCost` | Cost job findings | workspace edit, `openPr` | A cost report, and PRs for changes worth making |
+
+- **System prompts** live in the repo (`agent/prompts/<task>.md`) so they're versioned and reviewed. Each task has
+  a turn limit, a token budget and a timeout; daily budgets per task kind are enforced from zio-bedrock's usage
+  metrics.
+- **Read-only tools:** `observe`, `plan`, `policyExplain`, `status`, CloudWatch logs and metrics queries scoped to
+  the app, Cost Explorer queries, git log and diff, file read and search in a workspace, Slack thread read.
+- **Effectful tools** never mutate infra directly: editing files in a local workspace, `runBuild` (CodeBuild on a
+  `iae/` branch), `openPr` / `updatePr` through the GitHub App, `ask` / `notify` in Slack, `requestReconcile`.
+  The gated tools (`rollback`, `proposeCleanup`) go through the engine's policy evaluation and come back with
+  `Done`, `NeedsApproval(requestLink)` or `Denied(rules)`.
+- **There is no `apply` tool and no raw AWS or shell tool.** Infra changes reach AWS only by becoming code on
+  `main` or a policy-approved engine action.
+- **Untrusted input:** Slack messages, PR text, logs, alert payloads and file contents are passed as data in
+  tool results, never as instructions. A prompt injection can at worst produce a bad PR or Slack message, which
+  still has to pass review and policy.
+- **Transcripts:** every task's messages, tool calls and usage go to CloudWatch Logs (`/iae/agent/tasks`), and
+  evidence links to them (§6).
+- **Tests:** zio-bedrock accepts a custom origin, so `iae-testkit` has a `ScriptedModel` server that replays
+  scripted model turns. Task tests are deterministic and check tool dispatch, budgets and the safety rules. For
+  local runs against a real model, point it at Bedrock or at [acprock](https://github.com/jamesward/acprock).
+
+### 5.5 Approval policy (user-configured)
 
 The user decides what needs a human. zio-iae ships risk classes and a conservative default, but the policy is code
 in the user's repo (`.iae/Policy.scala`), type-checked, unit-testable, and reviewed like any other code.
@@ -376,8 +487,8 @@ object Policy extends IaePolicy:
 
 Facts a rule can match: env; resource kind and id; change type (`Create`, `Update(fields)`, `Replace`, `Delete`,
 `Move`, `Deploy`, `Rollback`); risk; derived flags (`iamWidening`, `publicAccess`, `encryptionChange`,
-`dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert` for
-changes made while handling an alert); time windows.
+`dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert`, `Drift`, `Cleanup` and
+`Cost` for changes the background jobs propose, §5.10); time windows.
 
 Evaluation:
 
@@ -391,10 +502,11 @@ Evaluation:
 Guarding the policy itself:
 
 - The policy used for an env is the one at the commit **currently deployed** there (read from the `iae:commit`
-  tags, §5.8), not the one being deployed. A change can't loosen its own gate.
+  tags, §5.3), not the one being deployed. A change can't loosen its own gate.
 - Any change to `.iae/Policy.scala` is itself a change the engine plans (`PolicyChange`), and a built-in rule that
   the user can't override requires `Approve(1, owners)` for it, where `owners` is set at bootstrap.
 - The agent may propose policy changes but they never count as `Auto`.
+- Changes to the agent's own deployment (§5.12) always need `Approve(1, owners)`, also built in.
 
 Agent-authored changes. The agent can change infra by opening PRs (a fix, a tuning change, a new resource). For an
 agent PR the engine previews the plan for each env at the PR head and evaluates policy with `origin = Agent`:
@@ -403,14 +515,14 @@ agent PR the engine previews the plan for each env at the PR head and evaluates 
   agent's identity merge with a required status check `iae/policy` that the engine sets. Human code review
   requirements stay whatever the user configured in GitHub.
 - Otherwise the agent asks for approval in Slack before merging. Approvals bind to the manifest and change set,
-  not the commit (§5.4), so an approval given on the PR preview still covers the run after merge as long as the
+  not the commit (§5.6), so an approval given on the PR preview still covers the run after merge as long as the
   plan hasn't changed.
 
 A stateful resource removed from the manifest isn't deleted by default. It's **orphaned**: tagged
 `iae:orphaned=<date>`, left alone, and reported. Deletion requires the resource to be declared with
 `Retention.Delete` (or an explicit `iae destroy <id>`), and is then `Critical`.
 
-### 5.4 Approvals
+### 5.6 Approvals
 
 When a plan's verdict is `Approve(n, groups)`:
 
@@ -420,9 +532,9 @@ When a plan's verdict is `Approve(n, groups)`:
    same plan exists, the engine reuses it. Older requests for the env are edited to say "superseded".
 2. The agent replies in the thread with a plain-language explanation: what changes, why, blast radius, how to roll
    back, and anything it's unsure about.
-3. **A human approves by reacting ✅** (`:white_check_mark:`) on the request, or rejects with ❌. The Slack relay
-   wakes the routine (§5.5).
-4. The next run recomputes the plan and asks the engine whether it's approved.
+3. **A human approves by reacting ✅** (`:white_check_mark:`) on the request, or rejects with ❌. The agent receives the
+   reaction over Slack Socket Mode (§5.7) and re-runs the env's reconcile.
+4. The reconcile recomputes the plan and asks the engine whether it's approved.
 
 The engine's checks, made with its own Slack token and never trusting the agent:
 
@@ -448,75 +560,69 @@ Alternatives considered:
 
 - *Plan PRs* (approval file merged with CODEOWNERS review): strong GitHub-native trail, but slow and awkward for
   on-call. It could come back as an optional second channel for teams that live in GitHub.
-- *Slack buttons*: nicer UX, but a click isn't recorded anywhere in Slack. The relay would have to record it, as a
-  reply from a separate approvals app whose token only the relay holds. Planned as v2 on top of reactions.
+- *Slack buttons*: nicer UX, and the agent receives clicks over Socket Mode, but a click isn't recorded anywhere
+  in Slack, so the record would have to be a message the agent writes, which the agent could forge. Planned as v2
+  with a separate approvals app whose token only the executor (§5.11) holds.
 - *GitHub Environments with required reviewers*: only gates GitHub Actions jobs. It fits if applies move into
-  Actions (§5.9, option B variant).
+  Actions.
 
 Break-glass: a human with admin AWS access can run `iae apply --break-glass --reason ...` locally. The engine
 posts it to the channel and records it as an exception in Audit Manager.
 
-### 5.5 Slack: the agent's communication channel
+### 5.7 Slack: the agent's communication channel
 
 **Layout.** One channel per app (`#iae-<app>`, configured in `.iae/config.json`), one **run thread** per
-(env, target manifest). Everything about one rollout happens in its thread, so a new session can rebuild the
-whole conversation by reading the thread.
+(env, target manifest), and one thread per alert, cleanup proposal or cost report. Everything about one piece of
+work happens in its thread, so the thread is the conversation's durable record.
 
 **Message kinds:**
 
 | Kind | Posted by | Content | Expects |
 |---|---|---|---|
 | Approval request | engine | Structured plan, matched rules, required group/count, expiry, plan hash | ✅ / ❌ reactions |
-| Question | agent (through the engine's MCP tools) | The situation, the options, the agent's recommendation, and what happens with no answer | A threaded reply |
-| Notice | engine or agent | Applied, deployed, canary step, verified, rolled back, failed, with links | Nothing |
-| Escalation | agent | A question or failure that needs someone now; mentions the on-call group | A reply |
+| Question | agent (`ask` tool) | The situation, the options, the agent's recommendation, and what happens with no answer | A threaded reply |
+| Notice | engine or agent | Applied, deployed, canary step, verified, rolled back, failed, drift found, with links | Nothing |
+| Report | cost / cleanup jobs | Periodic summary with proposals | Reactions or replies per proposal |
+| Escalation | agent | Something that needs someone now; mentions the on-call group | A reply |
 
-**When the agent asks for guidance.** The routine prompt tells the agent to ask instead of guessing when:
-a build, test or apply fails and it isn't confident of the fix; there's more than one reasonable fix with
-different trade-offs; a change it would author is outside what the policy lets it do alone; it sees drift it
-didn't cause; or an alert's cause is unclear.
+**When the agent asks for guidance.** The task prompts tell the agent to ask instead of guessing when: it isn't
+confident of a fix; there's more than one reasonable fix with different trade-offs; a change it would author is
+outside what the policy lets it do alone; it sees drift it didn't cause; or an alert's cause is unclear. People
+can also start a conversation by mentioning the bot in the channel ("why did staging roll back?").
 
-**Asking doesn't block.** The agent posts the question and the session ends. When someone replies, the relay fires
-the routine, and the new session reads the thread and continues. The default for no answer is always to do
-nothing: after a reminder period (default 1h) the agent mentions the group, and when the request expires it
-posts that it stopped.
+**Waiting.** A question parks the task: the conversation stays in memory and the agent does other work. A reply
+arrives over Socket Mode and resumes the task with the reply appended. The default for no answer is always to
+do nothing: after a reminder period (default 1h) the agent mentions the group, and when the wait expires it
+posts that it stopped. After a restart, waits are restored from the thread (§5.3).
 
 **Guidance isn't authorisation.** A reply can steer what the agent does or proposes ("use a new bucket instead of
 renaming it"), but it never authorises an apply. Anything the policy gates still needs ✅ reactions on an engine
-approval request. Replies are accepted only from members of the configured responder group, and the routine
-prompt treats their text as information to weigh, not as instructions that override the policy or the prompt.
+approval request. Replies count only from members of the configured responder group, and the task prompts treat
+their text as information to weigh, not as instructions that override the policy.
 
-**Waking the agent.** Scheduled tasks can't subscribe to Slack directly, so `iae bootstrap` provisions
-`iae-slack-relay`: a Lambda with a Function URL registered as the Slack app's Events API endpoint. It verifies
-Slack's request signature, keeps only relevant events (`reaction_added` on iae bot messages, human `message`
-replies in run threads), and POSTs `slack <channel> <thread_ts>` to the routine's `/fire`. The payload is only a
-pointer: the session re-reads everything from Slack and AWS. The hourly reconcile also re-checks open approval
-requests in case an event was dropped.
+**Identity and tokens.** One Slack app, "iae", with a bot token (post, update, read history and reactions, read
+user groups) and an app-level token for Socket Mode, both in Secrets Manager in the tooling account.
 
-**Identities and tokens.** One Slack app, "iae", with a bot token (post, update, read history and reactions,
-read user groups) and a signing secret (the relay only). The agent uses Slack only through the engine's MCP tools
-(`slack_ask`, `slack_notify`, `slack_read_thread`), so messages look the same and go through one code path.
+**No state.** Conversations and approvals live in Slack and are read back through Slack's API, the same way
+infra is read back through AWS's. Slack message retention for the channel has to be at least the longest
+approval or question expiry (open question Q11).
 
-**No state.** Slack is where the conversation and the approvals live, and they're read back through Slack's API,
-the same way infra is read back through AWS's. Nothing is copied into a store of ours. Evidence copies go to S3
-(write-only, §6). Slack message retention for the channel has to be at least the approval expiry (see open
-question Q11).
-
-### 5.6 Pipeline for one reconcile run
+### 5.8 Pipeline: one env reconcile
 
 ```
+# run by the env's reconciler fiber (§5.3), on a push, an approval, a timer or a drift event
 for env in [staging, prod]:              # promotion order from .iae/config.json
   sha      = main HEAD
-  if env != first and previous env isn't observed running sha verified: continue   # promotion gate (§5.8)
-  build + test at sha                    # sbt Test/compile; test (Floci); skipped if the sha's image is in ECR
+  if env != first and previous env isn't observed running sha verified: continue   # promotion gate (§5.3)
+  build + test at sha                    # CodeBuild: sbt Test/compile; test (Floci); image to ECR. Skipped if the image exists
   manifest = iae manifest @ sha
   plan     = observe + diff (expand phase only: creates/updates, no deletes)
   verdict  = policy(env, plan)
     Deny    -> report, stop env
-    Approve -> approved? continue : (post or reuse the Slack approval request; stop env, resumes on ✅)
+    Approve -> approved? continue : (post or reuse the Slack approval request; wait, resumes on ✅)
     Auto or approved ->
       apply(plan)                        # idempotent, re-observe + commit guard before each change
-      deploy(app image @ sha)            # phase 2, §5.7
+      deploy(app image @ sha)            # §5.9
       verify                             # health + alarms over a bake window
       contract phase: deletes/orphaning (a separate plan; usually Approve in prod)
   evidence(env, sha, plan, approval, results)
@@ -525,69 +631,100 @@ for env in [staging, prod]:              # promotion order from .iae/config.json
 
 **Expand/contract ordering** keeps old and new app versions working during rollout: additive changes go before
 the deploy and removals go after it. A failure at any step stops that env, rolls back the deploy if needed (infra
-expand changes are left in place since they're additive), records evidence, and the agent posts a diagnosis in the run thread, and either proposes a fix PR or asks for
-guidance.
+expand changes are left in place since they're additive), records evidence, and starts a `DiagnoseFailure` task (§5.4): the agent posts a diagnosis in the run thread
+and either proposes a fix PR or asks for guidance.
 
-### 5.7 Deploy and canary (phase 2)
+### 5.9 Deploy and canary
 
-- The build produces a container image (sbt-native-packager Docker) pushed to the env's ECR, tagged with the sha.
+- The build (CodeBuild, §5.8) produces a container image (sbt-native-packager Docker) pushed to ECR, tagged
+  with the sha.
 - `Service` resource: ECS Fargate service with **two target groups** behind an ALB listener with weighted
   forwarding.
 - Canary: start the new task set on the green target group, shift weight `0 → 10 → 50 → 100%` with a bake time at
   each step. CloudWatch alarms (5xx rate, latency p99, plus app-declared alarms in `Infra`) gate each step. If an
-  alarm fires, weight goes back to 0 and the deploy is marked failed. All of this is done by the engine, not the
-  agent.
+  alarm fires, weight goes back to 0 and the deploy is marked failed. All of this is deterministic engine code; the
+  canary watcher is a fiber in the agent process, so a bake window is just a `ZIO.sleep` between checks.
 - Staging gets the same flow with shorter bake times, so the canary machinery runs on every change.
 
-### 5.8 State: none of our own
+### 5.10 Background jobs
 
-The engine has no state file, table or database. Every decision is made from two inputs: the repo at `main` HEAD
-(desired state, policy) and what the cloud APIs report now (observed state). Approvals and guidance are read
-from Slack's API in the same way. Things that usually need
-a state store are derived instead:
+Each job is a supervised fiber with its own `Schedule` and inbox subscription. Jobs find things
+deterministically and hand judgement to an LLM task. Every change they want goes through the policy with the job
+as `origin`, so the user decides how much each job may do alone.
 
-| Need | Derived from |
-|---|---|
-| What we own | Tags (`iae:app`, `iae:env`, `iae:id`) via the Tagging API and list calls (§3.6) |
-| Whether a resource is current | `iae:spec-hash` and `iae:commit` tags on the resource |
-| Crash recovery | Nothing to resume: every `apply` is idempotent, so a re-run re-observes and the remaining changes are simply the new plan (covered by the approval as a subset, §5.4) |
-| Approvals | Reactions on the engine's approval request, read through Slack's API (§5.4) |
-| Approval already used | The recomputed plan is empty once applied (§5.4) |
-| What is deployed | ECS service, its task definition and deployments (image tag = sha), ALB listener weights |
-| Canary progress | Observed listener weights and ECS deployment rollout state, so an interrupted canary resumes from where the cloud says it is |
-| Promotion gate | The previous env's service is observed running the sha, tagged `iae:verified=<sha>` after its bake window passed |
-| Already built | Image for the sha exists in ECR |
-| History | CloudTrail, ECS deployment history, the evidence bucket. These are **write-only** for the engine: evidence is never read to make a decision. |
+**Reconcilers** (§5.8): one per env. Triggered by pushes, approvals, build results and drift, plus a periodic
+full reconcile.
 
-**Concurrency without locks.** Two sessions can run at once (the routine starts one per event). Correctness comes
-from:
+**Monitor.** Watches CloudWatch alarms for every managed app: the defaults (5xx rate, latency, queue age, DLQ
+depth, throttles) and the alarms the app declares in `Infra`. Alarms open a `Triage` task (§7). The monitor also
+does a periodic health sweep and posts a notice when an env degrades without an alarm firing.
 
-- **Commit guard:** before changing a resource, the engine re-reads its `iae:commit` tag. If that commit is a
-  descendant of the one this run targets, the resource is newer and the run stops for that env. So an older run
-  can never roll back a newer one, and two runs at the same commit make the same idempotent changes.
-- **Re-observe before each change**, so a run never acts on a stale read for longer than one API call.
-- **Serialisation by infrastructure** once applies move to the in-account executor (§5.9, option B): the executor
-  is a CodeBuild project with a concurrent build limit of 1 per env. That's configuration of a provisioned
-  resource, not a state store.
+**Drift.** AWS Config and CloudTrail events on `iae:managed` resources from a principal other than the deployer
+role mean someone changed infra by hand. The agent posts what changed and who did it, then plans a revert to the
+manifest. The revert is a normal plan, gated by policy (`origin = Drift`), with the drift described in the
+approval request. If the hand change should stay, the answer is a PR changing the `Infra` declaration.
 
-The remaining race window (between the guard's read and the write) is accepted for MVP. It's covered by the
-level-triggered design: the next run sees the result and converges.
+**Cleanup.** Daily. Candidates:
 
-### 5.9 Credentials and trust boundary
+- orphaned resources (`iae:orphaned=<date>`) older than the retention window in policy;
+- resources tagged for an app or env that no longer exists in any repo's manifest;
+- idle resources: no requests or messages for N days, from CloudWatch metrics;
+- old ECR images and task definitions beyond the last N per app and env, never one that's deployed or the
+  rollback target.
 
-Routine sessions are ephemeral cloud containers with env vars set per environment, so whatever credentials the
-engine uses are visible to anyone who can use that environment.
+`ReviewCleanup` groups them and adds context ("bucket still has 12 GB, last written 94 days ago"). Each
+proposal is a plan with `origin = Cleanup`: deleting stateful resources is `Critical`, so it needs approvals by
+default, while old images and task definitions can be `Auto` if the user's policy allows.
 
-- **Option A (MVP):** the routine environment holds credentials for an `iae-deployer` role per env, and the
-  Slack bot token. The role can
-  only touch `iae:managed` resources and has a permissions boundary; it has no IAM wildcard. The engine enforces
-  policy and approvals. Risk: a compromised session could bypass the engine with the same credentials.
-- **Option B (target):** the routine holds only an `iae-planner` read role plus permission to start an **in-account
-  apply executor** (Step Functions or CodeBuild running the same engine). The executor re-verifies the approval
-  against Slack with its own token and holds the write role. The agent can then propose and observe but can't mutate on its own. A
-  variant runs the executor in GitHub Actions with OIDC and Environments.
+**Cost optimizer.** Daily data collection, weekly report:
 
-We start with A against non-prod accounts and move to B before managing prod. See open question Q5.
+- Cost Explorer by the `iae:app` and `iae:env` cost-allocation tags (activated by `iae bootstrap`);
+- Cost Anomaly Detection events (immediate notice);
+- Compute Optimizer recommendations and CloudWatch utilisation for services;
+- storage patterns (S3 access, DynamoDB capacity mode fit).
+
+`ReviewCost` decides which findings are worth acting on. Because desired state is code, every optimisation is a
+**PR to the `Infra` declaration** (right-size a `Service`, switch a table's capacity mode, add a lifecycle
+rule), with the expected savings in the description. It then goes through the normal pipeline and policy
+(`origin = Cost`).
+
+### 5.11 Credentials and trust boundary
+
+The agent runs in its own **tooling account** on ECS Fargate with a task role. There are no long-lived AWS keys.
+
+- **Planner role** in each env account (read-only, plus CloudWatch and Cost Explorer reads). The agent process
+  assumes it for observing, planning, monitoring and cost.
+- **Deployer role** in each env account (writes, limited to `iae:managed` resources, with a permissions
+  boundary, no IAM wildcard).
+- **Phase 1:** the agent process can assume the deployer role, and only the engine's apply path does so, after
+  the policy and approval checks. The LLM has no tool that reaches it.
+- **Phase 2 (before prod):** a separate **executor** service (same engine code, no LLM, its own task role) is the
+  only principal that can assume deployer roles. The agent sends it (env, target commit, plan hash, approval
+  link). The executor recomputes the plan, re-evaluates the policy and re-verifies the approval against Slack with
+  its own token before applying. A compromised agent process can then propose but not mutate.
+
+Other credentials, in Secrets Manager in the tooling account:
+
+- **GitHub App** "iae": private key and webhook secret. Installation tokens for cloning, branches, PRs, statuses,
+  deployments, and reading reviews for evidence. Branch protection lets the app push only `iae/` branches.
+- **Slack**: bot token and Socket Mode app token.
+- **Bedrock**: zio-bedrock authenticates with a Bedrock API key (bearer token), not SigV4. The agent mints
+  short-term Bedrock API keys from its task role and refreshes them; a long-term key in Secrets Manager is the
+  fallback (open question Q13).
+
+### 5.12 Running and deploying the agent
+
+- `iae bootstrap` (run once by a human with admin credentials) creates the tooling account pieces: the agent
+  service, SQS inbox, `iae-webhook` Lambda, EventBridge rules (including cross-account forwarding from env
+  accounts), CodeBuild `iae-build`, roles, secrets placeholders, plus the per-env roles, evidence buckets and Audit
+  Manager setup (§6).
+- The agent is an `InfraApp` itself: its inbox queue, roles and service are declared with zio-iae. After bootstrap
+  the agent deploys new versions of itself through its own pipeline, and a built-in policy rule requires
+  `Approve(1, owners)` for any change to the agent's own deployment.
+- One running task (desired count 1). ECS deploys it stop-before-start, so there's a short gap rather than two
+  agents. Events queue in SQS meanwhile, and the commit guard covers any overlap.
+- Locally, `iae-agent` runs against Floci (AWS), a test Slack workspace, a webhook forwarded from GitHub (or
+  replayed fixtures), and a real or scripted model.
 
 ---
 
@@ -601,15 +738,14 @@ We start with A against non-prod accounts and move to B before managing prod. Se
   - `IAE-CM-3` plan approved as required by policy: matched rules, policy commit, Slack request permalink,
     approvers and reaction times (or auto-approved by policy commit X)
   - `IAE-CM-4` deployment verified (health and canary results)
-  - `IAE-CM-5` exceptions: break-glass, rollbacks, failed applies
+  - `IAE-CM-5` exceptions: break-glass, rollbacks, failed applies, drift reverts
 - An assessment over that framework scoped to the env account, plus optionally a standard framework (such as SOC 2)
   so CloudTrail/Config automated evidence about the same resources sits next to ours.
 - An evidence bucket `iae-evidence-<env>` with Object Lock (compliance mode) and versioning.
-- The `iae-slack-relay` Lambda (§5.5), with the Slack signing secret in Secrets Manager.
 
 For each reconcile of an env, the engine writes one JSON evidence document per control to the evidence bucket
 (commit, PR + reviewers, test summary, plan hash + changes, approval refs, per-change apply results, CloudTrail event IDs,
-canary results) and imports it with `BatchImportEvidenceToAssessmentControl` (`s3ResourcePath`). Evidence is
+canary results, and links to the LLM transcripts of any agent tasks involved, §5.4) and imports it with `BatchImportEvidenceToAssessmentControl` (`s3ResourcePath`). Evidence is
 batched per run because manual evidence is limited to 100 uploads per control per day.
 
 Audit Manager has no Floci emulation. `iae-testkit` provides `AuditManagerFake` (records imports, enforces the
@@ -617,21 +753,20 @@ daily limit), and contract tests run against a real account when gated on.
 
 ---
 
-## 7. Later: monitors and triage (phase 3)
+## 7. Alert triage
 
-- An alert fires the routine through `/fire` with the alarm summary.
-- The agent gets read-only investigation tools from the engine's MCP server (`iae status`, recent deployments,
-  CloudWatch logs and metrics queries scoped to the app) plus the repo.
+- An alarm reaches the monitor (§5.10), which opens a `Triage` task and a Slack thread for the alert.
+- The agent investigates with read-only tools: recent deployments and their canary results, CloudWatch logs and
+  metrics scoped to the app, recent commits and PRs, the current plan (is there drift?).
 - Possible outcomes:
-  1. **Recent deploy correlates:** the engine runs `iae rollback <env>` if policy allows it for
-     `origin = Alert` (it returns to a state that was already approved); otherwise it asks in Slack.
-  2. **Code fix:** the agent opens a PR with a fix and a regression test, linking the alert. It goes through
-     review and the normal pipeline, with canary.
-  3. **Infra tuning** (such as queue visibility or concurrency): a PR changing the `Infra` declaration, so the change
-     is reviewed like any other.
-  4. **Unknown:** the agent posts its triage notes as an escalation in Slack and asks for guidance.
-- The agent never mutates prod outside the pipeline. Rollback is the only fast path, and it's policy-gated.
-  Each alert gets its own Slack thread, linked from the run threads of any changes it leads to.
+  1. **Recent deploy correlates:** the agent calls `rollback`. The engine runs it if policy allows it for
+     `origin = Alert` (it returns to a state that was already approved); otherwise it posts an approval request.
+  2. **Code fix:** the agent makes the change in a workspace, builds it in CodeBuild with a regression test, and
+     opens a PR linking the alert. It goes through review and the normal pipeline, with canary.
+  3. **Infra tuning** (queue visibility, concurrency, capacity): a PR changing the `Infra` declaration.
+  4. **Unknown:** the agent posts its triage notes as an escalation and asks for guidance.
+- The agent keeps the alert thread open until the alarm clears, then posts a summary. It never mutates prod
+  outside the pipeline; rollback is the only fast path, and it's policy-gated.
 
 ---
 
@@ -643,25 +778,28 @@ zio-iae/
   AGENTS.md                    # project facts; follows zen-of-projects
   SPEC.md                      # this document
   modules/
-    core/        aws-client/   aws/        testkit/      # library (Scala LTS)
-    engine/      agent/                                  # application (Scala Next): CLI + MCP server
+    core/  aws-client/  aws/  testkit/       # library (Scala LTS)
+    engine/                                  # plan, policy, apply, deploy, evidence (library used by agent + CLI)
+    cli/                                     # `iae` CLI (and optional MCP server mode)
+    agent/                                   # always-on agent: inbox, reconcilers, jobs, Slack, zio-bedrock tasks
+    webhook/                                 # iae-webhook Lambda: verify GitHub signature, enqueue to SQS
   agent/
-    ROUTINE.md                 # the scheduled task's prompt (when to ask in Slack, how to treat replies)
-    setup.sh                   # environment setup script: installs iae, registers MCP
-  modules/slack-relay/         # the Slack Events relay Lambda
+    prompts/                   # system prompts per LLM task (ExplainPlan.md, DiagnoseFailure.md, ...)
   examples/
     photo-app/                 # InfraApp using Bucket + Queue; end-to-end on Floci
-  .github/workflows/           # CI (build + Floci tests); optional iae-fire.yml
+  .github/workflows/           # CI for this repo (build + Floci tests)
 ```
 
-A repo using zio-iae has:
+A repo managed by zio-iae has:
 
 ```
 .iae/config.json               # app entry points, envs + accounts/regions, promotion order,
                                #   Slack channel, responder group, GitHub-to-Slack identity mapping
-.iae/Policy.scala              # the user's approval policy (§5.3)
+.iae/Policy.scala              # the user's approval policy (§5.5)
 CODEOWNERS                     # policy owners for .iae/Policy.scala
 ```
+
+and the "iae" GitHub App installed.
 
 ---
 
@@ -671,11 +809,12 @@ CODEOWNERS                     # policy owners for .iae/Policy.scala
 |---|---|---|
 | M0 | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
-| M2 | Engine: plan, policy DSL + evaluation + `iae policy explain`, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation | `assertConverges` end-to-end on Floci for the example app, including crash/re-run and concurrent runs |
-| M3 | Routine + MCP server; merge trigger; Slack app, relay, approval requests + verification, questions and notices; staging account | A merged PR that changes infra converges staging; a change the policy gates waits for ✅ in Slack; the agent asks a question, gets a reply and continues in a new session |
-| M4 | Audit Manager bootstrap + evidence; prod account; credentials option B; agent-authored PRs merged under policy | Prod change with approval produces evidence for IAE-CM-1..4 |
-| M5 | `Service` + ECR + ALB canary + auto-rollback | Bad build in staging is rolled back automatically by an alarm |
-| M6 | Alert trigger + triage tools | Synthetic alarm results in a rollback or a fix PR |
+| M2 | Engine: plan, policy DSL + evaluation + `iae policy explain`, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
+| M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, approval requests + verification, notices, rehydrate on restart; staging account | A push to `main` converges staging; a gated change waits for ✅; killing the agent mid-run and restarting it converges with no lost approval |
+| M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
+| M5 | `Service` + ECR + ALB canary + auto-rollback | A bad build in staging is rolled back automatically by an alarm |
+| M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
+| M7 | Cleanup + cost optimizer jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR |
 
 ---
 
@@ -685,18 +824,19 @@ CODEOWNERS                     # policy owners for .iae/Policy.scala
 |---|---|---|
 | Q1 | Package and artifact naming: `zio.iae` / `dev.zio`-style vs `com.jamesward` | `zio.iae` package, `com.jamesward` org, unless it moves under the ZIO org |
 | Q2 | Resource identity via singleton-type `Tag`s: verify izumi-reflect stability; fallback to marker traits | Spike in M1 |
-| Q3 | Hand-written `iae-aws-client` vs zio-aws vs Java SDK v2 | Hand-written for the ~40 ops we need (ZIO-native streams, Scala 3, small footprint); revisit if the surface grows |
-| Q4 | Manifest extraction: running `main --iae-manifest` via sbt per commit is slow | Reuse within a session only (no persisted cache); later an sbt task that only links the `infra` value |
-| Q5 | Move to credentials option B before prod? Executor in Step Functions/CodeBuild vs GitHub Actions + OIDC | B before prod; pick executor in M4 |
-| Q6 | Engine's GitHub token for evidence (PR reviewers for IAE-CM-1) and the `iae/policy` status check | Fine-grained token in the env, or moves into the executor (B) |
+| Q3 | Hand-written `iae-aws-client` vs zio-aws vs Java SDK v2 | Hand-written for the ops we need (ZIO-native streams, Scala 3, small footprint); revisit if the surface grows |
+| Q4 | Manifest extraction: running `main --iae-manifest` via sbt per commit is slow | Do it in CodeBuild alongside the build; keep the result in memory for the commit; later an sbt task that only links the `infra` value |
+| Q5 | When to split out the executor (§5.11) | Before managing prod (M4) |
+| Q6 | Does the agent need durable memory beyond what it can rehydrate (learned facts about a system, runbooks)? | If so, as markdown in the repo (`.iae/agent/notes/`) written through PRs, so it's reviewed and versioned rather than a hidden store |
 | Q7 | Multi-app repos and shared infra (VPC, ALB, DNS zone) owned by a platform `InfraModule` | Platform module with its own Slack channel and policy; apps reference it by id |
 | Q8 | Multi-region / multi-account per env | Out of scope until M5 |
-| Q9 | Scheduled-task event caps and research-preview churn | Level-triggered design + hourly reconcile makes dropped events harmless; keep the routine prompt thin so the engine holds the logic |
-| Q10 | Is the commit guard's small read-then-write race acceptable before option B serialises applies? | Yes for non-prod; prod waits for B |
-| Q11 | Slack retention and audit: approvals must stay readable for at least their expiry; long-term proof is the S3 evidence copy | Require channel retention ≥ 30 days; document it in bootstrap |
-| Q12 | Use Claude in Slack (Claude Tag) for the conversational side instead of relay + routine? | Start with relay + routine so the engine and policy stay in one place; revisit once approvals are stable |
-| Q13 | Reactions (v1) vs buttons with a separate approvals app (v2) | Reactions first: no extra endpoint state, unforgeable attribution |
+| Q9 | High availability: one agent task vs. leader election | One task; SQS buffers during restarts and the commit guard covers overlap. Revisit if restart gaps hurt |
+| Q10 | Commit guard read-then-write race during agent redeploys | Accept; stop-before-start makes the overlap rare and the next reconcile converges |
+| Q11 | Slack retention and audit: approvals and questions must stay readable at least until they expire; long-term proof is the S3 evidence copy | Require channel retention ≥ 30 days; checked at bootstrap |
+| Q12 | Reactions (v1) vs buttons with a separate approvals app (v2) | Reactions first: unforgeable attribution and no extra endpoint |
+| Q13 | Bedrock auth for zio-bedrock: short-term API keys minted from the task role vs a long-term key | Short-term keys if minting from role credentials works reliably; otherwise a rotated key in Secrets Manager |
 | Q14 | Mapping GitHub authors to Slack users for the "author can't approve" rule | Explicit mapping in `.iae/config.json`; fall back to email match through Slack's `users.lookupByEmail` |
+| Q15 | Floci coverage for Cost Explorer, Compute Optimizer, Config and Bedrock | Fakes in `iae-testkit` where Floci lacks them; `ScriptedModel` for Bedrock |
 
 ---
 
