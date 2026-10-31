@@ -1,0 +1,12 @@
+{
+  "mcpServers" : {
+    "sbta" : {
+      "type" : "stdio",
+      "command" : "./sbta",
+      "args" : [
+        "--mcp"
+      ],
+      "timeout" : 1800000
+    }
+  }
+}

@@ -1,0 +1,7 @@
+target/
+.bsp/
+.kiro/skills/
+.idea/
+.vscode/
+.metals/
+.bloop/
