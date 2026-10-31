@@ -38,6 +38,8 @@ The project has two parts:
   authority, and every mutation goes through the deterministic engine, which enforces policy.
 - **Auditable by construction.** Every change links commit, tests, plan, approval, apply result and deploy
   verification, and is recorded as AWS Audit Manager evidence.
+- **No state file.** State is what is provisioned, read through the cloud's own APIs. The engine keeps no
+  table, file or database of its own to decide what to do (§5.7).
 - **Local-first testing.** The whole stack, from the app's use of `Bucket` up to the engine's plan/apply, runs
   against [Floci](https://github.com/floci-io/floci) through Testcontainers.
 
@@ -207,8 +209,9 @@ Apps that aren't a single `main` (a library module of shared infra, or several s
 - Physical name: `<app>-<env>-<id>`, plus a short stable hash suffix where AWS needs global uniqueness (S3).
 - Every managed resource is tagged `iae:app`, `iae:env`, `iae:id`, `iae:kind`, `iae:spec-hash`,
   `iae:commit`.
-- **Tags are the ownership record.** There is no separate state file to drift from reality. The engine
-  discovers what it owns through the Resource Groups Tagging API and per-service list calls.
+- **Tags are the ownership record.** There is no state file, so nothing can drift from reality. The engine
+  discovers what it owns through the Resource Groups Tagging API and per-service list calls. `iae:commit` is
+  also the concurrency guard (§5.7).
 - IAM policies for the deploy role are conditioned on `aws:ResourceTag/iae:managed = true`, so the engine
   can't touch resources it doesn't own.
 
@@ -260,7 +263,7 @@ Alternative: generated clients ([zio-aws](https://github.com/zio/zio-aws)) for t
 | Client | Each AWS op | Floci |
 | Provider | create, then observe, then diff is empty; update; replace; delete; `apply` idempotency | Floci |
 | Capability | `Bucket[Id]` etc. used by a sample program | Floci with `Cloud.autoProvision` |
-| Engine end-to-end | manifest, plan, apply, re-plan gives an empty plan (`assertConverges`); crash mid-apply then resume; lock contention | Floci + in-memory state fakes |
+| Engine end-to-end | manifest, plan, apply, re-plan gives an empty plan (`assertConverges`); crash mid-apply then re-run converges; two concurrent runs at different commits converge to the newer one | Floci |
 | Audit Manager | evidence import | in-memory fake; real AWS gated (`IAE_AWS_CONTRACT_TESTS=1`) |
 | Real AWS smoke | One sandbox account, nightly | AWS (gated, paid) |
 
@@ -288,7 +291,7 @@ provider behaviour that matters (IAM evaluation, S3 consistency edge cases) also
 |---|---|
 | Build manifest at a commit | Decide which envs to reconcile; run the engine |
 | Observe, plan, classify risk, evaluate policy | Explain the plan in plain language in the plan PR |
-| Acquire locks, apply, journal, resume | Open, update and close plan PRs |
+| Apply idempotently with the commit guard, re-observe and resume | Open, update and close plan PRs |
 | Verify approvals (GitHub API), bind them to the plan hash | Diagnose failed builds, tests, applies and canaries; open fix PRs (never push to `main`) |
 | Deploy, canary, auto-rollback on alarm | Summarise outcomes; later: triage alerts and propose fixes |
 | Write evidence to S3 + Audit Manager | |
@@ -298,7 +301,7 @@ The engine is a published application (Scala Next) with two faces:
 
 - CLI: `iae manifest | plan | apply | deploy | promote | rollback | drift | status | bootstrap`
 - MCP server: `iae --mcp`, the same operations as structured tools that return JSON (plan with risks, policy
-  verdict, apply journal), so the agent doesn't parse logs.
+  verdict, per-change apply results), so the agent doesn't parse logs.
 
 The routine's environment setup script installs the engine (for example with coursier) and registers the MCP
 server. The routine's prompt lives in this repo (`agent/ROUTINE.md`) and tells the agent which tools to use and
@@ -319,7 +322,7 @@ above an hourly cap are dropped. So:
 
 **Runs are level-triggered.** An event is only a wake-up. Every run reconciles each env toward the *current*
 `main` HEAD, not the event's sha. Dropped, duplicated or out-of-order events are harmless, and concurrent sessions
-serialise on a per-env lock. Fire payloads arrive as untrusted text, so the routine prompt uses them only as hints
+converge through idempotent, commit-guarded changes (§5.7). Fire payloads arrive as untrusted text, so the routine prompt uses them only as hints
 and re-derives everything from git and AWS.
 
 ### 5.3 Risk and policy
@@ -353,8 +356,8 @@ audit trail.
 
 1. The engine computes a plan for an env, and policy returns `Approve(n)`.
 2. The agent pushes branch `claude/iae-plan/<env>/<plan-hash-prefix>` with one file,
-   `.iae/approvals/<env>/<plan-hash>.json` (env, base commit, plan hash, the observed-state hash it was computed
-   from, the change list, expiry), and opens a PR titled `[iae] <env>: <summary>`. The body has the agent's
+   `.iae/approvals/<env>/<plan-hash>.json` (env, the target commit's manifest hash, plan hash, the
+   observed-state hash it was computed from, the change list, expiry), and opens a PR titled `[iae] <env>: <summary>`. The body has the agent's
    plain-language explanation, the full change table with risks, the blast radius, and the rollback story. If an
    older open plan PR exists for the env, the agent closes it as superseded.
 3. CODEOWNERS for `.iae/approvals/**` names the approver team, and the `main` ruleset requires their review
@@ -365,14 +368,16 @@ audit trail.
 
 Engine-side checks before applying an approved plan. The engine doesn't trust the agent for any of these:
 
-- The recomputed plan hash equals the approved hash. If anything drifted, the plan is stale and a new plan PR
-  is opened.
+- The recomputed plan is covered by the approval: same target manifest hash, and its changes are a subset of the
+  approved changes. A subset is allowed so a crashed apply can finish without re-approval, because the changes
+  already made simply drop out of the recomputed plan. Any change not in the approved set (drift, or a newer
+  commit) means the plan is stale, and a new plan PR is opened.
 - Through the GitHub API (engine's own read-only token): the PR that added the file was merged into `main`, has
   ≥ n approving reviews from members of the approver team, and no approver is the PR author or the agent's
   identity.
 - Not expired (default 24h for prod).
-- The approval file is never reused. After applying, the engine records `applied` in the state table, keyed by
-  plan hash.
+- Reuse is impossible without any record of it: once applied, the observed state matches the manifest, the
+  recomputed plan is empty, and there is nothing left for the approval to authorise.
 
 Alternatives considered:
 
@@ -390,24 +395,21 @@ records it as an exception in Audit Manager.
 
 ```
 for env in [staging, prod]:              # promotion order from .iae/config.json
-  lock(env)                              # DynamoDB conditional write with lease; skip if held
-  resume any incomplete apply journal for env
   sha      = main HEAD
-  if env != first and sha not yet verified in previous env: continue      # promotion gate
-  build + test at sha                    # sbt Test/compile; test (Floci); result cached by sha
+  if env != first and previous env isn't observed running sha verified: continue   # promotion gate (§5.7)
+  build + test at sha                    # sbt Test/compile; test (Floci); skipped if the sha's image is in ECR
   manifest = iae manifest @ sha
   plan     = observe + diff (expand phase only: creates/updates, no deletes)
   verdict  = policy(env, plan)
     Deny    -> report, stop env
     Approve -> ensure plan PR open; stop env (resumes on merge)
     Auto or approved ->
-      apply(plan)                        # journaled, idempotent
+      apply(plan)                        # idempotent, re-observe + commit guard before each change
       deploy(app image @ sha)            # phase 2, §5.6
       verify                             # health + alarms over a bake window
       contract phase: deletes/orphaning (a separate plan; usually Approve in prod)
   evidence(env, sha, plan, approval, results)
-  GitHub Deployment status for (env, sha)
-  unlock(env)
+  GitHub Deployment status for (env, sha)   # display only, never read back
 ```
 
 **Expand/contract ordering** keeps old and new app versions working during rollout: additive changes go before
@@ -426,18 +428,37 @@ on the merged PR or open a fix PR.
   agent.
 - Staging gets the same flow with shorter bake times, so the canary machinery runs on every change.
 
-### 5.7 State
+### 5.7 State: none of our own
 
-Each env account has a small, engine-owned DynamoDB table `iae-state` (created by `iae bootstrap`):
+The engine has no state file, table or database. Every decision is made from two inputs: the repo at `main` HEAD
+(desired state, policy, approvals) and what the cloud APIs report now (observed state). Things that usually need
+a state store are derived instead:
 
-| Item | Key | Purpose |
-|---|---|---|
-| Lock | `lock#<env>` | Lease with owner session id and expiry; conditional writes |
-| Plan record | `plan#<hash>` | Plan, verdict, approval ref, status (`pending/applying/applied/failed`) |
-| Apply journal | `journal#<hash>#<step>` | Per-change progress for crash-safe resume |
-| Deployment | `deploy#<env>#<sha>` | Canary steps, verification result |
+| Need | Derived from |
+|---|---|
+| What we own | Tags (`iae:app`, `iae:env`, `iae:id`) via the Tagging API and list calls (§3.6) |
+| Whether a resource is current | `iae:spec-hash` and `iae:commit` tags on the resource |
+| Crash recovery | Nothing to resume: every `apply` is idempotent, so a re-run re-observes and the remaining changes are simply the new plan (covered by the approval as a subset, §5.4) |
+| Approval already used | The recomputed plan is empty once applied (§5.4) |
+| What is deployed | ECS service, its task definition and deployments (image tag = sha), ALB listener weights |
+| Canary progress | Observed listener weights and ECS deployment rollout state, so an interrupted canary resumes from where the cloud says it is |
+| Promotion gate | The previous env's service is observed running the sha, tagged `iae:verified=<sha>` after its bake window passed |
+| Already built | Image for the sha exists in ECR |
+| History | CloudTrail, ECS deployment history, the evidence bucket. These are **write-only** for the engine: evidence is never read to make a decision. |
 
-This table holds no resource state. That stays in AWS tags (§3.6).
+**Concurrency without locks.** Two sessions can run at once (the routine starts one per event). Correctness comes
+from:
+
+- **Commit guard:** before changing a resource, the engine re-reads its `iae:commit` tag. If that commit is a
+  descendant of the one this run targets, the resource is newer and the run stops for that env. So an older run
+  can never roll back a newer one, and two runs at the same commit make the same idempotent changes.
+- **Re-observe before each change**, so a run never acts on a stale read for longer than one API call.
+- **Serialisation by infrastructure** once applies move to the in-account executor (§5.8, option B): the executor
+  is a CodeBuild project with a concurrent build limit of 1 per env. That's configuration of a provisioned
+  resource, not a state store.
+
+The remaining race window (between the guard's read and the write) is accepted for MVP. It's covered by the
+level-triggered design: the next run sees the result and converges.
 
 ### 5.8 Credentials and trust boundary
 
@@ -471,7 +492,7 @@ We start with A against non-prod accounts and move to B before managing prod. Se
 - An evidence bucket `iae-evidence-<env>` with Object Lock (compliance mode) and versioning.
 
 For each reconcile of an env, the engine writes one JSON evidence document per control to the evidence bucket
-(commit, PR + reviewers, test summary, plan hash + changes, approval refs, apply journal, CloudTrail event IDs,
+(commit, PR + reviewers, test summary, plan hash + changes, approval refs, per-change apply results, CloudTrail event IDs,
 canary results) and imports it with `BatchImportEvidenceToAssessmentControl` (`s3ResourcePath`). Evidence is
 batched per run because manual evidence is limited to 100 uploads per control per day.
 
@@ -532,7 +553,7 @@ CODEOWNERS                     # approver team for .iae/approvals/**
 |---|---|---|
 | M0 | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
-| M2 | Engine: plan, policy, apply, journal, lock, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation | `assertConverges` end-to-end on Floci for the example app, including crash/resume |
+| M2 | Engine: plan, policy, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation | `assertConverges` end-to-end on Floci for the example app, including crash/re-run and concurrent runs |
 | M3 | Routine + MCP server; merge trigger; plan PRs and engine-side approval verification; GitHub Deployments; staging account | A merged PR that changes infra converges staging; a High-risk change waits for the plan PR |
 | M4 | Audit Manager bootstrap + evidence; prod account; credentials option B | Prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback | Bad build in staging is rolled back automatically by an alarm |
@@ -547,12 +568,13 @@ CODEOWNERS                     # approver team for .iae/approvals/**
 | Q1 | Package and artifact naming: `zio.iae` / `dev.zio`-style vs `com.jamesward` | `zio.iae` package, `com.jamesward` org, unless it moves under the ZIO org |
 | Q2 | Resource identity via singleton-type `Tag`s: verify izumi-reflect stability; fallback to marker traits | Spike in M1 |
 | Q3 | Hand-written `iae-aws-client` vs zio-aws vs Java SDK v2 | Hand-written for the ~40 ops we need (ZIO-native streams, Scala 3, small footprint); revisit if the surface grows |
-| Q4 | Manifest extraction: running `main --iae-manifest` via sbt per commit is slow | Cache by sha; later an sbt task that only links the `infra` value |
+| Q4 | Manifest extraction: running `main --iae-manifest` via sbt per commit is slow | Reuse within a session only (no persisted cache); later an sbt task that only links the `infra` value |
 | Q5 | Move to credentials option B before prod? Executor in Step Functions/CodeBuild vs GitHub Actions + OIDC | B before prod; pick executor in M4 |
 | Q6 | Engine's GitHub token for approval verification (routine sessions reach GitHub through MCP; the engine needs its own read-only token) | Fine-grained read-only token in the env, or verification moves into the executor (B) |
 | Q7 | Multi-app repos and shared infra (VPC, ALB, DNS zone) owned by a platform `InfraModule` | Platform module with its own plan PRs; apps reference it by id |
 | Q8 | Multi-region / multi-account per env | Out of scope until M5 |
 | Q9 | Scheduled-task event caps and research-preview churn | Level-triggered design + hourly reconcile makes dropped events harmless; keep the routine prompt thin so the engine holds the logic |
+| Q10 | Is the commit guard's small read-then-write race acceptable before option B serialises applies? | Yes for non-prod; prod waits for B |
 
 ---
 
