@@ -278,7 +278,8 @@ Alternative: generated clients ([zio-aws](https://github.com/zio/zio-aws)) for t
 | Provider | create, then observe, then diff is empty; update; replace; delete; `apply` idempotency | Floci |
 | Capability | `Bucket[Id]` etc. used by a sample program | Floci with `Cloud.autoProvision` |
 | Engine end-to-end | manifest, plan, apply, re-plan gives an empty plan (`assertConverges`); crash mid-apply then re-run converges; an older commit can't overwrite a newer one (commit guard) | Floci |
-| Agent | Inbox routing and coalescing, reconciler flow, approval verification, restart rehydration, job candidate detection | Floci + `SlackFake` + webhook fixtures |
+| Agent | Inbox routing and coalescing, reconciler flow, approval verification, restart rehydration, job candidate detection | Floci + `FakeSlack` + `FakeGitHub` |
+| Scenarios | The `Scenario`s from the local harness (§4.1), run headlessly end to end | Floci + fakes + `ScriptedModel` |
 | LLM tasks | Tool dispatch, budgets, safety rules (no mutation without policy), prompt-injection fixtures; `EvaluatePolicy` fail-safe paths (bad output, unknown group, unconfident, made-up clause) | `ScriptedModel` (zio-bedrock custom origin) |
 | Policy evals | `EvaluatePolicy` against the example policy and `.iae/policy-examples` | Real model (gated, paid) |
 | Audit Manager | evidence import | in-memory fake; real AWS gated (`IAE_AWS_CONTRACT_TESTS=1`) |
@@ -297,6 +298,80 @@ One container per suite (`provideShared`). Each test gets a fresh `env` name so 
 emulated services include S3, SQS, SNS, DynamoDB, IAM, STS, KMS, Secrets Manager, ECS, ECR, ELBv2, CloudWatch,
 CloudTrail and Config. **Audit Manager isn't emulated**, so it needs the fake. Floci emulates; it isn't AWS, so
 provider behaviour that matters (IAM evaluation, S3 consistency edge cases) also gets real-AWS smoke coverage.
+
+### 4.1 Local development harness (`AppTest`)
+
+`./sbta agent/Test/run` starts the whole system on a laptop: the real agent, wired to emulated AWS, Slack and
+GitHub, with a web UI that stands in for the Slack channel and lets you simulate pushes, deployments and
+incidents. `./sbta ~agent/Test/runReload` restarts it on code changes. **Everything except the LLM is emulated.**
+The LLM is real Bedrock through zio-bedrock (`AWS_BEARER_TOKEN_BEDROCK`, `BEDROCK_MODEL_ID`), or acprock; without
+them `AppTest` fails at startup with a message saying which variable is missing.
+
+All of it lives in `modules/agent/src/test/scala` (and test-scoped dependencies), so none of it reaches the
+production classpath. `AppTest` composes the production agent with test layers, and production code has no dev
+branches. Wherever possible the **real clients** are pointed at emulated endpoints (Slack base URL, GitHub API URL,
+`AWS_ENDPOINT_URL`), so the harness exercises the same HTTP code as production.
+
+| Real service | Emulated by | Notes |
+|---|---|---|
+| AWS accounts (tooling, staging, prod) | One Floci container per account | S3, SQS, SNS, DynamoDB, IAM, STS, Secrets Manager, ECR, ECS, ELBv2, CloudWatch, CloudTrail, Config, EventBridge, CodeBuild, Lambda |
+| AWS services Floci lacks | In-process fakes over HTTP from `iae-testkit`: `AuditManagerFake`, `CostExplorerFake`, `ComputeOptimizerFake`, `CostAnomalyFake` | The real `iae-aws-client` calls them through per-service endpoint overrides |
+| Slack (Web API + Socket Mode) | `FakeSlack`: the subset the agent uses (`chat.postMessage`, `chat.update`, `conversations.history`/`replies`, `reactions.get`, `usergroups.users.list`, `users.info`, `users.lookupByEmail`, `apps.connections.open` + the Socket Mode websocket) | State in memory; the web UI is its client |
+| GitHub (repo, App API, webhooks) | A local bare git repo as the remote, plus `FakeGitHub`: the App API subset (installation tokens, PRs, reviews, merges, statuses, deployments) and a webhook sender that signs `push` and `pull_request` events with the configured secret | Pushing to the local repo, from the UI or a real `git push`, sends the webhook |
+| `iae-webhook` Lambda | The same handler code, run in-process behind a local HTTP endpoint | Enqueues to the tooling account's SQS in Floci, as in production |
+| Bedrock | **Not emulated** | Real model; token usage shows in the UI |
+
+**Seed.** On start the harness creates the accounts' bootstrap resources (`iae bootstrap` against Floci), seeds the
+local repo from `examples/photo-app` with a `.iae/config.json`, a sample `POLICY.md` and policy examples, and
+creates simulated Slack users: `alice` (in `infra-approvers`), `bob` (in `platform-owners`), `carol` (in no
+group) and `dev` (the author of seeded commits).
+
+**Web UI** (served by zio-http on `localhost`, test scope only):
+
+- **Slack.** The `#iae-<app>` channel with threads, rendered from `FakeSlack`'s state and updated live. A user
+  switcher picks who you are; you can reply in threads, mention the bot, and add ✅/❌ reactions. Because it goes
+  through `FakeSlack`, the agent sees exactly what it would see from real Slack, and approvals are verified the
+  same way (group membership, author exclusion, expiry).
+- **GitHub.** Commits on `main`, open PRs (including the agent's), review and merge buttons, and a small editor to
+  change a file and push, which sends the webhook.
+- **Environments.** For staging and prod: managed resources and their tags, the deployed sha, canary weights and
+  bake timers, alarms, and recent evidence.
+- **Agent.** Inbox events, reconciler status per env, running tasks with their transcripts and token usage, open
+  waits (approvals, questions) with timers.
+- **Simulate.** The controls below.
+- **Clock.** A speed factor for the agent's `Clock` (default 60×), so reminders, approval expiries, bake windows
+  and daily jobs happen in minutes, plus "advance by…" for jumps. The LLM, Floci and Docker run in real time.
+
+**Simulating deployment.** Builds run in Floci's CodeBuild, which uses real Docker, and push the example app's
+image to Floci's ECR. The engine deploys it to Floci's ECS, where it runs as a real container, behind ELBv2
+target groups with weighted forwarding. A traffic generator in the harness sends steady requests to the service
+and publishes request, error and latency metrics to Floci's CloudWatch, so the canary's alarms are evaluated on
+real numbers. The Environments panel shows the canary stepping through its weights.
+
+**Simulating issues.** Each control is a `Scenario` step (below), available as a button:
+
+| Issue | How it's simulated |
+|---|---|
+| Bad deploy | Push a commit (from a patch shipped with the example) that makes the app return 500s for some requests; the canary's alarm fires and the engine rolls back |
+| Production incident | Turn up the example app's fault rate or latency through its test-only fault endpoint, so real metrics trip real alarms; or force an alarm with `SetAlarmState` |
+| Build or test failure | Push a commit with a failing test or a compile error; `DiagnoseFailure` runs |
+| Gated change | Push an infra change the sample policy gates (a deletion in prod, IAM widening); approve or reject it in the Slack panel as different users, including one who isn't allowed to |
+| Drift | Change a managed resource directly through the Floci API as a different principal (for example a queue's visibility timeout) |
+| Orphans and idle resources | Remove a resource from the manifest; create `iae:`-tagged resources no repo declares; set idle metrics |
+| Cost anomaly | Post a Cost Anomaly event and edit the fake Cost Explorer series |
+| Nobody answers | Let a question or approval sit while the clock runs fast; watch the reminder, the escalation and the expiry |
+| Agent restart | Stop and restart the agent (same harness, new agent layer) mid-reconcile, mid-canary or while a question is open, and check it rehydrates |
+| Dropped event | Push without sending the webhook; the periodic reconcile picks it up |
+
+Where Floci doesn't emit an event the agent relies on (for example an EventBridge event for a CloudTrail change
+or an alarm state change), the harness publishes the same event with `PutEvents`, so the agent's input is the
+same as in production.
+
+**Scenarios are code.** A `Scenario` is a list of steps (push a patch, wait for a Slack message matching…, react
+as `alice`, inject faults, advance the clock, assert on an env's state). The UI runs them step by step. The
+end-to-end agent tests run the same scenarios headlessly with `ScriptedModel` in place of Bedrock, so every issue
+the harness can simulate is also a repeatable test.
+
 
 ---
 
@@ -753,8 +828,7 @@ Other credentials, in Secrets Manager in the tooling account:
   `Approve(1, owners)` for any change to the agent's own deployment.
 - One running task (desired count 1). ECS deploys it stop-before-start, so there's a short gap rather than two
   agents. Events queue in SQS meanwhile, and the commit guard covers any overlap.
-- Locally, `iae-agent` runs against Floci (AWS), a test Slack workspace, a webhook forwarded from GitHub (or
-  replayed fixtures), and a real or scripted model.
+- Locally, `./sbta agent/Test/run` runs the agent in the harness described in §4.1.
 
 ---
 
@@ -816,8 +890,9 @@ zio-iae/
     webhook/                                 # iae-webhook Lambda: verify GitHub signature, enqueue to SQS
   agent/
     prompts/                   # system prompts per LLM task (ExplainPlan.md, DiagnoseFailure.md, ...)
+  modules/agent/src/test/     # AppTest local harness: FakeSlack + web UI, FakeGitHub, scenarios (§4.1)
   examples/
-    photo-app/                 # InfraApp using Bucket + Queue; end-to-end on Floci
+    photo-app/                 # InfraApp using Bucket + Queue; harness seed; fault endpoint + issue patches
   .github/workflows/           # CI for this repo (build + Floci tests)
 ```
 
@@ -842,9 +917,9 @@ and the "iae" GitHub App installed.
 | M0 | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
 | M2 | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
-| M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, `EvaluatePolicy` with `POLICY.md` + policy examples, approval requests + verification, notices, rehydrate on restart; staging account | A push to `main` converges staging; a gated change waits for ✅; killing the agent mid-run and restarting it converges with no lost approval |
+| M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, `EvaluatePolicy` with `POLICY.md` + policy examples, approval requests + verification, notices, rehydrate on restart; local harness (`AppTest`, `FakeSlack` + web UI, `FakeGitHub`, per-account Floci, clock control, first scenarios); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval. Then the same on a real staging account |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
-| M5 | `Service` + ECR + ALB canary + auto-rollback | A bad build in staging is rolled back automatically by an alarm |
+| M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup + cost optimizer jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR |
 
@@ -871,6 +946,8 @@ and the "iae" GitHub App installed.
 | Q15 | Floci coverage for Cost Explorer, Compute Optimizer, Config and Bedrock | Fakes in `iae-testkit` where Floci lacks them; `ScriptedModel` for Bedrock |
 | Q16 | When to add a typed policy DSL alongside or instead of `POLICY.md` | When the examples show the text giving inconsistent verdicts, or when a team wants rules checked at compile time. Same `ChangeVerdict` output, so it's additive |
 | Q17 | Consistency of LLM verdicts across model versions | Pin the model per policy evaluation; re-run `.iae/policy-examples` on a model change and treat differences like a policy change |
+| Q18 | One Floci container per simulated account vs. one shared container (does Floci separate accounts by credentials?) | Per account to start: simplest isolation; revisit if startup time hurts |
+| Q19 | Floci CodeBuild for local builds (real Docker, slow) vs. a local build runner | Floci CodeBuild, so the build path matches production; add a local runner behind the same service only if it's too slow |
 
 ---
 
