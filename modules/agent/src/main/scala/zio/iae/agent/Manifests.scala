@@ -13,11 +13,19 @@ trait ManifestSource:
   def manifests(dir: Path, config: RepoConfig, commit: CommitSha): IO[AgentError, List[Manifest]]
 
 object ManifestSource:
-  def parse(app: AppEntry, out: String): IO[AgentError, Manifest] =
+  /** The manifest the app printed, with its services' image set to the commit's (when the app has a container). */
+  def parse(app: AppEntry, out: String, commit: CommitSha): IO[AgentError, Manifest] =
     for
       manifest <- ZIO.fromEither(Manifest.fromJson(out)).mapError(AgentError.Manifest(app.name.value, _))
       _        <- ZIO.fail(AgentError.Manifest(app.name.value, s"the command printed the manifest of ${manifest.app.value}")).when(manifest.app != app.name)
-    yield manifest
+    yield withImage(manifest, app.container.map(_.replace("${commit}", commit.value)))
+
+  def withImage(manifest: Manifest, image: Option[String]): Manifest =
+    image.fold(manifest): i =>
+      manifest.copy(resources = manifest.resources.map:
+        case ResourceDecl(id, ResourceSpec.Service(spec)) => ResourceDecl(id, ResourceSpec.Service(spec.copy(image = Some(i))))
+        case other                                        => other
+      )
 
 /** Runs each app's build and manifest commands in the agent's own workspace. Only for development and tests: it runs
   * the repo's code inside the agent, with the agent's credentials. Production builds run in CodeBuild.
@@ -29,7 +37,7 @@ final case class CommandManifests(timeout: Duration = 10.minutes) extends Manife
         _   <- ZIO.fail(AgentError.Manifest(app.name.value, "no manifest command")).when(app.manifest.isEmpty)
         _   <- ZIO.foreachDiscard(app.build)(c => Process.run(dir, Seq("sh", "-c", c), timeout).mapError(AgentError.Manifest(app.name.value, _)))
         out <- Process.run(dir, app.manifest, timeout).mapError(AgentError.Manifest(app.name.value, _))
-        m   <- ManifestSource.parse(app, out)
+        m   <- ManifestSource.parse(app, out, commit)
       yield m
 
 /** Builds each app in CodeBuild, from the commit's source zipped into the build bucket, and reads back the manifest
@@ -89,7 +97,7 @@ final case class CodeBuildManifests(
       case Some(_) => s3.getObject(bucket, k).run(ZSink.collectAll[Byte]).map(b => Some(String(b.toArray, UTF_8)))
 
   private def cached(app: AppEntry, commit: CommitSha): IO[AgentError, Option[Manifest]] =
-    read(manifestKey(app, commit)).mapError(e => fail(app)(s"reading the cached manifest: $e")).flatMap(ZIO.foreach(_)(ManifestSource.parse(app, _)))
+    read(manifestKey(app, commit)).mapError(e => fail(app)(s"reading the cached manifest: $e")).flatMap(ZIO.foreach(_)(ManifestSource.parse(app, _, commit)))
 
   private def build(dir: Path, app: AppEntry, commit: CommitSha): IO[AgentError, Manifest] =
     val token  = s"${app.name.value}-${commit.short}-${java.util.UUID.randomUUID.toString.take(8)}"
@@ -118,7 +126,7 @@ final case class CodeBuildManifests(
         // Where CodeBuild puts the artifact, or the bucket's root where Floci does.
         out <- read(key(s"iae/builds/$token/out/$output")).someOrElseZIO(read(key(output)).someOrFail(S3Error.NoSuchKey(bucket, key(output))))
                  .mapError(e => fail(app)(s"build ${id.value} left no manifest: $e"))
-        manifest <- ManifestSource.parse(app, out)
+        manifest <- ManifestSource.parse(app, out, commit)
         _        <- s3.putObject(bucket, manifestKey(app, commit), Chunk.fromArray(out.getBytes(UTF_8)), Some("application/json")).mapError(e => fail(app)(e.toString))
       yield manifest
 

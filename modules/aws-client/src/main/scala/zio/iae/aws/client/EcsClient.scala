@@ -4,7 +4,7 @@ import zio.*
 import zio.schema.{Schema, derived}
 
 /** One container of a task: its image, port and environment. */
-final case class ContainerSpec(name: String, image: String, port: Int, environment: Map[String, String], cpu: Int, memory: Int)
+final case class ContainerSpec(name: String, image: String, port: Int, environment: Map[String, String], cpu: Int, memory: Int, command: List[String] = Nil)
 
 final case class EcsService(name: String, taskDefinition: String, desiredCount: Int, runningCount: Int, status: String)
 
@@ -26,6 +26,7 @@ final case class EcsClient(json: AwsJsonClient):
       true,
       List(PortMapping(container.port, "tcp")),
       container.environment.toList.sorted.map((k, v) => KeyValue(k, v)),
+      Option.when(container.command.nonEmpty)(container.command),
     )
     call[RegisterTaskDefinition, Registered](
       "RegisterTaskDefinition",
@@ -73,7 +74,14 @@ object EcsClient:
   final case class Clusters(clusters: Option[List[ClusterJson]]) derives Schema
   final case class CreateCluster(clusterName: String, tags: List[Tag]) derives Schema
   final case class PortMapping(containerPort: Int, protocol: String) derives Schema
-  final case class ContainerDefinition(name: String, image: String, essential: Boolean, portMappings: List[PortMapping], environment: List[KeyValue]) derives Schema
+  final case class ContainerDefinition(
+      name: String,
+      image: String,
+      essential: Boolean,
+      portMappings: List[PortMapping],
+      environment: List[KeyValue],
+      command: Option[List[String]],
+  ) derives Schema
   final case class RegisterTaskDefinition(
       family: String,
       networkMode: String,

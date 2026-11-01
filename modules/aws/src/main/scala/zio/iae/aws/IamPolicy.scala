@@ -69,7 +69,8 @@ object IamPolicy:
             case _                    => Right(Statement(sid, "Allow", List("dynamodb:DeleteItem", "dynamodb:PutItem"), List(table)))
         case ResourceKind.Topic =>
           Right(Statement(sid, "Allow", List("sns:Publish"), List(TopicNaming.arn(context, Address(app, env, ResourceKind.Topic, grant.id)))))
-        case ResourceKind.Role => Left(InfraError.InvalidConfig(s"a role can't be granted to an app: ${grant.id.value}"))
+        case ResourceKind.Role    => Left(InfraError.InvalidConfig(s"a role can't be granted to an app: ${grant.id.value}"))
+        case ResourceKind.Service => Left(InfraError.InvalidConfig(s"a service can't be granted to an app: ${grant.id.value}"))
     statements.partitionMap(identity) match
       case (Nil, all)     => Right(PolicyDocument(version, all))
       case (error :: _, _) => Left(error)

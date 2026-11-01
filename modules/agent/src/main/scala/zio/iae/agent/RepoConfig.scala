@@ -9,10 +9,17 @@ import zio.schema.{Schema, derived}
 import zio.schema.codec.JsonCodec
 
 /** An app in the repo: the shell commands that build it, then the command that prints its manifest (both run at the
-  * repo's root, e.g. `sbt photoApp/stage` and `target/.../bin/photo-app --iae-manifest`), and the build image for
-  * CodeBuild if not the project's.
+  * repo's root, e.g. `sbt photoApp/stage` and `target/.../bin/photo-app --iae-manifest`), the build image for
+  * CodeBuild if not the project's, and the container image its services run, where `${commit}` is the commit
+  * (e.g. `123456789012.dkr.ecr.us-east-1.amazonaws.com/photo-app:${commit}`, pushed by the build).
   */
-final case class AppEntry(name: AppName, manifest: List[String], build: List[String] = Nil, image: Option[String] = None) derives Schema
+final case class AppEntry(
+    name: AppName,
+    manifest: List[String],
+    build: List[String] = Nil,
+    image: Option[String] = None,
+    container: Option[String] = None,
+) derives Schema
 
 final case class SlackSettings(channel: String, owners: SlackGroup, groups: List[SlackGroup]) derives Schema
 

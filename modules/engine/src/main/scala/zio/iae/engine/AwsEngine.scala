@@ -7,7 +7,17 @@ import zio.iae.aws.client.*
 
 /** The engine wired to AWS: one driver per resource kind, discovery through the tagging API plus IAM. */
 object AwsEngine:
-  def drivers(s3: S3Client, sqs: SqsClient, secrets: SecretsClient, dynamo: DynamoClient, sns: SnsClient, iam: IamClient, naming: BucketNaming, context: AwsContext): Drivers =
+  def drivers(
+      s3: S3Client,
+      sqs: SqsClient,
+      secrets: SecretsClient,
+      dynamo: DynamoClient,
+      sns: SnsClient,
+      iam: IamClient,
+      deploys: DeployClients,
+      naming: BucketNaming,
+      context: AwsContext,
+  ): Drivers =
     Drivers(
       List(
         BucketDriver(BucketProvider(s3, naming)),
@@ -16,17 +26,19 @@ object AwsEngine:
         TableDriver(TableProvider(dynamo)),
         TopicDriver(TopicProvider(sns, sqs, context)),
         RoleDriver(RoleProvider(iam, naming, context)),
+        ServiceDriver(ServiceProvider(deploys.ecs, deploys.elb, deploys.cloudwatch, deploys.ec2.defaultNetwork.mapError(_.message).either, context)),
       )
     )
 
   def discovery(tagging: TaggingClient, iam: IamClient): CompositeDiscovery =
     CompositeDiscovery(List(TaggingDiscovery(tagging), RoleDiscovery(iam)))
 
-  type Clients = AwsCloud.Clients & TaggingClient & IamClient
+  type Clients = AwsCloud.Clients & TaggingClient & IamClient & DeployClients
 
   /** Every client the engine needs, from an `AwsConfig` and an HTTP client. */
   val clients: ZLayer[AwsConfig & Client, AwsError, Clients] =
-    AwsCloud.clients ++ ((AwsJsonClient.layer >>> TaggingClient.layer) ++ (AwsQueryClient.layer >>> IamClient.layer))
+    AwsCloud.clients ++ ((AwsJsonClient.layer >>> TaggingClient.layer) ++ (AwsQueryClient.layer >>> IamClient.layer)) ++
+      ((AwsJsonClient.layer ++ AwsQueryClient.layer) >>> DeployClients.layer)
 
   /** The engine from one set of clients for both planning and applying (a single account, the CLI, tests). */
   def layer(naming: BucketNaming): ZLayer[Clients & CommitOrder, Nothing, Engine] =
@@ -41,9 +53,16 @@ object AwsEngine:
     */
   def make(naming: BucketNaming, planner: ZEnvironment[Clients], deployer: ZEnvironment[Clients], commits: CommitOrder): Engine =
     def driversOf(c: ZEnvironment[Clients]) =
-      drivers(c.get[S3Client], c.get[SqsClient], c.get[SecretsClient], c.get[DynamoClient], c.get[SnsClient], c.get[IamClient], naming, c.get[AwsContext])
+      drivers(c.get[S3Client], c.get[SqsClient], c.get[SecretsClient], c.get[DynamoClient], c.get[SnsClient], c.get[IamClient], c.get[DeployClients], naming, c.get[AwsContext])
     Engine(Planner(driversOf(planner), discovery(planner.get[TaggingClient], planner.get[IamClient])), zio.iae.engine.Executor(driversOf(deployer), commits))
 
   /** The clients for one account's config. */
   def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =
     (ZLayer.succeed(config) ++ ZLayer.environment[Client] >>> clients).build
+
+/** The clients a service's deploys use: ECS, the load balancer, its alarms, and the default network. */
+final case class DeployClients(ecs: EcsClient, elb: Elbv2Client, cloudwatch: CloudWatchClient, ec2: Ec2Client)
+
+object DeployClients:
+  val layer: ZLayer[AwsJsonClient & AwsQueryClient, Nothing, DeployClients] =
+    ZLayer.fromFunction((json: AwsJsonClient, query: AwsQueryClient) => DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query)))
