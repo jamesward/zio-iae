@@ -246,7 +246,13 @@ object PhotoApp extends AwsInfraApp(AppName("photo-app"), Bucket.readWrite(Uploa
 Queues are named `MessageQueue` (not `Queue`) so they don't clash with `zio.Queue` under `import zio.*`. A queue is
 declared with its message type (`MessageQueue.Id[Job]`), messages travel as JSON from the type's `Schema`, and
 `send`/`receive` only accept that type: they take evidence `I <:< MessageQueue.Id[M]`, so `M` is inferred from the
-queue and sending anything else is a compile error. `Secret.reader(DatabasePassword)` gives a `SecretReader` whose
+queue and sending anything else is a compile error. Tables work the same way: `Table.Id[K, V]` stores JSON keys and
+values in a DynamoDB table, and `get`/`put`/`delete` infer `K` and `V` from the declaration. A topic is declared with
+its message type and its subscribers, `Topic.Id[M](id, List(Topic.to(Thumbnailer)))`, where `Topic.to` only
+accepts a `MessageQueue.Id[M]`, so a queue of another message type doesn't compile; subscribed queues get every
+message as-is (raw delivery) and must be declared by the app (`MessageQueue.wired` declares one without granting
+access). The engine creates resources in kind order (buckets, queues, secrets, tables, topics, then the role), so
+queues exist before topics subscribe them. `Secret.reader(DatabasePassword)` gives a `SecretReader` whose
 value is set out of band and redacted in `toString`; the engine creates and tags the secret but never handles its
 value.
 
@@ -269,7 +275,7 @@ Apps that aren't a single `main` (a library module of shared infra, or several s
 - Every managed resource is tagged `iae:managed`, `iae:app`, `iae:env`, `iae:id`, `iae:kind`, `iae:spec-hash`,
   and (from M2) `iae:commit`. Tags the user adds by hand are kept when the engine re-tags.
 - **Tags are the ownership record.** There is no state file, so nothing can drift from reality. The engine
-  discovers what it owns through the Resource Groups Tagging API (S3, SQS, Secrets Manager) and, because that API
+  discovers what it owns through the Resource Groups Tagging API (S3, SQS, Secrets Manager, DynamoDB, SNS) and, because that API
   doesn't cover IAM on AWS, by listing roles under the `/iae/` path. `iae:commit` is
   also the concurrency guard (§5.3).
 - IAM policies for the deploy role are conditioned on `aws:ResourceTag/iae:managed = true`, so the engine
@@ -987,7 +993,7 @@ and the "iae" GitHub App installed.
 |---|---|---|
 | M0 ✅ | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
-| M2 (in progress) | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue` ✅, `Secret` ✅, `Table`, `Topic`; IAM generation ✅; `iae` CLI ✅ | `assertConverges` end-to-end on Floci for the example app, including crash/re-run ✅ |
+| M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
 | M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, `EvaluatePolicy` with `POLICY.md` + policy examples, approval requests + verification, notices, rehydrate on restart; local harness (`AppTest`, `FakeSlack` + web UI, `FakeGitHub`, per-account Floci, clock control, first scenarios); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval. Then the same on a real staging account |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
