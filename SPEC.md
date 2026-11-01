@@ -12,7 +12,7 @@ declared once and used for three things:
 
 An always-on, stateful agent process runs the pipeline. It receives git pushes through its own GitHub webhook,
 plans and applies infrastructure changes (including changes it authors itself), deploys the app with canaries, and
-records evidence in AWS Audit Manager. The same process runs monitors, drift detection, resource cleanup and cost
+records evidence in AWS Audit Manager. The same process runs monitors, drift detection, security audits, resource cleanup and cost
 optimisation. Deterministic code makes the decisions that can be made by code; an LLM loop built on
 [zio-bedrock](https://github.com/jamesward/zio-bedrock) handles judgement, conversation and code changes. **The user configures a policy** that says which kinds of changes need a human
 approval. The agent talks to people in **Slack**: it asks for approvals there, asks for guidance when it's unsure,
@@ -25,6 +25,36 @@ The project has two parts:
 |---|---|---|
 | **Library** (`iae-core`, `iae-aws`, `iae-aws-client`, `iae-testkit`) | Resource traits, the infra description model, AWS providers, a thin ZIO AWS client, Floci test layers | App developers, in their ZIO programs |
 | **Agent** (`iae-engine`, `iae-cli`, `iae-agent`, `iae-webhook`) | Deterministic plan/apply/deploy engine, the `iae` CLI, and the always-on agent process (inbox, reconcilers, background jobs, Slack, zio-bedrock LLM tasks) | Runs in a tooling AWS account; humans approve and guide it in Slack |
+
+---
+
+## Why an agent
+
+Traditional IaC (Terraform, CDK, Pulumi, CloudFormation) is a compiler for infrastructure: a human writes the
+desired state, CI runs `plan` and `apply` when the code changes, and the job ends. Everything after the apply
+(watching the system, noticing waste, keeping it secure, fixing what broke, cleaning up) is left to people, and
+in most teams that work is done late or not at all. An agent that owns the infrastructure keeps working after
+the deploy.
+
+| | Traditional IaC | Agent-managed infra (zio-iae) |
+|---|---|---|
+| **When it runs** | When someone pushes; idle otherwise | Always: pushes, alarms, drift, cost signals, security findings, timers |
+| **Cost optimisation** | The declared sizes stay until someone reads a bill and edits the code | Watches Cost Explorer, utilisation and Compute Optimizer, and opens PRs that right-size services, change capacity modes or add lifecycle rules, with the expected savings |
+| **Security audits** | Periodic manual reviews or a separate scanner whose findings land in a backlog | Continuously reads IAM Access Analyzer, Security Hub, GuardDuty and Inspector findings for the resources it manages, and opens fixes as PRs: drop unused permissions, patch a vulnerable image, close an exposure |
+| **Least privilege** | Hand-written IAM, usually broader than needed and drifting from the code | Generated from the capabilities the code uses, then narrowed further from observed unused access |
+| **Delivery ("auto-DevOps")** | A pipeline someone has to build, debug and maintain; a failed build waits for a human to read the log | Builds, tests, plans, deploys with canaries and rolls back on its own; when a build or deploy fails it diagnoses the failure and proposes the fix |
+| **Incidents** | A human is paged, finds the cause, and fixes it by hand or by a rushed change | Triages the alarm against recent deploys, logs and metrics; rolls back if policy allows, or opens a fix PR, and keeps the alert thread updated |
+| **Drift** | Found at the next `plan`, often weeks later, and usually overwritten without anyone asking why | Detected when it happens, reported with who changed what, and reverted or turned into a code change, as policy says |
+| **Cleanup** | Orphaned and idle resources pile up because nobody is sure what's safe to delete | Finds orphans, idle resources and stale artifacts, explains them, and deletes them only with the approvals policy requires |
+| **Change review** | Reviewers read a raw `plan` diff | The agent explains each change in plain language, with blast radius and rollback, and quotes the policy clauses that apply |
+| **Approval rules** | All-or-nothing: a protected CI environment, or nothing | Per change, from a plain-English policy the team writes: what can go ahead, who must approve, what's never allowed |
+| **Compliance evidence** | Assembled by hand before an audit | Recorded on every change (commit, tests, plan, verdict, approvers, results) and filed in AWS Audit Manager |
+| **State** | A state file to store, lock and repair | None: the cloud's own APIs are the state |
+| **People's time** | Spent operating: running pipelines, reading dashboards, chasing tickets | Spent deciding: approving, rejecting and guiding in Slack when the agent asks |
+
+The agent doesn't get unchecked power for this. It changes infra only through the engine. The user's policy
+decides what needs a human. Approvals come from people and are verified, so the agent can't produce them.
+Everything it does is explained in Slack and recorded as evidence.
 
 ---
 
@@ -359,6 +389,7 @@ real numbers. The Environments panel shows the canary stepping through its weigh
 | Drift | Change a managed resource directly through the Floci API as a different principal (for example a queue's visibility timeout) |
 | Orphans and idle resources | Remove a resource from the manifest; create `iae:`-tagged resources no repo declares; set idle metrics |
 | Cost anomaly | Post a Cost Anomaly event and edit the fake Cost Explorer series |
+| Security finding | Grant a role an unused permission, make a bucket public through the Floci API, or post a GuardDuty or Inspector finding |
 | Nobody answers | Let a question or approval sit while the clock runs fast; watch the reminder, the escalation and the expiry |
 | Agent restart | Stop and restart the agent (same harness, new agent layer) mid-reconcile, mid-canary or while a question is open, and check it rehydrates |
 | Dropped event | Push without sending the webhook; the periodic reconcile picks it up |
@@ -431,6 +462,7 @@ Code, but the agent doesn't need it.
 | Alarms | CloudWatch alarm state changes through EventBridge to the inbox | Monitor job (§5.10) |
 | Drift | AWS Config / CloudTrail events on `iae:managed` resources by a principal other than the deployer role, through EventBridge | Drift job (§5.10) |
 | Cost | Cost Anomaly Detection through EventBridge; scheduled Cost Explorer reads | Cost job (§5.10) |
+| Security | Security Hub, GuardDuty and Inspector findings through EventBridge; scheduled Access Analyzer reads | Security auditor (§5.10) |
 | Build results | CodeBuild state changes through EventBridge | Reconciler waiting on that build |
 | Timers | `Schedule`s in the process: periodic full reconcile (default 15 min), cleanup (daily), cost review (daily, weekly report), reminders and expiries | The owning job |
 
@@ -503,6 +535,7 @@ on the Converse backend with a Claude model on Bedrock (`BEDROCK_MODEL_ID`). Eac
 | `Triage` | Alarm (§7) | `rollback` (policy-gated), workspace edit, `runBuild`, `openPr`, `ask` | Rollback, fix PR, or escalation |
 | `ReviewCleanup` | Cleanup job candidates | `proposeCleanup` | Proposals in Slack |
 | `ReviewCost` | Cost job findings | workspace edit, `openPr` | A cost report, and PRs for changes worth making |
+| `ReviewSecurity` | Security auditor findings | workspace edit, `runBuild`, `openPr`, `ask` | A security report, fix PRs, or an escalation |
 
 - **System prompts** live in the repo (`agent/prompts/<task>.md`) so they're versioned and reviewed. Each task has
   a turn limit, a token budget and a timeout; daily budgets per task kind are enforced from zio-bedrock's usage
@@ -552,7 +585,7 @@ Approvers are the @infra-approvers Slack group. Owners are @platform-owners.
 `EvaluatePolicy`: env; resource kind and id; change type (`Create`, `Update(fields)`, `Replace`, `Delete`, `Move`,
 `Deploy`, `Rollback`, `Cleanup`); risk; derived flags (`iamWidening`, `publicAccess`, `encryptionChange`,
 `dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert`,
-`Drift`, `Cleanup` and `Cost` for changes the background jobs propose, §5.10); author; current date and time. PR
+`Drift`, `Cleanup`, `Cost` and `Security` for changes the background jobs propose, §5.10); author; current date and time. PR
 descriptions, commit messages, Slack text and logs are not included, so they can't argue for a weaker verdict.
 
 Risk classes, assigned by providers with these defaults (a provider can raise a specific change's risk):
@@ -793,11 +826,23 @@ default, while old images and task definitions can be `Auto` if the user's polic
 rule), with the expected savings in the description. It then goes through the normal pipeline and policy
 (`origin = Cost`).
 
+**Security auditor.** Continuous, plus a weekly report. Sources, all scoped to `iae:managed` resources:
+
+- IAM Access Analyzer: unused permissions on the generated roles, and external or public access;
+- Security Hub and GuardDuty findings;
+- Inspector scans of the app images in ECR;
+- configuration checks the engine can run itself (encryption, public access, logging, TLS on listeners).
+
+`ReviewSecurity` ranks the findings, explains them in Slack, and fixes what it can as **PRs**: narrow a capability
+in the app code (`Bucket` to `BucketReader`), turn on a setting in the `Infra` declaration, or bump a base image or
+dependency and rebuild. The PRs go through the normal pipeline and policy (`origin = Security`). Active threats
+(a GuardDuty finding of compromised credentials, for example) are escalations, not PRs.
+
 ### 5.11 Credentials and trust boundary
 
 The agent runs in its own **tooling account** on ECS Fargate with a task role. There are no long-lived AWS keys.
 
-- **Planner role** in each env account (read-only, plus CloudWatch and Cost Explorer reads). The agent process
+- **Planner role** in each env account (read-only, plus CloudWatch, Cost Explorer and security-findings reads). The agent process
   assumes it for observing, planning, monitoring and cost.
 - **Deployer role** in each env account (writes, limited to `iae:managed` resources, with a permissions
   boundary, no IAM wildcard).
@@ -921,7 +966,7 @@ and the "iae" GitHub App installed.
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
-| M7 | Cleanup + cost optimizer jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR |
+| M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
 
