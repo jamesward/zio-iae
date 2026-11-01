@@ -678,8 +678,10 @@ The engine then combines and checks it deterministically:
   The policy can only add to the floor.
 - **Stable per plan.** The verdict is computed once per (policy text hash, change facts hash, UTC date of the facts)
   and kept in memory,
-  so re-running a reconcile doesn't re-roll the dice. The executor (§5.11) evaluates independently; if the two
-  differ, the more restrictive one wins.
+  so re-running a reconcile doesn't re-roll the dice. The executor (§5.11) has no model. It doesn't re-read the
+  policy text, but recomputes the plan and the built-in floor and verifies the approval itself, so what the policy
+  text alone requires rests on the agent's verdict, carried by the approval request it posted. The floor and human
+  approvals don't rest on the agent.
 - **Visible.** The approval request quotes the clauses and the reasoning, so a human can see *why* approval is
   needed, and the verdict, clauses and transcript go into evidence (§6). `iae policy explain` runs the same
   evaluation against a plan without applying anything.
@@ -747,9 +749,11 @@ The engine's checks, made with its own Slack token and never trusting the agent:
   requested changes. A subset is allowed so a crashed apply can finish without re-approval, since the changes
   already made drop out of the recomputed plan. Anything outside the set (drift, a newer commit) makes the request
   stale and a new one is posted.
-- `reactions.get` shows ✅ from at least `n` distinct users who are members of every required group
-  (`usergroups.users.list`), are human (not bots), and aren't the change's author (GitHub-to-Slack identity
-  mapping in `.iae/config.json`). Any ❌ from a member of a required group rejects it.
+- `reactions.get` shows ✅ from at least `n` distinct users who are members of each required group
+  (`usergroups.users.list`; a person in two groups counts for both), are human (not bots), and aren't the
+  change's author (GitHub-to-Slack identity mapping in `.iae/config.json`). Any ❌ from a member of a required group
+  rejects it. Because each group must supply the count, combining two changes' requirements into one request never
+  weakens either: a plan that needs an owner for a policy change and an approver for a resource change needs both.
 - Not expired (default 24h for prod; the policy text can say otherwise).
 - Reuse is impossible without a record: once applied, the recomputed plan is empty and there's nothing left for
   the approval to cover.
@@ -937,10 +941,21 @@ The agent runs in its own **tooling account** on ECS Fargate with a task role. T
   boundary, no IAM wildcard).
 - **Phase 1:** the agent process can assume the deployer role, and only the engine's apply path does so, after
   the policy and approval checks. The LLM has no tool that reaches it.
-- **Phase 2 (before prod):** a separate **executor** service (same engine code, no LLM, its own task role) is the
-  only principal that can assume deployer roles. The agent sends it (env, target commit, plan hash, approval
-  link). The executor recomputes the plan, re-evaluates the policy and re-verifies the approval against Slack with
-  its own token before applying. A compromised agent process can then propose but not mutate.
+- **Phase 2 (before prod):** a separate **executor** service (`iae-executor`, same engine code, no LLM, its own
+  task role and Slack app) is the only principal that can assume deployer roles. The agent sends (env, app, commit,
+  phase, plan hash, approval request) to the executor's SQS queue (`IAE_EXECUTOR_QUEUE_URL`) and plans with the
+  planner roles only. Before applying, the executor:
+  - checks out the commit itself, which must be on the branch;
+  - recomputes the plan, which must have the same hash;
+  - reads the author from git;
+  - recomputes the policy deployed in the env and the built-in floor;
+  - verifies the approval request with its own Slack token: posted by the agent's bot, open, unexpired, for this
+    app, env and manifest, and covering every change;
+  - verifies the reactions against the stricter of the floor and the request.
+
+  It then applies, posts the notice, labels the request, records the evidence and wakes the agent through its
+  inbox. A refusal is posted once. A compromised agent process can then propose but not mutate. It can at most
+  under-state what the policy text alone requires, never the floor or a human approval.
 
 Other credentials, in Secrets Manager in the tooling account:
 
@@ -1061,7 +1076,7 @@ and the "iae" GitHub App installed.
 | M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
-| M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
+| M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
