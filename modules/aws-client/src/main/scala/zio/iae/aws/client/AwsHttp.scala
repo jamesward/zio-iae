@@ -60,9 +60,10 @@ private[client] object AwsHttp:
     val all         = if contentSha256Header then ("x-amz-content-sha256" -> payloadHash) :: headers else headers
     val signable    = SigV4.Request(method.name, target.authority, target.path, target.query, all, payloadHash)
     for
-      now <- Clock.ClockLive.instant // AWS checks the signing time against its own clock
-      url <- ZIO.fromEither(URL.decode(target.url)).mapError(e => s"${target.url}: ${e.getMessage}")
-      signed = SigV4.sign(signable, config.credentials, SigV4.Scope(signingRegion(config, service), service.signingName), now)
+      now   <- Clock.ClockLive.instant // AWS checks the signing time against its own clock
+      url   <- ZIO.fromEither(URL.decode(target.url)).mapError(e => s"${target.url}: ${e.getMessage}")
+      creds <- config.credentials.credentials.mapError(e => s"credentials: ${e.message}")
+      signed = SigV4.sign(signable, creds, SigV4.Scope(signingRegion(config, service), service.signingName), now)
       sent   = ("host" -> target.authority) :: all ++ signed
     yield Request(method = method, url = url, headers = Headers(sent.map(Header.Custom(_, _))), body = Body.fromChunk(body))
 

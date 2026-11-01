@@ -269,6 +269,21 @@ object FlociSpec extends ZIOSpecDefault:
       ,
     ),
     suite("Bucket capability")(
+      test("an assumed role's credentials are fetched from STS and used"):
+        for
+          base     <- ZIO.service[AwsConfig]
+          http     <- ZIO.service[Client]
+          iam      <- ZIO.service[IamClient]
+          suffix   <- Random.nextIntBounded(1000000)
+          name      = RoleName.from(s"iae-deployer-$suffix").toOption.get
+          account  <- StsClient(AwsQueryClient(http, base)).accountId
+          trust     = s"""{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::${account.value}:root"},"Action":"sts:AssumeRole"}]}"""
+          _        <- iam.createRole(name, "/", trust, Map.empty)
+          assumed  <- StsClient.assumed(base, http, s"arn:aws:iam::${account.value}:role/$name", "iae-agent")
+          creds    <- assumed.credentials.credentials
+          caller   <- StsClient(AwsQueryClient(http, assumed)).accountId
+        yield assertTrue(creds.sessionToken.isDefined, caller == account)
+      ,
       test("a program uses the buckets it declares"):
         val infra = Bucket.readWrite(Uploads) ++ Bucket.reader(Archive)
         val program =

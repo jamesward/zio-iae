@@ -25,7 +25,7 @@ object FlociLayer:
           for
             region   <- Region.from(floci.getRegion.nn)
             endpoint <- Endpoint.parse(floci.getEndpoint.nn)
-          yield AwsConfig(
+          yield AwsConfig.static(
             region,
             AwsCredentials(AccessKeyId(floci.getAccessKey.nn), SecretAccessKey(floci.getSecretKey.nn), None),
             Some(endpoint),

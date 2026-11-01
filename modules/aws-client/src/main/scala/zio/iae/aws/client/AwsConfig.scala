@@ -50,27 +50,36 @@ object Endpoint:
       host   <- Option(uri.getHost).toRight(s"'$value' has no host")
     yield Endpoint(scheme, host, Option.when(uri.getPort >= 0)(uri.getPort))
 
-final case class AwsConfig(region: Region, credentials: AwsCredentials, endpoint: Option[Endpoint])
+final case class AwsConfig(region: Region, credentials: CredentialsProvider, endpoint: Option[Endpoint])
 
 final case class AwsConfigError(detail: String):
   def message: String = s"AWS configuration: $detail"
 
 object AwsConfig:
-  /** Reads the standard AWS environment variables. Only static credentials are supported so far. */
+  def static(region: Region, credentials: AwsCredentials, endpoint: Option[Endpoint]): AwsConfig =
+    AwsConfig(region, CredentialsProvider.Static(credentials), endpoint)
+
+  /** Reads the standard AWS environment variables: static keys (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+    * `AWS_SESSION_TOKEN`), else the ECS task role.
+    */
   val fromEnvironment: IO[AwsConfigError, AwsConfig] =
     for
       regionName <- firstOf("AWS_REGION", "AWS_DEFAULT_REGION")
       region     <- ZIO.fromEither(Region.from(regionName)).mapError(AwsConfigError(_))
-      keyId      <- required("AWS_ACCESS_KEY_ID")
-      secret     <- required("AWS_SECRET_ACCESS_KEY")
+      keyId      <- optional("AWS_ACCESS_KEY_ID")
+      secret     <- optional("AWS_SECRET_ACCESS_KEY")
       token      <- optional("AWS_SESSION_TOKEN")
+      container  <- CredentialsProvider.container
+      provider <- (keyId, secret, container) match
+                    case (Some(k), Some(s), _) =>
+                      ZIO.succeed(CredentialsProvider.Static(AwsCredentials(AccessKeyId(k), SecretAccessKey(s), token.map(SessionToken(_)))))
+                    case (None, None, Some(c)) => ZIO.succeed(c)
+                    case (Some(_), None, _)    => ZIO.fail(AwsConfigError("AWS_SECRET_ACCESS_KEY is not set"))
+                    case (None, Some(_), _)    => ZIO.fail(AwsConfigError("AWS_ACCESS_KEY_ID is not set"))
+                    case (None, None, None)    => ZIO.fail(AwsConfigError("no credentials: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or run with an ECS task role"))
       endpointS  <- optional("AWS_ENDPOINT_URL")
       endpoint   <- ZIO.foreach(endpointS)(s => ZIO.fromEither(Endpoint.parse(s)).mapError(AwsConfigError(_)))
-    yield AwsConfig(
-      region,
-      AwsCredentials(AccessKeyId(keyId), SecretAccessKey(secret), token.map(SessionToken(_))),
-      endpoint,
-    )
+    yield AwsConfig(region, provider, endpoint)
 
   val layer: ZLayer[Any, AwsConfigError, AwsConfig] = ZLayer(fromEnvironment)
 
