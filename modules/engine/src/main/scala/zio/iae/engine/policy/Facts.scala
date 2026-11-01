@@ -11,11 +11,6 @@ import zio.schema.annotation.simpleEnum
 enum Origin derives Schema, CanEqual:
   case Human, Agent, Alert, Drift, Cleanup, Cost, Security
 
-/** Derived properties of a change that policies commonly care about. */
-@simpleEnum
-enum Flag derives Schema, CanEqual:
-  case IamWidening, PublicAccess, EncryptionChange, DataLoss
-
 opaque type SlackGroup = String
 
 object SlackGroup:
@@ -55,7 +50,7 @@ final case class ChangeFacts(
     env: EnvName,
     subject: Subject,
     risk: Risk,
-    flags: Set[Flag],
+    flags: Set[ChangeFlag],
     origin: Origin,
     author: Option[String],
     at: Instant,
@@ -69,15 +64,12 @@ object ChangeFacts:
         case Change.Update(_, _, fields) => ("Update", fields.toList.map(_.field))
         case Change.Orphan(_, _)         => ("Orphan", Nil)
         case Change.Delete(_)            => ("Delete", Nil)
-      val flags = planned.change match
-        case Change.Delete(_) => Set(Flag.DataLoss)
-        case _                => Set.empty[Flag]
       ChangeFacts(
         ChangeId(s"$index:${planned.address.show}"),
         plan.env,
         Subject.Resource(planned.address, action, fields),
         planned.risk,
-        flags,
+        planned.flags,
         origin,
         author,
         at,

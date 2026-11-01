@@ -9,7 +9,7 @@ import zio.schema.codec.JsonCodec
 
 @simpleEnum
 enum ResourceKind derives Schema, CanEqual:
-  case Bucket
+  case Bucket, Role
 
 @simpleEnum
 enum Versioning derives Schema, CanEqual:
@@ -17,12 +17,22 @@ enum Versioning derives Schema, CanEqual:
 
 final case class BucketSpec(versioning: Versioning = Versioning.Disabled) derives Schema, CanEqual
 
+/** Which compute service may assume an app's runtime role. */
+@simpleEnum
+enum TrustedService derives Schema, CanEqual:
+  case EcsTasks, Lambda
+
+/** An app's runtime identity: derived from its grants, never declared by hand. */
+final case class RoleSpec(grants: List[Grant], trust: List[TrustedService]) derives Schema, CanEqual
+
 /** The desired state of one resource. Closed over every kind zio-iae manages. */
 enum ResourceSpec derives Schema, CanEqual:
   case Bucket(spec: BucketSpec)
+  case Role(spec: RoleSpec)
 
   def kind: ResourceKind = this match
     case Bucket(_) => ResourceKind.Bucket
+    case Role(_)   => ResourceKind.Role
 
 final case class ResourceDecl(id: LogicalId, spec: ResourceSpec) derives Schema, CanEqual:
   def kind: ResourceKind = spec.kind

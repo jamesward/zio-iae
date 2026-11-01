@@ -44,11 +44,12 @@ object EngineSpec extends ZIOSpecDefault:
   val uniqueEnv: UIO[EnvName] =
     ZIO.collectAll(List.fill(8)(Random.nextIntBounded(26).map(i => ('a' + i).toChar))).map(cs => EnvName.from("e" + cs.mkString).toOption.get)
 
-  def engineWith(history: CommitOrder): URIO[S3Client & TaggingClient, Engine] =
+  def engineWith(history: CommitOrder): URIO[S3Client & TaggingClient & IamClient, Engine] =
     for
       s3      <- ZIO.service[S3Client]
       tagging <- ZIO.service[TaggingClient]
-    yield Engine.make(AwsEngine.drivers(s3, naming), TaggingDiscovery(tagging), history)
+      iam     <- ZIO.service[IamClient]
+    yield Engine.make(AwsEngine.drivers(s3, iam, naming), AwsEngine.discovery(tagging, iam), history)
 
   /** After converging, planning again finds nothing to do in either phase. */
   def assertConverges(engine: Engine, manifest: Manifest, env: EnvName, target: Option[CommitSha]): IO[EngineError, TestResult] =
@@ -68,8 +69,10 @@ object EngineSpec extends ZIOSpecDefault:
         result   <- assertConverges(engine, manifest, env, Some(sha('a')))
         commit   <- engine.planner.drivers(ResourceKind.Bucket).flatMap(_.lastCommit(Address(app, env, ResourceKind.Bucket, Uploads.logicalId)).mapError(EngineError.Provider(_)))
       yield result && assertTrue(
-        plan.changes.map(_.change.productPrefix) == List("Create", "Create", "Create"),
+        plan.changes.map(c => (c.change.productPrefix, c.address.kind)) ==
+          List(("Create", ResourceKind.Bucket), ("Create", ResourceKind.Bucket), ("Create", ResourceKind.Bucket), ("Create", ResourceKind.Role)),
         plan.changes.forall(_.risk == Risk.Low),
+        plan.changes.filter(_.address.kind == ResourceKind.Role).forall(_.flags == Set(ChangeFlag.IamWidening)),
         commit.contains(sha('a')),
       )
     ,
@@ -78,14 +81,15 @@ object EngineSpec extends ZIOSpecDefault:
         env       <- uniqueEnv
         s3        <- ZIO.service[S3Client]
         tagging   <- ZIO.service[TaggingClient]
+        iam       <- ZIO.service[IamClient]
         manifest  <- manifestOf(everything)
         remaining <- Ref.make(1)
-        crashing   = Engine.make(Drivers(List(CrashingDriver(BucketDriver(BucketProvider(s3, naming)), remaining))), TaggingDiscovery(tagging), LinearHistory(Nil))
+        crashing   = Engine.make(Drivers(AwsEngine.drivers(s3, iam, naming).all.map(CrashingDriver(_, remaining))), AwsEngine.discovery(tagging, iam), LinearHistory(Nil))
         crashed   <- crashing.converge(manifest, env, None).either
         engine    <- engineWith(LinearHistory(Nil))
         leftOver  <- engine.plan(manifest, env, None, Phase.Expand)
         result    <- assertConverges(engine, manifest, env, None)
-      yield result && assertTrue(crashed.isLeft, leftOver.changes.size == 2)
+      yield result && assertTrue(crashed.isLeft, leftOver.changes.size == 3)
     ,
     test("resources that are no longer declared are orphaned, not deleted, and can be adopted again"):
       for
@@ -105,12 +109,13 @@ object EngineSpec extends ZIOSpecDefault:
         contract.changes.map(_.address.id) == List(Logs.logicalId, Thumbs.logicalId),
         contract.changes.forall(_.change.productPrefix == "Orphan"),
         stillThere,
-        readopt.changes.flatMap:
+        readopt.changes.filter(_.address.kind == ResourceKind.Bucket).flatMap:
           _.change match
             case Change.Update(_, _, fields) => fields.toList.map(_.field)
             case _                           => Nil
         .forall(_ == "orphaned"),
-        readopt.changes.size == 2,
+        readopt.changes.count(_.address.kind == ResourceKind.Bucket) == 2,
+        readopt.changes.exists(c => c.address.kind == ResourceKind.Role && c.flags.contains(ChangeFlag.IamWidening)),
       )
     ,
     test("an older commit can't undo a change made by a newer one"):
@@ -145,4 +150,6 @@ object EngineSpec extends ZIOSpecDefault:
     S3Client.layer,
     AwsJsonClient.layer,
     TaggingClient.layer,
+    AwsQueryClient.layer,
+    IamClient.layer,
   ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock @@ TestAspect.timeout(3.minutes)

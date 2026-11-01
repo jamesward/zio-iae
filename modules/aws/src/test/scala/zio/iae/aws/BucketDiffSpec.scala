@@ -68,8 +68,8 @@ object BucketDiffSpec extends ZIOSpecDefault:
     ,
     test("risk follows the change type"):
       assertTrue(
-        provider.risk(Change.Create(address, BucketSpec())) == Risk.Low,
-        provider.risk(Change.Delete(address)) == Risk.Critical,
+        provider.assess(Change.Create(address, BucketSpec())) == Assessment(Risk.Low, Set.empty),
+        provider.assess(Change.Delete(address)) == Assessment(Risk.Critical, Set(ChangeFlag.DataLoss)),
       )
     ,
   )

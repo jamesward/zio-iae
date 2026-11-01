@@ -13,7 +13,7 @@ trait Provider[S, O]:
 
   def diff(address: Address, desired: S, observed: Option[O]): Option[Change[S]]
 
-  def risk(change: Change[S]): Risk
+  def assess(change: Change[S], observed: Option[O]): Assessment
 
   def applyChange(change: Change[S], context: ApplyContext): IO[ProviderError, Unit]
 

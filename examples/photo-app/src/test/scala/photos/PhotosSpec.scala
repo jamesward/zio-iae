@@ -36,8 +36,9 @@ object PhotosSpec extends ZIOSpecDefault:
     test("declares one versioned bucket it can read and write"):
       val manifest = PhotoApp.infra.manifest(PhotoApp.appName)
       assertTrue(
-        manifest.map(_.resources) ==
-          Right(List(ResourceDecl(LogicalId("uploads"), ResourceSpec.Bucket(BucketSpec(versioning = Versioning.Enabled))))),
+        manifest.map(_.resources.map(_.spec.kind)) == Right(List(ResourceKind.Bucket, ResourceKind.Role)),
+        manifest.map(_.resources.head) ==
+          Right(ResourceDecl(LogicalId("uploads"), ResourceSpec.Bucket(BucketSpec(versioning = Versioning.Enabled)))),
         manifest.map(_.grants.map(_.capability)) == Right(List(Capability.BucketRead, Capability.BucketWrite)),
       )
     ,

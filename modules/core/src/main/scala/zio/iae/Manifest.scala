@@ -9,6 +9,9 @@ final case class Manifest(app: AppName, resources: List[ResourceDecl], grants: L
   def toJson: String = Manifest.codec.encoder.encodeJson(this, Some(0)).toString
 
 object Manifest:
+  /** The logical id of the role an app runs as, derived from its grants. */
+  val runtimeRole: LogicalId = LogicalId("runtime")
+
   given codec: zio.json.JsonCodec[Manifest] = JsonCodec.jsonCodec(Schema[Manifest])
 
   def fromJson(json: String): Either[String, Manifest] = json.fromJson[Manifest]

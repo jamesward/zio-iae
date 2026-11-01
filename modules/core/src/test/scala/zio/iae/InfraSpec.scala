@@ -14,7 +14,8 @@ object InfraSpec extends ZIOSpecDefault:
       val infra = Bucket.readWrite(Uploads) ++ Bucket.reader(Thumbs) ++ Bucket.reader(Uploads)
       val manifest = infra.manifest(app)
       assertTrue(
-        manifest.map(_.resources.map(_.id)) == Right(List(LogicalId("thumbs"), LogicalId("uploads"))),
+        manifest.map(_.resources.map(_.id)) == Right(List(LogicalId("thumbs"), LogicalId("uploads"), Manifest.runtimeRole)),
+        manifest.map(_.resources.last.spec) == manifest.map(m => ResourceSpec.Role(RoleSpec(m.grants, List(TrustedService.EcsTasks)))),
         manifest.map(_.grants) == Right(
           List(
             Grant(LogicalId("thumbs"), ResourceKind.Bucket, Capability.BucketRead),

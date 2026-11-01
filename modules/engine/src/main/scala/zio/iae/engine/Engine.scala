@@ -29,7 +29,7 @@ final case class Planner(drivers: Drivers, discovery: Discovery):
     yield found
       .filter(d => !declared.contains(d.address) && d.orphanedSince.isEmpty)
       .sortBy(_.address.show)
-      .map(d => PlannedChange(Change.Orphan(d.address, today), Risk.Low))
+      .map(d => PlannedChange(Change.Orphan(d.address, today), Risk.Low, Set.empty))
 
 /** What an apply did: the changes applied, in order. */
 final case class ApplyReport(plan: ContentHash, applied: List[Address])

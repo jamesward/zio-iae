@@ -22,7 +22,7 @@ final case class BucketProvider(s3: S3Client, naming: BucketNaming) extends Prov
   def diff(address: Address, desired: BucketSpec, observed: Option[ObservedBucket]): Option[Change[BucketSpec]] =
     BucketProvider.diff(address, desired, observed)
 
-  def risk(change: Change[BucketSpec]): Risk = BucketProvider.risk(change)
+  def assess(change: Change[BucketSpec], observed: Option[ObservedBucket]): Assessment = BucketProvider.assess(change)
 
   def applyChange(change: Change[BucketSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -70,11 +70,11 @@ object BucketProvider:
         val tags = ManagedTags.differences(current.tags, desiredTags(address, desired))
         NonEmptyChunk.fromIterableOption(versioning.toList ++ tags).map(Change.Update(address, desired, _))
 
-  def risk(change: Change[BucketSpec]): Risk = change match
-    case Change.Create(_, _)    => Risk.Low
-    case Change.Update(_, _, _) => Risk.Medium
-    case Change.Orphan(_, _)    => Risk.Low
-    case Change.Delete(_)       => Risk.Critical
+  def assess(change: Change[BucketSpec]): Assessment = change match
+    case Change.Create(_, _)    => Assessment(Risk.Low, Set.empty)
+    case Change.Update(_, _, _) => Assessment(Risk.Medium, Set.empty)
+    case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
+    case Change.Delete(_)       => Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))
 
   private[aws] def desiredTags(address: Address, spec: BucketSpec): Map[String, String] =
     ManagedTags.identity(address, SpecHash.of(ResourceSpec.Bucket(spec)))
@@ -93,15 +93,19 @@ final case class BucketDriver(provider: BucketProvider) extends ResourceDriver:
     desired match
       case ResourceSpec.Bucket(spec) =>
         provider.observe(address).map: observed =>
-          provider.diff(address, spec, observed).map(c => PlannedChange(c.map(ResourceSpec.Bucket(_)), provider.risk(c)))
+          provider.diff(address, spec, observed).map: change =>
+            val assessment = provider.assess(change, observed)
+            PlannedChange(change.map(ResourceSpec.Bucket(_)), assessment.risk, assessment.flags)
+      case other => ZIO.fail(ProviderError(address, "plan", s"expected a bucket spec, got ${other.kind}"))
 
   def apply(change: Change[ResourceSpec], context: ApplyContext): IO[ProviderError, Unit] =
-    val typed: Change[BucketSpec] = change match
-      case Change.Create(address, ResourceSpec.Bucket(spec))         => Change.Create(address, spec)
-      case Change.Update(address, ResourceSpec.Bucket(spec), fields) => Change.Update(address, spec, fields)
-      case Change.Orphan(address, since)                             => Change.Orphan(address, since)
-      case Change.Delete(address)                                    => Change.Delete(address)
-    provider.applyChange(typed, context)
+    val typed: Either[ProviderError, Change[BucketSpec]] = change match
+      case Change.Create(address, ResourceSpec.Bucket(spec))         => Right(Change.Create(address, spec))
+      case Change.Update(address, ResourceSpec.Bucket(spec), fields) => Right(Change.Update(address, spec, fields))
+      case Change.Orphan(address, since)                             => Right(Change.Orphan(address, since))
+      case Change.Delete(address)                                    => Right(Change.Delete(address))
+      case other                                                     => Left(ProviderError(other.address, "apply", "expected a bucket change"))
+    ZIO.fromEither(typed).flatMap(provider.applyChange(_, context))
 
   def lastCommit(address: Address): IO[ProviderError, Option[CommitSha]] =
     provider.observe(address).map(_.flatMap(o => ManagedTags.commit(o.tags)))

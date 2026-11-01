@@ -34,6 +34,14 @@ enum Risk derives Schema, CanEqual:
 object Risk:
   given Ordering[Risk] = Ordering.by(_.ordinal)
 
+/** Properties of a change that policies commonly care about, worked out by the provider that understands it. */
+@simpleEnum
+enum ChangeFlag derives Schema, CanEqual:
+  case IamWidening, PublicAccess, EncryptionChange, DataLoss
+
+/** How risky a change is, and why. */
+final case class Assessment(risk: Risk, flags: Set[ChangeFlag]) derives CanEqual
+
 /** A change to one resource of any kind, as the engine plans, shows and applies it. */
-final case class PlannedChange(change: Change[ResourceSpec], risk: Risk) derives Schema, CanEqual:
+final case class PlannedChange(change: Change[ResourceSpec], risk: Risk, flags: Set[ChangeFlag]) derives Schema, CanEqual:
   def address: Address = change.address

@@ -16,10 +16,7 @@ final case class Infra[+R](
     val conflict = byId.collectFirst:
       case (id, decls) if decls.map(_.spec).distinct.size > 1 =>
         InfraError.ConflictingDeclarations(id, decls.map(_.spec).distinct.toList)
-    conflict.toLeft(
-      Manifest(
-        app = app,
-        resources = byId.flatMap(_._2.headOption),
-        grants = grants.toList.sortBy(g => (g.id, g.capability.ordinal)),
-      )
-    )
+    val sortedGrants = grants.toList.sortBy(g => (g.id, g.capability.ordinal))
+    val role = Option.when(sortedGrants.nonEmpty):
+      ResourceDecl(Manifest.runtimeRole, ResourceSpec.Role(RoleSpec(sortedGrants, List(TrustedService.EcsTasks))))
+    conflict.toLeft(Manifest(app = app, resources = byId.flatMap(_._2.headOption) ++ role.toList, grants = sortedGrants))

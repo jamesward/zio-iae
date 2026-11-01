@@ -71,6 +71,33 @@ object FlociSpec extends ZIOSpecDefault:
         )
       ,
     ),
+    suite("RoleProvider")(
+      test("a role converges, widening is flagged, narrowing isn't, and discovery finds it"):
+        val read  = RoleSpec(List(Grant(LogicalId("uploads"), ResourceKind.Bucket, Capability.BucketRead)), List(TrustedService.EcsTasks))
+        val write = read.copy(grants = read.grants :+ Grant(LogicalId("uploads"), ResourceKind.Bucket, Capability.BucketWrite))
+        for
+          env      <- uniqueEnv
+          iam      <- ZIO.service[IamClient]
+          provider  = RoleProvider(iam, naming)
+          address   = Address(app, env, ResourceKind.Role, Manifest.runtimeRole)
+          create    = provider.diff(address, read, None)
+          _        <- ZIO.foreachDiscard(create)(provider.applyChange(_, ApplyContext.local))
+          created  <- provider.observe(address)
+          widen     = provider.diff(address, write, created)
+          _        <- ZIO.foreachDiscard(widen)(provider.applyChange(_, ApplyContext.local))
+          widened  <- provider.observe(address)
+          narrow    = provider.diff(address, read, widened)
+          found    <- RoleDiscovery(iam).managed(app, env)
+        yield assertTrue(
+          create.exists(c => provider.assess(c, None).flags.contains(ChangeFlag.IamWidening)),
+          provider.diff(address, read, created).isEmpty,
+          widen.exists(c => provider.assess(c, created) == Assessment(Risk.High, Set(ChangeFlag.IamWidening))),
+          provider.diff(address, write, widened).isEmpty,
+          narrow.exists(c => provider.assess(c, widened) == Assessment(Risk.Medium, Set.empty)),
+          found.map(_.address) == List(address),
+        )
+      ,
+    ),
     suite("AwsCloud")(
       test("binding fails until the bucket is provisioned, then binds"):
         for
@@ -133,4 +160,4 @@ object FlociSpec extends ZIOSpecDefault:
         yield result
       ,
     ),
-  ).provideShared(FlociLayer.live, Client.default, S3Client.layer) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock
+  ).provideShared(FlociLayer.live, Client.default, S3Client.layer, AwsQueryClient.layer, IamClient.layer) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock

@@ -37,7 +37,7 @@ object CliSpec extends ZIOSpecDefault:
 
   val engine: ZLayer[Any, Throwable, Engine] =
     (FlociLayer.live ++ Client.default) >>>
-      (S3Client.layer ++ (AwsJsonClient.layer >>> TaggingClient.layer) ++ ZLayer.succeed[CommitOrder](GitCommitOrder(Paths.get(".").nn))) >>>
+      (S3Client.layer ++ (AwsJsonClient.layer >>> TaggingClient.layer) ++ (AwsQueryClient.layer >>> IamClient.layer) ++ ZLayer.succeed[CommitOrder](GitCommitOrder(Paths.get(".").nn))) >>>
       AwsEngine.layer(BucketNaming(None))
 
   def spec = suite("iae")(
@@ -76,7 +76,8 @@ object CliSpec extends ZIOSpecDefault:
           planned == 0,
           planOut.contains("+ create  Bucket uploads [Low]"),
           applied == 0,
-          applyOut.contains("applied 1 change(s)"),
+          planOut.contains("+ create  Role runtime [Low]"),
+          applyOut.contains("applied 2 change(s)"),
           after.contains("Expand plan") && after.contains("nothing to change"),
         )
       ,
