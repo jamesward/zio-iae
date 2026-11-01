@@ -721,6 +721,13 @@ When a plan's verdict is `Approve(n, groups)`:
    reaction over Slack Socket Mode (§5.7) and re-runs the env's reconcile.
 4. The reconcile recomputes the plan and asks the engine whether it's approved.
 
+**Request lifecycle.** A request's first line says where it stands, and the agent edits it as that changes (keeping
+its metadata): `*Approval needed*` while open; `*Approved*` once the approved plan has applied; `*Rejected*`;
+`*Superseded*` when a request for a different plan in the same env replaces it; `*Expired*`. Approved, superseded
+and expired requests cover nothing. A rejected one keeps covering its plan, so the change stays stopped until a new
+commit (or until the request expires and a new one is asked). An open request with no answer after the reminder
+period (default 1h) gets one thread reply that mentions the required groups (`<!subteam^…>`).
+
 The engine's checks, made with its own Slack token and never trusting the agent:
 
 - The request message was posted by the iae bot user and its footer carries the plan hash.
@@ -808,7 +815,7 @@ for env in [staging, prod]:              # promotion order from .iae/config.json
   sha      = main HEAD
   if env != first and previous env isn't observed running sha verified: continue   # promotion gate (§5.3)
   build + test at sha                    # CodeBuild: sbt Test/compile; test (Floci); image to ECR. Skipped if the image exists
-  manifest = iae manifest @ sha
+  manifest = iae manifest @ sha          # printed by the app in that build; kept per commit in the build bucket
   plan     = observe + diff (expand phase only: creates/updates, no deletes)
   verdict  = policy(env, plan)
     Deny    -> report, stop env
@@ -821,6 +828,16 @@ for env in [staging, prod]:              # promotion order from .iae/config.json
   evidence(env, sha, plan, approval, results)
   GitHub Deployment status for (env, sha)   # display only, never read back
 ```
+
+**Builds.** The agent never runs the repo's code itself. For each app and commit it zips the commit
+(`git archive`) into the tooling account's build bucket (`iae/sources/<sha>.zip`) and runs a CodeBuild build with the
+app's build commands and manifest command from `.iae/config.json` (`apps[].build`, `apps[].manifest`, optionally
+`apps[].image`). The manifest comes back as the build's artifact and is kept at `iae/manifests/<app>/<sha>.json`, so a
+commit is built once however many envs and reconciles ask for it, including after a restart; concurrent requests
+share one build. Each build gets a CodeBuild project of its own, created with everything the build needs and deleted
+when it finishes, so nothing depends on `StartBuild` overrides (Floci ignores them). The builds' service role reaches
+only the build bucket: builds run the repo's code and must not reach the env accounts. Without a build bucket
+(`IAE_BUILD_BUCKET`) the agent runs the commands itself, which is for development only.
 
 **Expand/contract ordering** keeps old and new app versions working during rollout: additive changes go before
 the deploy and removals go after it. A failure at any step stops that env, rolls back the deploy if needed (infra
@@ -897,6 +914,11 @@ dependency and rebuild. The PRs go through the normal pipeline and policy (`orig
 
 The agent runs in its own **tooling account** on ECS Fargate with a task role. There are no long-lived AWS keys.
 
+- **The agent's own credentials** come from its ECS task role (the container credentials endpoint), or static keys in
+  development. It assumes the env roles with STS AssumeRole and refreshes their credentials five minutes before they
+  expire. `.iae/config.json` maps each env to its account: `accounts.<env>` with the `planner` and `deployer` role ARNs
+  and an optional `region`. An env without one uses the agent's own account (a single-account setup). The engine
+  plans through the planner role and applies through the deployer role.
 - **Planner role** in each env account (read-only, plus CloudWatch, Cost Explorer and security-findings reads). The agent process
   assumes it for observing, planning, monitoring and cost.
 - **Deployer role** in each env account (writes, limited to `iae:managed` resources, with a permissions
@@ -999,7 +1021,8 @@ zio-iae/
 A repo managed by zio-iae has:
 
 ```
-.iae/config.json               # app entry points, envs + accounts/regions, promotion order,
+.iae/config.json               # apps (build commands, manifest command, build image), envs (promotion order),
+                               #   accounts (planner/deployer roles, region) per env,
                                #   Slack channel, responder group, GitHub-to-Slack identity mapping
 .iae/POLICY.md                 # the user's approval policy, plain English (§5.5)
 .iae/policy-examples/*.json    # example changes with expected decisions
@@ -1017,7 +1040,7 @@ and the "iae" GitHub App installed.
 | M0 ✅ | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
-| M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests from each app's command ✅ (CodeBuild builds to follow), Slack approval requests + verification and notices ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, Floci, real model when configured; clock control, per-account Floci and scenario steps to follow); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
+| M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
@@ -1032,7 +1055,7 @@ and the "iae" GitHub App installed.
 | Q1 | Package and artifact naming: `zio.iae` / `dev.zio`-style vs `com.jamesward` | `zio.iae` package, `com.jamesward` org, unless it moves under the ZIO org |
 | Q2 | Resource identity via singleton-type `Tag`s: verify izumi-reflect stability; fallback to marker traits | Resolved in M1: works across modules (§3.2) |
 | Q3 | Hand-written `iae-aws-client` vs zio-aws vs Java SDK v2 | Hand-written for the ops we need (ZIO-native streams, Scala 3, small footprint); revisit if the surface grows |
-| Q4 | Manifest extraction: running `main --iae-manifest` via sbt per commit is slow | Do it in CodeBuild alongside the build; keep the result in memory for the commit; later an sbt task that only links the `infra` value |
+| Q4 | Manifest extraction: running `main --iae-manifest` via sbt per commit is slow | Done in CodeBuild alongside the build and kept per commit in the build bucket (§5.8) ✅; later an sbt task that only links the `infra` value |
 | Q5 | When to split out the executor (§5.11) | Before managing prod (M4) |
 | Q6 | Does the agent need durable memory beyond what it can rehydrate (learned facts about a system, runbooks)? | If so, as markdown in the repo (`.iae/agent/notes/`) written through PRs, so it's reviewed and versioned rather than a hidden store |
 | Q7 | Multi-app repos and shared infra (VPC, ALB, DNS zone) owned by a platform `InfraModule` | Platform module with its own Slack channel and policy; apps reference it by id |
