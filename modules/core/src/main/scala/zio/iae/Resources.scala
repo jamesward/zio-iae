@@ -7,9 +7,10 @@ import zio.schema.{Schema, derived}
 import zio.schema.annotation.simpleEnum
 import zio.schema.codec.JsonCodec
 
+/** Declared in the order resources are created: a topic subscribes queues, and a role grants access to the rest. */
 @simpleEnum
 enum ResourceKind derives Schema, CanEqual:
-  case Bucket, Queue, Secret, Table, Role
+  case Bucket, Queue, Secret, Table, Topic, Role
 
 @simpleEnum
 enum Versioning derives Schema, CanEqual:
@@ -31,6 +32,7 @@ enum ResourceSpec derives Schema, CanEqual:
   case Queue(spec: QueueSpec)
   case Secret(spec: SecretSpec)
   case Table(spec: TableSpec)
+  case Topic(spec: TopicSpec)
   case Role(spec: RoleSpec)
 
   def kind: ResourceKind = this match
@@ -38,6 +40,7 @@ enum ResourceSpec derives Schema, CanEqual:
     case Queue(_)  => ResourceKind.Queue
     case Secret(_) => ResourceKind.Secret
     case Table(_)  => ResourceKind.Table
+    case Topic(_)  => ResourceKind.Topic
     case Role(_)   => ResourceKind.Role
 
 final case class ResourceDecl(id: LogicalId, spec: ResourceSpec) derives Schema, CanEqual:

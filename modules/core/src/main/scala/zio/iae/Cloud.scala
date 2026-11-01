@@ -12,3 +12,4 @@ trait Cloud:
   def queue[I <: MessageQueue.Id[?]](id: I): IO[InfraError, MessageQueue[I]]
   def secret[I](id: LogicalId, spec: SecretSpec): IO[InfraError, SecretReader[I]]
   def table[I <: Table.Id[?, ?]](id: I): IO[InfraError, Table[I]]
+  def topic[I <: Topic.Id[?]](id: I): IO[InfraError, TopicPublisher[I]]

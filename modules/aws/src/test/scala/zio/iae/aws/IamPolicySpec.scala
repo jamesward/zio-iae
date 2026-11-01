@@ -64,6 +64,17 @@ object IamPolicySpec extends ZIOSpecDefault:
         write.map(_.permissions) == Right(Set("dynamodb:DeleteItem" -> arn, "dynamodb:PutItem" -> arn)),
       )
     ,
+    test("a topic publisher may publish to that one topic"):
+      val doc = IamPolicy.permissions(app, env, RoleSpec(List(Grant(LogicalId("events"), ResourceKind.Topic, Capability.TopicPublish)), Nil), naming, context)
+      assertTrue(doc.map(_.permissions) == Right(Set("sns:Publish" -> "arn:aws:sns:us-east-1:123456789012:photo-app-prod-events")))
+    ,
+    test("subscribing a queue keeps the other statements in its policy and replaces only ours"):
+      val theirs  = """{"Version":"2012-10-17","Statement":[{"Sid":"someone-else","Effect":"Allow","Principal":"*","Action":"sqs:GetQueueUrl","Resource":"q"}]}"""
+      val ours    = TopicProvider.statement("arn:aws:sns:us-east-1:1:events", "arn:aws:sqs:us-east-1:1:q")
+      val once    = TopicProvider.withStatement(Some(theirs), ours)
+      val twice   = TopicProvider.withStatement(Some(once), ours)
+      assertTrue(once.contains("someone-else"), once.contains("iae-events"), twice == once)
+    ,
     test("documents round-trip through the JSON IAM stores"):
       val spec  = RoleSpec(List(grant("uploads", Capability.BucketRead), grant("thumbs", Capability.BucketWrite)), List(TrustedService.EcsTasks))
       val doc   = IamPolicy.permissions(app, env, spec, naming, context)

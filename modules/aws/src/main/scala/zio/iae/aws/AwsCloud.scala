@@ -23,6 +23,8 @@ final case class AwsCloud(
     queues: QueueProvider,
     secrets: SecretsClient,
     dynamo: DynamoClient,
+    sns: SnsClient,
+    context: AwsContext,
 ) extends Cloud:
   def bucket[I](id: LogicalId, spec: BucketSpec): IO[InfraError, Bucket[I]] =
     val address = Address(app, env, ResourceKind.Bucket, id)
@@ -46,6 +48,11 @@ final case class AwsCloud(
     val address = Address(app, env, ResourceKind.Table, id.logicalId)
     bind(TableProvider(dynamo), address, id.spec, ResourceSpec.Table(id.spec))(_.tags).as(DynamoKeyValue[I](id, dynamo, TableNaming.physical(address)))
 
+  def topic[I <: Topic.Id[?]](id: I): IO[InfraError, TopicPublisher[I]] =
+    val address = Address(app, env, ResourceKind.Topic, id.logicalId)
+    bind(TopicProvider(sns, sqs, context), address, id.spec, ResourceSpec.Topic(id.spec))(_.tags)
+      .as(SnsTopic[I](id, sns, TopicNaming.arn(context, address)))
+
   /** Checks (or, when auto-provisioning, converges) the resource, and returns what is there afterwards. */
   private def bind[S, O](provider: Provider[S, O], address: Address, spec: S, resource: ResourceSpec)(tags: O => Map[String, String]): IO[InfraError, Option[O]] =
     for
@@ -67,9 +74,31 @@ final case class AwsCloud(
     yield after
 
 object AwsCloud:
-  def layer(app: AppName, env: EnvName, mode: ProvisionMode, naming: BucketNaming): ZLayer[S3Client & SqsClient & SecretsClient & DynamoClient, Nothing, Cloud] =
-    ZLayer.fromFunction((s3: S3Client, sqs: SqsClient, secrets: SecretsClient, dynamo: DynamoClient) =>
-      AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets, dynamo)
+  type Clients = S3Client & SqsClient & SecretsClient & DynamoClient & SnsClient & AwsContext
+
+  def layer(app: AppName, env: EnvName, mode: ProvisionMode, naming: BucketNaming): ZLayer[Clients, Nothing, Cloud] =
+    ZLayer:
+      for
+        s3      <- ZIO.service[S3Client]
+        sqs     <- ZIO.service[SqsClient]
+        secrets <- ZIO.service[SecretsClient]
+        dynamo  <- ZIO.service[DynamoClient]
+        sns     <- ZIO.service[SnsClient]
+        context <- ZIO.service[AwsContext]
+      yield AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets, dynamo, sns, context)
+
+  /** Every client the AWS cloud needs, from an `AwsConfig` and an HTTP client. */
+  val clients: ZLayer[AwsConfig & Client, AwsError, Clients] =
+    ZLayer.makeSome[AwsConfig & Client, Clients](
+      S3Client.layer,
+      AwsJsonClient.layer,
+      SqsClient.layer,
+      SecretsClient.layer,
+      DynamoClient.layer,
+      AwsQueryClient.layer,
+      SnsClient.layer,
+      StsClient.layer,
+      AwsContext.layer,
     )
 
   /** Configuration from the environment: `IAE_ENV` (required), `IAE_PROVISION` (`bind`, the default, or `auto`),
@@ -87,9 +116,9 @@ object AwsCloud:
                   case Some(other)         => ZIO.fail(InfraError.InvalidConfig(s"IAE_PROVISION must be 'bind' or 'auto', not '$other'"))
         suffix <- System.env("IAE_NAME_SUFFIX").orElseFail(InfraError.InvalidConfig("cannot read IAE_NAME_SUFFIX"))
       yield (env, mode, BucketNaming(suffix))
-    val clients =
+    val base =
       AwsConfig.layer.mapError(e => InfraError.InvalidConfig(e.message)) ++
         Client.default.mapError(e => InfraError.Unavailable(s"HTTP client: ${e.getMessage}"))
     ZLayer.fromZIO(settings).flatMap: env =>
       val (envName, mode, naming) = env.get
-      (clients >>> (S3Client.layer ++ (AwsJsonClient.layer >>> (SqsClient.layer ++ SecretsClient.layer ++ DynamoClient.layer)))) >>> layer(app, envName, mode, naming)
+      (base >>> clients.mapError(e => InfraError.Unavailable(e.message))) >>> layer(app, envName, mode, naming)

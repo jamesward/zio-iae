@@ -48,8 +48,8 @@ object EngineSpec extends ZIOSpecDefault:
   val uniqueEnv: UIO[EnvName] =
     ZIO.collectAll(List.fill(8)(Random.nextIntBounded(26).map(i => ('a' + i).toChar))).map(cs => EnvName.from("e" + cs.mkString).toOption.get)
 
-  def engineWith(history: CommitOrder): URIO[AwsEngine.Clients & AwsContext, Engine] =
-    AwsEngine.layer(naming).build.provideSome[AwsEngine.Clients & AwsContext](ZLayer.succeed(history), Scope.default).map(_.get)
+  def engineWith(history: CommitOrder): URIO[AwsEngine.Clients, Engine] =
+    AwsEngine.layer(naming).build.provideSome[AwsEngine.Clients](ZLayer.succeed(history), Scope.default).map(_.get)
 
   /** After converging, planning again finds nothing to do in either phase. */
   def assertConverges(engine: Engine, manifest: Manifest, env: EnvName, target: Option[CommitSha]): IO[EngineError, TestResult] =
@@ -152,6 +152,16 @@ object EngineSpec extends ZIOSpecDefault:
         !actions.exists(_._1 == "s3:PutObject"),
       )
     ,
+    test("queues are created before the topics that deliver to them, and the app converges"):
+      object Fanout extends Topic.Id[Job](LogicalId("fanout"), List(Topic.to(Jobs)))
+      for
+        env      <- uniqueEnv
+        engine   <- engineWith(LinearHistory(Nil))
+        manifest <- manifestOf(Topic.publisher(Fanout) ++ MessageQueue.receiver(Jobs))
+        plan     <- engine.plan(manifest, env, None, Phase.Expand)
+        result   <- assertConverges(engine, manifest, env, None)
+      yield result && assertTrue(plan.changes.map(_.address.kind) == List(ResourceKind.Queue, ResourceKind.Topic, ResourceKind.Role))
+    ,
     test("plans are data: they round-trip through JSON and hash by content"):
       for
         env      <- uniqueEnv
@@ -162,17 +172,4 @@ object EngineSpec extends ZIOSpecDefault:
         decoded   = zio.schema.codec.JsonCodec.jsonDecoder(zio.schema.Schema[Plan]).decodeJson(plan.toJson)
       yield assertTrue(decoded == Right(plan), plan.hash == again.hash)
     ,
-  ).provideShared(
-    FlociLayer.live,
-    Client.default,
-    S3Client.layer,
-    AwsJsonClient.layer,
-    TaggingClient.layer,
-    AwsQueryClient.layer,
-    IamClient.layer,
-    StsClient.layer,
-    AwsContext.layer,
-    SqsClient.layer,
-    SecretsClient.layer,
-    DynamoClient.layer,
-  ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock @@ TestAspect.timeout(3.minutes)
+  ).provideShared(FlociLayer.live, Client.default, AwsEngine.clients) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock @@ TestAspect.timeout(3.minutes)

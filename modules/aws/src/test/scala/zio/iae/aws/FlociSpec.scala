@@ -24,6 +24,9 @@ object FlociSpec extends ZIOSpecDefault:
   final case class PhotoId(value: String) derives Schema, CanEqual
   final case class PhotoInfo(width: Int, height: Int, tags: List[String]) derives Schema, CanEqual
   object PhotoInfos extends Table.Id[PhotoId, PhotoInfo](LogicalId("photo-info"))
+
+  object Thumbnails extends MessageQueue.Id[Job](LogicalId("thumbnails"))
+  object Uploaded   extends Topic.Id[Job](LogicalId("uploaded"), List(Topic.to(Thumbnails)))
   object Jobs extends MessageQueue.Id[Job](LogicalId("jobs"), QueueSpec(visibilityTimeout = 1.second, deadLetter = Some(DeadLetter(maxReceives = 3))))
   object Archive extends Bucket.Id(LogicalId("archive"), BucketSpec(versioning = Versioning.Enabled))
 
@@ -36,13 +39,8 @@ object FlociSpec extends ZIOSpecDefault:
 
   def bytes(text: String): ZStream[Any, Nothing, Byte] = ZStream.fromChunk(Chunk.fromArray(text.getBytes(UTF_8)))
 
-  def cloud(env: EnvName, mode: ProvisionMode): URIO[S3Client & SqsClient & SecretsClient & DynamoClient, Cloud] =
-    for
-      s3      <- ZIO.service[S3Client]
-      sqs     <- ZIO.service[SqsClient]
-      secrets <- ZIO.service[SecretsClient]
-      dynamo  <- ZIO.service[DynamoClient]
-    yield AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets, dynamo)
+  def cloud(env: EnvName, mode: ProvisionMode): URIO[AwsCloud.Clients, Cloud] =
+    AwsCloud.layer(app, env, mode, naming).build.provideSome[AwsCloud.Clients](Scope.default).map(_.get)
 
   def spec = suite("Floci")(
     suite("BucketProvider")(
@@ -161,6 +159,37 @@ object FlociSpec extends ZIOSpecDefault:
         )
       ,
     ),
+    suite("TopicProvider")(
+      test("a published message reaches the subscribed queue, and dropping the subscriber unsubscribes it"):
+        for
+          env      <- uniqueEnv
+          c        <- cloud(env, ProvisionMode.AutoProvision)
+          queue    <- c.queue(Thumbnails)
+          topic    <- c.topic(Uploaded)
+          _        <- topic.publish(Job("cat.jpg"))
+          received <- queue.receive(max = 10, wait = 5.seconds)
+          sns      <- ZIO.service[SnsClient]
+          sqs      <- ZIO.service[SqsClient]
+          context  <- ZIO.service[AwsContext]
+          provider  = TopicProvider(sns, sqs, context)
+          address   = Address(app, env, ResourceKind.Topic, Uploaded.logicalId)
+          observed <- provider.observe(address)
+          dropped   = provider.diff(address, TopicSpec(Nil), observed)
+          _        <- ZIO.foreachDiscard(dropped)(provider.applyChange(_, ApplyContext.local))
+          after    <- provider.observe(address)
+          policy   <- sqs.queueUrl(s"photo-app-${env.value}-thumbnails").someOrFail(AwsError.InvalidRequest("no queue")).flatMap(sqs.attributes).map(_.get("Policy"))
+        yield assertTrue(
+          received.map(_.message) == Chunk(Job("cat.jpg")),
+          provider.diff(address, Uploaded.spec, observed).isEmpty,
+          dropped.exists:
+            case Change.Update(_, _, fields) => fields.exists(f => f.field == "subscription" && f.to == "(none)")
+            case _                           => false
+          ,
+          after.exists(_.subscriptions.isEmpty),
+          policy.exists(_.contains("sns.amazonaws.com")),
+        )
+      ,
+    ),
     suite("TableProvider")(
       test("a table converges, and typed items go in and come out"):
         for
@@ -271,16 +300,4 @@ object FlociSpec extends ZIOSpecDefault:
         yield result
       ,
     ),
-  ).provideShared(
-    FlociLayer.live,
-    Client.default,
-    S3Client.layer,
-    AwsQueryClient.layer,
-    IamClient.layer,
-    StsClient.layer,
-    AwsContext.layer,
-    AwsJsonClient.layer,
-    SqsClient.layer,
-    SecretsClient.layer,
-    DynamoClient.layer,
-  ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock
+  ).provideShared(FlociLayer.live, Client.default, AwsCloud.clients, AwsQueryClient.layer, IamClient.layer) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock

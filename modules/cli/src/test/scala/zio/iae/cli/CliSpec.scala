@@ -5,7 +5,7 @@ import java.nio.file.{Files, Path, Paths}
 import zio.*
 import zio.http.Client
 import zio.iae.*
-import zio.iae.aws.{AwsContext, BucketNaming}
+import zio.iae.aws.BucketNaming
 import zio.iae.aws.client.*
 import zio.iae.engine.*
 import zio.iae.testkit.FlociLayer
@@ -35,23 +35,9 @@ object CliSpec extends ZIOSpecDefault:
       output  <- TestConsole.output
     yield (code.code, output.mkString)
 
-  val engine: ZLayer[Any, Throwable, Engine] =
-    ZLayer.make[Engine](
-      FlociLayer.live,
-      Client.default,
-      S3Client.layer,
-      AwsJsonClient.layer,
-      TaggingClient.layer,
-      SqsClient.layer,
-      SecretsClient.layer,
-      DynamoClient.layer,
-      AwsQueryClient.layer,
-      IamClient.layer,
-      StsClient.layer,
-      AwsContext.layer.mapError(e => IllegalStateException(e.message)),
-      ZLayer.succeed[CommitOrder](GitCommitOrder(Paths.get(".").nn)),
-      AwsEngine.layer(BucketNaming(None)),
-    )
+  val engine: ZLayer[Any, Throwable | AwsError, Engine] =
+    (FlociLayer.live ++ Client.default) >>> (AwsEngine.clients ++ ZLayer.succeed[CommitOrder](GitCommitOrder(Paths.get(".").nn))) >>>
+      AwsEngine.layer(BucketNaming(None))
 
   def spec = suite("iae")(
     suite("arguments")(

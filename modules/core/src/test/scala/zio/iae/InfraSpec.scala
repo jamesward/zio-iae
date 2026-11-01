@@ -1,5 +1,6 @@
 package zio.iae
 
+import zio.schema.derived
 import zio.test.*
 
 object InfraSpec extends ZIOSpecDefault:
@@ -8,6 +9,12 @@ object InfraSpec extends ZIOSpecDefault:
   object Clash   extends Bucket.Id(LogicalId("uploads"))
 
   val app = AppName("photo-app")
+
+  final case class Resize(photo: String) derives zio.schema.Schema
+  final case class Other(n: Int) derives zio.schema.Schema
+  object Thumbnailer extends MessageQueue.Id[Resize](LogicalId("thumbnailer"))
+  object Indexer     extends MessageQueue.Id[Resize](LogicalId("indexer"))
+  object PhotoEvents extends Topic.Id[Resize](LogicalId("photo-events"), List(Topic.to(Thumbnailer), Topic.to(Indexer)))
 
   def spec = suite("Infra")(
     test("combining declarations merges resources and grants"):
@@ -31,6 +38,24 @@ object InfraSpec extends ZIOSpecDefault:
         case Left(InfraError.ConflictingDeclarations(id, specs)) => id == LogicalId("uploads") && specs.size == 2
         case _                                                   => false
       )
+    ,
+    test("a topic's subscribers must be queues the app declares"):
+      val missing = Topic.publisher(PhotoEvents).manifest(app)
+      val wired   = (Topic.publisher(PhotoEvents) ++ MessageQueue.wired(Thumbnailer) ++ MessageQueue.receiver(Indexer)).manifest(app)
+      assertTrue(
+        missing match
+          case Left(InfraError.InvalidConfig(detail)) => detail.contains("indexer") && detail.contains("thumbnailer")
+          case _                                      => false
+        ,
+        wired.map(_.resources.map(_.kind)).map(_.toSet) == Right(Set(ResourceKind.Topic, ResourceKind.Queue, ResourceKind.Role)),
+        wired.map(_.grants.map(_.capability)) == Right(List(Capability.QueueReceive, Capability.TopicPublish)),
+      )
+    ,
+    test("a topic can only deliver to queues of its message type"):
+      typeCheck("""
+        object OtherQueue extends MessageQueue.Id[Other](LogicalId("other"))
+        object Bad extends Topic.Id[Resize](LogicalId("bad"), List(Topic.to(OtherQueue)))
+      """).map(result => assertTrue(result.isLeft))
     ,
     test("the manifest round-trips through JSON"):
       val manifest = (Bucket.readWrite(Uploads) ++ Bucket.reader(Thumbs)).manifest(app)

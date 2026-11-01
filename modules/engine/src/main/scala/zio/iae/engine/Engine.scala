@@ -16,7 +16,7 @@ final case class Planner(drivers: Drivers, discovery: Discovery):
 
   private def expand(manifest: Manifest, env: EnvName): IO[EngineError, List[PlannedChange]] =
     ZIO
-      .foreach(manifest.resources): decl =>
+      .foreach(manifest.resources.sortBy(_.kind.ordinal)): decl =>
         val address = Address(manifest.app, env, decl.kind, decl.id)
         drivers(decl.kind).flatMap(_.plan(address, decl.spec).mapError(EngineError.Provider(_)))
       .map(_.flatten)

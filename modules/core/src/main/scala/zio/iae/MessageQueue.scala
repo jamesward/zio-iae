@@ -68,6 +68,10 @@ object MessageQueue:
   def sendReceive[I <: Id[?] & Singleton](id: I)(using Tag[MessageQueue[I]]): Infra[MessageQueue[I]] =
     declare(id, Chunk(Capability.QueueSend, Capability.QueueReceive))
 
+  /** Declares a queue the app doesn't use itself, for example one a topic delivers to for another service. */
+  def wired[I <: Id[?] & Singleton](id: I): Infra[Any] =
+    Infra(Chunk(ResourceDecl(id.logicalId, ResourceSpec.Queue(id.spec))), Chunk.empty, ZLayer.empty)
+
   private def declare[I <: Id[?] & Singleton, R >: MessageQueue[I]: Tag](id: I, capabilities: Chunk[Capability]): Infra[R] =
     Infra(
       resources = Chunk(ResourceDecl(id.logicalId, ResourceSpec.Queue(id.spec))),

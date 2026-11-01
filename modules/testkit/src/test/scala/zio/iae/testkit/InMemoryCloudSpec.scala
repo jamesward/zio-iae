@@ -78,3 +78,27 @@ object InMemoryTableSpec extends ZIOSpecDefault:
       """).map(result => assertTrue(result.isLeft))
     ,
   )
+
+object InMemoryTopicSpec extends ZIOSpecDefault:
+  import zio.schema.{Schema, derived}
+
+  final case class Uploaded(photo: String) derives Schema, CanEqual
+  object Thumbnailer extends MessageQueue.Id[Uploaded](LogicalId("thumbnailer"))
+  object Indexer     extends MessageQueue.Id[Uploaded](LogicalId("indexer"))
+  object Uploads     extends Topic.Id[Uploaded](LogicalId("uploads"), List(Topic.to(Thumbnailer), Topic.to(Indexer)))
+
+  val infra = Topic.publisher(Uploads) ++ MessageQueue.receiver(Thumbnailer) ++ MessageQueue.receiver(Indexer)
+
+  def spec = suite("InMemoryCloud topics")(
+    test("a published message reaches every subscribed queue"):
+      val program =
+        for
+          uploads     <- ZIO.service[TopicPublisher[Uploads.type]]
+          thumbnailer <- ZIO.service[QueueReceiver[Thumbnailer.type]]
+          indexer     <- ZIO.service[QueueReceiver[Indexer.type]]
+          _           <- uploads.publish(Uploaded("cat.jpg"))
+          a           <- thumbnailer.receive()
+          b           <- indexer.receive()
+        yield assertTrue(a.map(_.message) == Chunk(Uploaded("cat.jpg")), b.map(_.message) == Chunk(Uploaded("cat.jpg")))
+      program.provide(InMemoryCloud.layer(AppName("photo-app"), EnvName("test")) >>> infra.layer)
+  )

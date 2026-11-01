@@ -37,16 +37,25 @@ final case class InMemoryCloud(
         def delete[K, V](key: K)(using ev: I <:< Table.Id[K, V]): IO[TableError, Unit] =
           tables.update(_ - (id.logicalId -> Table.encode(ev(id).keySchema, key)))
 
+  /** Publishing delivers the message to every subscribed in-memory queue, as raw SNS-to-SQS delivery does. */
+  def topic[I <: Topic.Id[?]](id: I): IO[InfraError, TopicPublisher[I]] =
+    ZIO.succeed:
+      new TopicPublisher[I]:
+        def publish[M](message: M)(using ev: I <:< Topic.Id[M]): IO[TopicError, Unit] =
+          val body = Topic.encode(ev(id).schema, message)
+          ZIO.foreachDiscard(id.spec.subscribers)(s => queueState(s.queue).flatMap(_.update(st => st.copy(ready = st.ready :+ InMemoryQueue.Stored(body, 0)))))
+
+  private def queueState(id: LogicalId): UIO[Ref[InMemoryQueue.State]] =
+    queues.modifyZIO: all =>
+      all.get(id) match
+        case Some(state) => ZIO.succeed((state, all))
+        case None        => Ref.make(InMemoryQueue.empty).map(state => (state, all + (id -> state)))
+
   /** Sets a secret's value, as a person would out of band. */
   def setSecret(id: LogicalId, value: String): UIO[Unit] = secrets.update(_ + (id -> Some(value)))
 
   def queue[I <: MessageQueue.Id[?]](id: I): IO[InfraError, MessageQueue[I]] =
-    queues
-      .modifyZIO: all =>
-        all.get(id.logicalId) match
-          case Some(state) => ZIO.succeed((state, all))
-          case None        => Ref.make(InMemoryQueue.empty).map(state => (state, all + (id.logicalId -> state)))
-      .map(InMemoryQueue(id, _))
+    queueState(id.logicalId).map(InMemoryQueue(id, _))
 
 object InMemoryCloud:
   final case class Stored(bytes: Chunk[Byte], contentType: Option[String], eTag: String, lastModified: Instant)
