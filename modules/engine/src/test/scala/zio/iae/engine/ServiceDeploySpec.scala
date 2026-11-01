@@ -14,7 +14,7 @@ object ServiceDeploySpec extends ZIOSpecDefault:
   val app = AppName("svc-app")
 
   def manifest(port: Int, command: List[String]): Manifest =
-    val spec = ServiceSpec(5678, healthPath = "/", listenerPort = port, canary = CanarySpec(List(50, 100), 2), command = command, image = Some("hashicorp/http-echo:1.0"))
+    val spec = ServiceSpec(5678, healthPath = "/", listenerPort = port, canary = CanarySpec(List(50, 100), 6, alarmPeriodSeconds = 10), command = command, image = Some("hashicorp/http-echo:1.0"))
     Manifest(app, List(ResourceDecl(LogicalId("web"), ResourceSpec.Service(spec))), Nil)
 
   object AnyOrder extends CommitOrder:
@@ -45,12 +45,13 @@ object ServiceDeploySpec extends ZIOSpecDefault:
         tags1    <- elb.loadBalancer(ServiceNaming.loadBalancer(address)).someOrFail("no lb").flatMap(lb => elb.tags(lb.arn))
         // The bad version: its alarm goes off once it has traffic.
         v3        = manifest(port, List("-text=v3", "-status-code=500"))
-        alarm     = ServiceNaming.alarm(address, Color.Blue)
-        trip      = (elb.loadBalancer(ServiceNaming.loadBalancer(address)).someOrFail("no lb").flatMap(lb => elb.listeners(lb.arn)).map(_.exists(_.weights.values.exists(w => w > 0 && w < 100))))
-                      .repeat(Schedule.spaced(200.millis) && Schedule.recurUntil[Boolean](identity)) *> cw.setState(alarm, AlarmState.Alarm, "test: 5xx")
-        tripper  <- trip.fork
+        lb       <- elb.loadBalancer(ServiceNaming.loadBalancer(address)).someOrFail("no lb")
+        blue     <- elb.targetGroup(ServiceNaming.targetGroup(address, Color.Blue)).someOrFail("no blue")
+        // What a real ALB publishes for the new color while it answers 500s.
+        errors    = cw.putMetric("AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", 5, Map("LoadBalancer" -> ServiceProvider.arnSuffix(lb.arn, "loadbalancer/"), "TargetGroup" -> ServiceProvider.arnSuffix(blue.arn, "")))
+        tripper  <- errors.repeat(Schedule.spaced(300.millis)).fork
         bad      <- engine.converge(v3, env, None).either
-        _        <- tripper.join
+        _        <- tripper.interrupt
         after    <- serving("v2")
         again    <- engine.converge(v3, env, None).either
         tags2    <- elb.loadBalancer(ServiceNaming.loadBalancer(address)).someOrFail("no lb").flatMap(lb => elb.tags(lb.arn))

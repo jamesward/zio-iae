@@ -17,7 +17,8 @@ object ServiceNaming:
   def cluster(address: Address): String                = s"iae-${address.app.value}-${address.env.value}"
   def loadBalancer(address: Address): String           = s"iae-${hash(address)}"
   def targetGroup(address: Address, c: Color): String  = s"iae-${hash(address)}-${c.short}"
-  def ecsService(address: Address, c: Color): String   = s"${address.id.value}-$c"
+  // The env is in the name although clusters are per env: Floci keys services by name across clusters.
+  def ecsService(address: Address, c: Color): String   = s"${address.env.value}-${address.id.value}-$c"
   def family(address: Address): String                 = s"iae-${address.app.value}-${address.env.value}-${address.id.value}"
   def alarm(address: Address, c: Color): String        = s"iae-${address.app.value}-${address.env.value}-${address.id.value}-$c-5xx"
 
@@ -169,7 +170,9 @@ final case class ServiceProvider(
                  _   <- ecs.updateService(cluster, ServiceNaming.ecsService(address, live), None, Some(0)).when(canary && old.isDefined)
                  _ <- elb.tag(current.loadBalancer.arn, ManagedTags.converged(current.tags, address, hash, ctx) ++ Map(ColorTag -> next.toString, ImageTag -> image))
                yield ()
-    yield ()).mapError(e => ProviderError(address, "deploy", e.message))
+    yield ()).mapError:
+      case AwsError.InvalidRequest(detail) => ProviderError(address, "deploy", detail) // a rollback or a precondition
+      case other                           => ProviderError(address, "deploy", other.message)
 
   /** Each step's share of the traffic, then its bake; None if every step stayed quiet (and the new color then has all
     * the traffic), or why it has to roll back.
