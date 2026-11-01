@@ -449,10 +449,10 @@ receive git pushes through our own GitHub webhook, and the long-running jobs (re
 optimizer) are fibers in the same process.
 
 ```
- GitHub ──webhook──▶ iae-webhook (Lambda, verifies signature) ──▶ SQS inbox ─┐
- CloudWatch alarms / Config / CloudTrail / Cost Anomaly ──EventBridge──▶ SQS ─┤
- Slack ◀──Socket Mode (outbound websocket)──────────────────────────────────┐ │
-                                                                            ▼ ▼
+ GitHub, Slack ──signed webhooks──▶ iae-webhook (verifies signatures) ──▶ SQS inbox ─┐
+ CloudWatch alarms / Config / CloudTrail / Cost Anomaly ──EventBridge──▶ SQS ─────────┤
+ Slack ◀──Web API (posts, history, reactions, groups)─────────────────────────────┐   │
+                                                                                  ▼   ▼
                          ┌──────────────────── iae-agent (ECS Fargate, 1 task) ─────────────────────┐
                          │ Inbox router ─▶ per-env reconciler fibers ─▶ engine (plan/policy/apply)  │
                          │             ─▶ background jobs (monitor, drift, cleanup, cost)            │
@@ -490,7 +490,7 @@ Code, but the agent doesn't need it.
 |---|---|---|
 | **Push to `main`** | GitHub App webhook (`push`), received by `iae-webhook`, a small Lambda with a Function URL that verifies `X-Hub-Signature-256` and enqueues to the SQS inbox (dedupe by `X-GitHub-Delivery`) | Reconciler for every env of the affected apps |
 | Pull requests | Same webhook (`pull_request`) | Plan preview + policy status check `iae/policy` on the PR; agent-authored PR flow (§5.5) |
-| Slack | Socket Mode: the agent opens an outbound websocket, so there's no public Slack endpoint | Approvals (§5.6), conversations (§5.7) |
+| Slack | Slack's Events API to the same webhook (`/slack`, signature and a 5-minute replay window checked), reduced to `SlackReaction`/`SlackReply` inbox events | Approvals (§5.6), conversations (§5.7) |
 | Alarms | CloudWatch alarm state changes through EventBridge to the inbox | Monitor job (§5.10) |
 | Drift | AWS Config / CloudTrail events on `iae:managed` resources by a principal other than the deployer role, through EventBridge | Drift job (§5.10) |
 | Cost | Cost Anomaly Detection through EventBridge; scheduled Cost Explorer reads | Cost job (§5.10) |
@@ -498,9 +498,12 @@ Code, but the agent doesn't need it.
 | Build results | CodeBuild state changes through EventBridge | Reconciler waiting on that build |
 | Timers | `Schedule`s in the process: periodic full reconcile (default 15 min), cleanup (daily), cost review (daily, weekly report), reminders and expiries | The owning job |
 
-The agent has **no inbound network endpoint** of its own. GitHub reaches it through the webhook Lambda and SQS;
-Slack through a websocket the agent opens. SQS keeps events while the agent restarts or redeploys (up to 14
-days), and the periodic reconcile covers anything that's lost anyway.
+The agent has **no inbound network endpoint** of its own. GitHub and Slack both reach it through the webhook and
+SQS, so there is one input path and it is buffered (up to 14 days) while the agent restarts or redeploys; the
+periodic reconcile covers anything that's lost anyway. (Socket Mode was the first plan; one signed webhook for both
+turned out simpler.) Inbox events carry only identifiers: the agent re-reads git, the cloud and Slack, so a forged
+or replayed event can at most cause an extra reconcile. The webhook is an HTTP server (`WebhookServer`), run on
+Lambda behind the Lambda Web Adapter or anywhere else.
 
 ### 5.3 State
 
@@ -730,7 +733,7 @@ Alternatives considered:
 
 - *Plan PRs* (approval file merged with CODEOWNERS review): strong GitHub-native trail, but slow and awkward for
   on-call. It could come back as an optional second channel for teams that live in GitHub.
-- *Slack buttons*: nicer UX, and the agent receives clicks over Socket Mode, but a click isn't recorded anywhere
+- *Slack buttons*: nicer UX, and clicks would reach the agent through the webhook, but a click isn't recorded anywhere
   in Slack, so the record would have to be a message the agent writes, which the agent could forge. Planned as v2
   with a separate approvals app whose token only the executor (§5.11) holds.
 - *GitHub Environments with required reviewers*: only gates GitHub Actions jobs. It fits if applies move into
@@ -761,7 +764,7 @@ outside what the policy lets it do alone; it sees drift it didn't cause; or an a
 can also start a conversation by mentioning the bot in the channel ("why did staging roll back?").
 
 **Waiting.** A question parks the task: the conversation stays in memory and the agent does other work. A reply
-arrives over Socket Mode and resumes the task with the reply appended. The default for no answer is always to
+arrives through the webhook and resumes the task with the reply appended. The default for no answer is always to
 do nothing: after a reminder period (default 1h) the agent mentions the group, and when the wait expires it
 posts that it stopped. After a restart, waits are restored from the thread (§5.3).
 
@@ -771,7 +774,15 @@ approval request. Replies count only from members of the configured responder gr
 their text as information to weigh, not as instructions that override the policy.
 
 **Identity and tokens.** One Slack app, "iae", with a bot token (post, update, read history and reactions, read
-user groups) and an app-level token for Socket Mode, both in Secrets Manager in the tooling account.
+user groups) and the signing secret its events are checked with (webhook only), both in Secrets Manager in the
+tooling account.
+
+**Approval requests carry what they cover in Slack message metadata** (`iae_approval_request`: app, env, manifest
+hash, plan hash, the change keys, required count and groups, author, expiry). The agent finds a covering request
+by reading the channel's history, so nothing is stored outside Slack. A request covers a later plan with the same
+manifest whose changes are a subset of the request's, which is how a crashed apply finishes without a new
+approval. Eligible reactions come from members of the required groups who aren't bots, the change's author (mapped
+from the commit email through `identities` in `.iae/config.json`) or the agent itself.
 
 **No state.** Conversations and approvals live in Slack and are read back through Slack's API, the same way
 infra is read back through AWS's. Slack message retention for the channel has to be at least the longest
@@ -994,7 +1005,7 @@ and the "iae" GitHub App installed.
 | M0 ✅ | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
-| M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, `EvaluatePolicy` with `POLICY.md` + policy examples, approval requests + verification, notices, rehydrate on restart; local harness (`AppTest`, `FakeSlack` + web UI, `FakeGitHub`, per-account Floci, clock control, first scenarios); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval. Then the same on a real staging account |
+| M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests from each app's command ✅ (CodeBuild builds to follow), Slack approval requests + verification and notices ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` + policy examples; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, Floci; clock control, per-account Floci and scenario steps to follow); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
