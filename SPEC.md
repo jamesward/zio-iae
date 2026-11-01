@@ -872,6 +872,38 @@ and either proposes a fix PR or asks for guidance.
   canary watcher is a fiber in the agent process, so a bake window is just a `ZIO.sleep` between checks.
 - Staging gets the same flow with shorter bake times, so the canary machinery runs on every change.
 
+**As built.** `Service.run(Id)` declares a `ServiceSpec`: port, health path, size, count, listener port, canary
+steps, bake, alarm period, environment and command. Its image isn't in the code. The agent fills it in from the
+app's `container` in `.iae/config.json` (`…/photo-app:${commit}`), so a new commit's image changes the service's
+spec. That makes a deploy an ordinary `Update` of the `Service` resource, which goes through policy, approvals, the
+executor and evidence like any other change.
+
+The provider creates:
+
+- an ECS cluster per app and env;
+- an ALB;
+- blue and green ip target groups;
+- a listener with weighted forwarding;
+- a `HTTPCode_Target_5XX_Count` alarm per color.
+
+Applying an `Update` deploys:
+
+1. Register a task definition (task role: the app's runtime role).
+2. Start the idle color's ECS service.
+3. Wait for its tasks.
+4. Move the weights through the steps, sleeping for the bake at each and reading the color's alarm.
+5. Retire the old color.
+
+The load balancer's tags (`iae:color`, `iae:image`, `iae:spec-hash`) record what's live, so there is still no
+state file.
+
+An alarm during a bake puts all traffic back on the old color and stops the new one. It also tags the spec as
+failed (`iae:failed`), so the version isn't retried and re-planning it fails with "rolled back …; push a fix". That
+keeps the env from converging, so later envs never get the version.
+
+Still to come: the canary watcher as its own fiber (today the deploy holds the env's reconcile, or the executor,
+until it finishes); latency and app-declared alarms; and builds that push images to ECR.
+
 ### 5.10 Background jobs
 
 Each job is a supervised fiber with its own `Schedule` and inbox subscription. Jobs find things
@@ -1077,7 +1109,7 @@ and the "iae" GitHub App installed.
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
-| M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
+| M5 (in progress) | `Service` + ALB canary + auto-rollback ✅ (ECR image builds to follow); harness traffic generator ✅ and the `bad-deploy` scenario ✅ (fault controls to follow) | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
