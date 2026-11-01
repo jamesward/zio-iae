@@ -1,5 +1,6 @@
 package zio.iae.engine.policy
 
+import zio.*
 import zio.iae.*
 import zio.schema.{Schema, derived}
 
@@ -85,3 +86,13 @@ final case class RiskTable(approvers: SlackGroup, owners: SlackGroup, production
             case Risk.Low | Risk.Medium   => Decision.Auto
             case Risk.High | Risk.Critical => Decision.Approve(1, Set(approvers))
       ChangeVerdict(fact.id, decision, Nil, s"default risk table: ${fact.risk} in ${fact.env.value}", confident = true)
+
+/** Turns a policy and change facts into verdicts: the natural-language evaluator in the agent, or the risk table. A
+  * failure is treated like a missing verdict by `Verdicts.decide`, so it ends in an owner approval, not an apply.
+  */
+trait PolicyEvaluator:
+  def evaluate(policy: PolicyConfig, facts: List[ChangeFacts]): IO[String, List[ChangeVerdict]]
+
+final case class RiskTableEvaluator(approvers: SlackGroup) extends PolicyEvaluator:
+  def evaluate(policy: PolicyConfig, facts: List[ChangeFacts]): IO[String, List[ChangeVerdict]] =
+    ZIO.succeed(RiskTable(approvers, policy.owners, policy.production, free = Set.empty).evaluate(facts))

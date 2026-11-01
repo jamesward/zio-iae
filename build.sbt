@@ -92,9 +92,9 @@ lazy val cli = (project in file("modules/cli"))
   )
 
 lazy val agent = (project in file("modules/agent"))
-  .dependsOn(engine)
+  .dependsOn(engine, webhook, testkit % Test)
   .enablePlugins(JavaAppPackaging)
-  .settings(name := "iae-agent", scalaVersion := scalaNext, publish / skip := true)
+  .settings(name := "iae-agent", scalaVersion := scalaNext, publish / skip := true, libraryDependencies ++= zioTest)
 
 lazy val webhook = (project in file("modules/webhook"))
   .dependsOn(engine, testkit % Test)
