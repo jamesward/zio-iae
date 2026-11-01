@@ -13,7 +13,8 @@ object FlociLayer:
     ZLayer.scoped:
       ZIO.acquireRelease(
         ZIO.attemptBlocking:
-          val floci = FlociContainer(DockerImageName.parse(image))
+          // The Docker socket lets Floci run CodeBuild builds (and later ECS tasks) as real containers.
+          val floci = FlociContainer(DockerImageName.parse(image)).withDockerSocket(true).nn
           floci.start()
           floci
       )(floci => ZIO.attemptBlocking(floci.stop()).ignoreLogged)

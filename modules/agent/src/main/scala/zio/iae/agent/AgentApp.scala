@@ -25,6 +25,21 @@ object AgentApp extends ZIOAppDefault:
   private def number(name: String, default: Int): IO[AgentError, Int] =
     env(name).flatMap(v => ZIO.fromOption(v.map(_.toIntOption)).orElseSucceed(Some(default)).someOrFail(AgentError.Config(s"$name must be a number")))
 
+  /** CodeBuild with `IAE_BUILD_BUCKET` and `IAE_BUILD_ROLE` (the builds' service role), and optionally
+    * `IAE_BUILD_IMAGE`; without them, builds run in the agent, which is only for development.
+    */
+  private def buildsFrom(base: AwsConfig, http: Client): IO[AgentError, ManifestSource] =
+    env("IAE_BUILD_BUCKET").flatMap:
+      case None =>
+        ZIO.logWarning("IAE_BUILD_BUCKET is not set: builds run inside the agent, with its credentials (development only)").as(CommandManifests())
+      case Some(name) =>
+        for
+          bucket <- ZIO.fromEither(BucketName.from(name)).mapError(AgentError.Config(_))
+          role   <- required("IAE_BUILD_ROLE")
+          image  <- env("IAE_BUILD_IMAGE").map(_.getOrElse("aws/codebuild/amazonlinux-x86_64-standard:5.0"))
+          builds <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, base)), S3Client(http, base), bucket, role, image)
+        yield builds
+
   def run: ZIO[Any, Any, Any] =
     val program =
       for
@@ -51,7 +66,8 @@ object AgentApp extends ZIOAppDefault:
         evaluator   <- EvaluatePolicy.fromEnvironment.someOrElseZIO:
                          ZIO.logWarning("no Bedrock model configured: using the default risk table instead of POLICY.md")
                            .as(RiskTableEvaluator(config.slack.groups.headOption.getOrElse(config.slack.owners)))
-        pipeline     = Pipeline(CommandManifests(), evaluator, slack, self, expiry.hours)
+        manifests   <- buildsFrom(base, http)
+        pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours)
         reconcilers <- Reconcilers.make(pipeline, envs)
         sqs         <- ZIO.service[SqsClient]
         _           <- ZIO.logInfo(s"agent started for $repo ($branch): envs ${config.envs.map(_.value).mkString(", ")}")

@@ -8,8 +8,11 @@ import zio.iae.engine.policy.{PolicyConfig, SlackGroup}
 import zio.schema.{Schema, derived}
 import zio.schema.codec.JsonCodec
 
-/** An app in the repo and the command (run in the repo) that prints its manifest, e.g. `bin/photo-app --iae-manifest`. */
-final case class AppEntry(name: AppName, manifest: List[String]) derives Schema
+/** An app in the repo: the shell commands that build it, then the command that prints its manifest (both run at the
+  * repo's root, e.g. `sbt photoApp/stage` and `target/.../bin/photo-app --iae-manifest`), and the build image for
+  * CodeBuild if not the project's.
+  */
+final case class AppEntry(name: AppName, manifest: List[String], build: List[String] = Nil, image: Option[String] = None) derives Schema
 
 final case class SlackSettings(channel: String, owners: SlackGroup, groups: List[SlackGroup]) derives Schema
 

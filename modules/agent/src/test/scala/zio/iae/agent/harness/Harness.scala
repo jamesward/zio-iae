@@ -59,7 +59,7 @@ object Harness:
       |""".stripMargin
 
   def config(envs: List[EnvName]): String =
-    s"""{"apps":[{"name":"${app.value}","manifest":["cat","$manifest"]}],
+    s"""{"apps":[{"name":"${app.value}","manifest":["cat","$manifest"],"image":"alpine:3.20"}],
        |"envs":[${envs.map(e => s"\"${e.value}\"").mkString(",")}],"production":["${envs.last.value}"],
        |"slack":{"channel":"$channel","owners":"platform-owners","groups":["infra-approvers"]},
        |"identities":{"dev@example.com":"U_DEV"}}""".stripMargin
@@ -108,13 +108,17 @@ object Harness:
                   account <- ZIO.foreach(accounts.get(env))(bootstrapAccount)
                   runtime <- EnvRuntimes.make(env, account, base, BucketNaming(None), repo.workspace(env)).mapError(_.message)
                 yield runtime
+      // Builds run in the tooling account's CodeBuild (Floci runs them as containers).
+      buildsAt  = BucketName.from(s"iae-builds-${envNames.head.value}").toOption.get
+      builds   <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, tooling)), S3Client(http, tooling), buildsAt, "arn:aws:iam::000000000000:role/iae-build", "alpine:3.20")
+                    .mapError(_.message)
       scope    <- ZIO.scope
       httpEnv  <- ZIO.environment[Client]
       start = (for
                 evaluator <- EvaluatePolicy.fromEnvironment.provideEnvironment(httpEnv).mapError(_.message).someOrElseZIO:
                                ZIO.logInfo("no Bedrock model configured: the harness uses the default risk table instead of POLICY.md")
                                  .as(RiskTableEvaluator(SlackGroup.from("infra-approvers").toOption.get))
-                pipeline     = Pipeline(CommandManifests(), evaluator, client, self, 24.hours)
+                pipeline     = Pipeline(builds, evaluator, client, self, 24.hours)
                 reconcilers <- Reconcilers.make(pipeline, envs)
                 fiber       <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers), 15.minutes).run).forkIn(scope)
               yield (fiber, reconcilers))

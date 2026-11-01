@@ -28,7 +28,7 @@ final case class Pipeline(manifests: ManifestSource, evaluator: PolicyEvaluator,
     for
       commit           <- runtime.workspace.sync
       (target, newText) <- RepoConfig.load(runtime.workspace.dir)
-      apps             <- manifests.manifests(runtime.workspace.dir, target)
+      apps             <- manifests.manifests(runtime.workspace.dir, target, commit)
       governance       <- governance(runtime, apps, commit, target, newText)
       authorEmail      <- runtime.workspace.author
       author            = governance.config.identities.get(authorEmail)
