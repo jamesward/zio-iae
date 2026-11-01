@@ -39,8 +39,8 @@ object FlociSpec extends ZIOSpecDefault:
           desired   = BucketSpec(versioning = Versioning.Enabled)
           before   <- provider.observe(address)
           create    = provider.diff(address, desired, before)
-          _        <- ZIO.foreachDiscard(create)(provider.applyChange)
-          _        <- ZIO.foreachDiscard(create)(provider.applyChange) // re-running is safe
+          _        <- ZIO.foreachDiscard(create)(provider.applyChange(_, ApplyContext.local))
+          _        <- ZIO.foreachDiscard(create)(provider.applyChange(_, ApplyContext.local)) // re-running is safe
           after    <- provider.observe(address)
         yield assertTrue(
           before.isEmpty,
@@ -55,14 +55,14 @@ object FlociSpec extends ZIOSpecDefault:
           s3       <- ZIO.service[S3Client]
           provider  = BucketProvider(s3, naming)
           address   = Address(app, env, ResourceKind.Bucket, LogicalId("uploads"))
-          _        <- ZIO.foreachDiscard(provider.diff(address, BucketSpec(), None))(provider.applyChange)
+          _        <- ZIO.foreachDiscard(provider.diff(address, BucketSpec(), None))(provider.applyChange(_, ApplyContext.local))
           name     <- ZIO.fromEither(naming.physical(address))
           tags     <- s3.getBucketTagging(name)
           _        <- s3.putBucketTagging(name, tags + ("team" -> "photos"))
           desired   = BucketSpec(versioning = Versioning.Enabled)
           observed <- provider.observe(address)
           update    = provider.diff(address, desired, observed)
-          _        <- ZIO.foreachDiscard(update)(provider.applyChange)
+          _        <- ZIO.foreachDiscard(update)(provider.applyChange(_, ApplyContext.local))
           after    <- provider.observe(address)
         yield assertTrue(
           update.exists(_.isInstanceOf[Change.Update[?]]),

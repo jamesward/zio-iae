@@ -10,7 +10,7 @@ object BucketDiffSpec extends ZIOSpecDefault:
   val provider = BucketProvider
 
   def observed(spec: BucketSpec, versioning: VersioningStatus, extraTags: Map[String, String] = Map.empty) =
-    ObservedBucket(name, versioning, ManagedTags.of(address, SpecHash.of(ResourceSpec.Bucket(spec))) ++ extraTags)
+    ObservedBucket(name, versioning, ManagedTags.identity(address, SpecHash.of(ResourceSpec.Bucket(spec))) ++ extraTags)
 
   def spec = suite("BucketProvider.diff")(
     test("a missing bucket is created"):
@@ -39,8 +39,31 @@ object BucketDiffSpec extends ZIOSpecDefault:
       val bare   = ObservedBucket(name, VersioningStatus.Off, Map.empty)
       val change = provider.diff(address, BucketSpec(), Some(bare))
       assertTrue(change match
-        case Some(Change.Update(_, _, fields)) => fields.size == TagKey.values.size
+        case Some(Change.Update(_, _, fields)) => fields.size == ManagedTags.identity(address, SpecHash.of(ResourceSpec.Bucket(BucketSpec()))).size
         case _                                 => false
+      )
+    ,
+    test("a re-declared orphan is an update that clears the orphan mark"):
+      val tags   = observed(BucketSpec(), VersioningStatus.Off).tags + (TagKey.Orphaned.wire -> "2026-10-01")
+      val change = provider.diff(address, BucketSpec(), Some(ObservedBucket(name, VersioningStatus.Off, tags)))
+      assertTrue(change match
+        case Some(Change.Update(_, _, fields)) => fields.toList == List(FieldChange("orphaned", "2026-10-01", "(none)"))
+        case _                                 => false
+      )
+    ,
+    test("converging keeps the user's tags, records the deploying commit and keeps the old one otherwise"):
+      val hash    = SpecHash.of(ResourceSpec.Bucket(BucketSpec()))
+      val older   = CommitSha.from("a" * 40).toOption.get
+      val newer   = CommitSha.from("b" * 40).toOption.get
+      val current = Map("team" -> "photos", TagKey.Commit.wire -> older.value, TagKey.Orphaned.wire -> "2026-10-01")
+      val deploy  = ManagedTags.converged(current, address, hash, ApplyContext(Some(newer)))
+      val local   = ManagedTags.converged(current, address, hash, ApplyContext.local)
+      assertTrue(
+        deploy.get("team").contains("photos"),
+        ManagedTags.commit(deploy).contains(newer),
+        ManagedTags.commit(local).contains(older),
+        !deploy.contains(TagKey.Orphaned.wire),
+        ManagedTags.specHash(deploy).contains(hash),
       )
     ,
     test("risk follows the change type"):

@@ -8,7 +8,7 @@ import java.util.Base64
 import scala.util.Try
 import scala.xml.Node
 import zio.*
-import zio.http.{Body, Client, Headers, Method, Request, Response, URL}
+import zio.http.{Client, Method, Request, Response}
 import zio.stream.ZStream
 
 /** A thin S3 client: only the operations zio-iae needs, signed with SigV4, with typed errors and retries. */
@@ -100,33 +100,24 @@ final case class S3Client(http: Client, config: AwsConfig):
 
   private def execute(call: Call): IO[S3Error, Response] =
     request(call)
-      .flatMap(req => http.batched(req).mapError(S3Error.Transport(_)))
+      .flatMap(req => AwsHttp.send(http, req).mapError(S3Error.Transport(_)))
       .flatMap(resp => if resp.status.isSuccess then ZIO.succeed(resp) else failure(resp, call))
       .retry(retryPolicy)
 
   private def request(call: Call): IO[S3Error, Request] =
-    val target      = targetOf(call)
-    val payloadHash = SigV4.sha256Hex(call.body.toArray)
-    val md5Header   = Option.when(call.md5)("content-md5" -> Base64.getEncoder.nn.encodeToString(md5(call.body.toArray)).nn)
-    val headers     = ("x-amz-content-sha256" -> payloadHash) :: call.headers ++ md5Header.toList
-    val signable    = SigV4.Request(call.method.name, target.authority, target.path, call.query, headers, payloadHash)
-    for
-      now <- Clock.instant
-      url <- ZIO.fromEither(URL.decode(target.url)).mapError(e => S3Error.InvalidRequest(s"${target.url}: ${e.getMessage}"))
-      signed = SigV4.sign(signable, config.credentials, SigV4.Scope(config.region, "s3"), now)
-      all    = ("host" -> target.authority) :: headers ++ signed
-    yield Request(method = call.method, url = url, headers = Headers(all.map(zio.http.Header.Custom(_, _))), body = Body.fromChunk(call.body))
+    val md5Header = Option.when(call.md5)("content-md5" -> Base64.getEncoder.nn.encodeToString(md5(call.body.toArray)).nn)
+    AwsHttp
+      .request(config, service, call.method, targetOf(call), call.headers ++ md5Header.toList, call.body, contentSha256Header = true)
+      .mapError(S3Error.InvalidRequest(_))
 
-  private def targetOf(call: Call): Target =
+  private def targetOf(call: Call): AwsHttp.Target =
     val encodedKey = call.key.fold("")(k => SigV4.uriEncode(k.value, encodeSlash = false))
-    val (scheme, authority, path) = config.endpoint match
+    config.endpoint match
       case Some(endpoint) =>
         val keyPart = if encodedKey.isEmpty then "" else s"/$encodedKey"
-        (endpoint.scheme.value, endpoint.authority, s"/${call.bucket.value}$keyPart")
+        AwsHttp.Target(endpoint.scheme.value, endpoint.authority, s"/${call.bucket.value}$keyPart", call.query)
       case None =>
-        ("https", s"${call.bucket.value}.s3.${config.region.value}.amazonaws.com", s"/$encodedKey")
-    val query = SigV4.canonicalQuery(call.query)
-    Target(authority, path, s"$scheme://$authority$path${if query.isEmpty then "" else s"?$query"}")
+        AwsHttp.Target("https", s"${call.bucket.value}.s3.${config.region.value}.amazonaws.com", s"/$encodedKey", call.query)
 
   private def failure(resp: Response, call: Call): IO[S3Error, Nothing] =
     resp.body.asString.mapError(S3Error.Transport(_)).flatMap(text => ZIO.fail(errorOf(resp.status.code, text, call)))
@@ -136,8 +127,9 @@ object S3Client:
 
   private val xmlns = "http://s3.amazonaws.com/doc/2006-03-01/"
 
-  private val retryPolicy =
-    (Schedule.exponential(100.millis).jittered && Schedule.recurs(4)) && Schedule.recurWhile[S3Error](_.retryable)
+  private val service = AwsService("s3", "s3")
+
+  private val retryPolicy = AwsHttp.retryPolicy && Schedule.recurWhile[S3Error](_.retryable)
 
   private final case class Call(
       method: Method,
@@ -148,8 +140,6 @@ object S3Client:
       headers: List[(String, String)] = Nil,
       md5: Boolean = false,
   )
-
-  private final case class Target(authority: String, path: String, url: String)
 
   private final case class ListPage(objects: Chunk[S3Object], next: Option[String])
 

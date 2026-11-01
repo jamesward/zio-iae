@@ -22,7 +22,7 @@ final case class AwsCloud(app: AppName, env: EnvName, mode: ProvisionMode, s3: S
       observed <- buckets.observe(address).mapError(InfraError.Provider(_))
       _ <- mode match
              case ProvisionMode.AutoProvision =>
-               ZIO.foreachDiscard(buckets.diff(address, spec, observed))(c => buckets.applyChange(c).mapError(InfraError.Provider(_)))
+               ZIO.foreachDiscard(buckets.diff(address, spec, observed))(c => buckets.applyChange(c, ApplyContext.local).mapError(InfraError.Provider(_)))
              case ProvisionMode.BindOnly => verify(address, spec, observed)
     yield S3Bucket[I](s3, name)
 

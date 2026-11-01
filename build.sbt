@@ -54,8 +54,10 @@ lazy val core = (project in file("modules/core")).settings(
 lazy val awsClient = (project in file("modules/aws-client")).settings(
   name := "iae-aws-client",
   libraryDependencies ++= Seq(
-    "dev.zio"                %% "zio-http"  % "3.11.6",
-    "org.scala-lang.modules" %% "scala-xml" % "2.5.0",
+    "dev.zio"                %% "zio-http"              % "3.11.6",
+    "dev.zio"                %% "zio-schema-derivation" % zioSchemaVersion,
+    "dev.zio"                %% "zio-schema-json"       % zioSchemaVersion,
+    "org.scala-lang.modules" %% "scala-xml"             % "2.5.0",
   ) ++ zioTest,
 )
 
@@ -72,7 +74,9 @@ lazy val aws = (project in file("modules/aws"))
   .dependsOn(core, awsClient, testkit % Test)
   .settings(name := "iae-aws", libraryDependencies ++= zioTest)
 
-lazy val engine = (project in file("modules/engine")).dependsOn(aws).settings(name := "iae-engine")
+lazy val engine = (project in file("modules/engine"))
+  .dependsOn(aws, testkit % Test)
+  .settings(name := "iae-engine", libraryDependencies ++= zioTest)
 
 // Applications (Scala Next, not published)
 
