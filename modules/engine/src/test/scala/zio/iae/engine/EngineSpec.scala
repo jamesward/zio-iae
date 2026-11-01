@@ -48,14 +48,15 @@ object EngineSpec extends ZIOSpecDefault:
   val uniqueEnv: UIO[EnvName] =
     ZIO.collectAll(List.fill(8)(Random.nextIntBounded(26).map(i => ('a' + i).toChar))).map(cs => EnvName.from("e" + cs.mkString).toOption.get)
 
-  def engineWith(history: CommitOrder): URIO[S3Client & SqsClient & TaggingClient & IamClient & AwsContext, Engine] =
+  def engineWith(history: CommitOrder): URIO[S3Client & SqsClient & SecretsClient & TaggingClient & IamClient & AwsContext, Engine] =
     for
       s3      <- ZIO.service[S3Client]
       sqs     <- ZIO.service[SqsClient]
+      secrets <- ZIO.service[SecretsClient]
       tagging <- ZIO.service[TaggingClient]
       iam     <- ZIO.service[IamClient]
       context <- ZIO.service[AwsContext]
-    yield Engine.make(AwsEngine.drivers(s3, sqs, iam, naming, context), AwsEngine.discovery(tagging, iam), history)
+    yield Engine.make(AwsEngine.drivers(s3, sqs, secrets, iam, naming, context), AwsEngine.discovery(tagging, iam), history)
 
   /** After converging, planning again finds nothing to do in either phase. */
   def assertConverges(engine: Engine, manifest: Manifest, env: EnvName, target: Option[CommitSha]): IO[EngineError, TestResult] =
@@ -179,4 +180,5 @@ object EngineSpec extends ZIOSpecDefault:
     StsClient.layer,
     AwsContext.layer,
     SqsClient.layer,
+    SecretsClient.layer,
   ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock @@ TestAspect.timeout(3.minutes)

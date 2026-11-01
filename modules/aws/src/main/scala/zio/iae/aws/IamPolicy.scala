@@ -60,6 +60,8 @@ object IamPolicy:
                   List("sqs:ChangeMessageVisibility", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:ReceiveMessage"),
                   List(queue),
                 )
+        case ResourceKind.Secret =>
+          Right(Statement(sid, "Allow", List("secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue"), List(SecretNaming.arnPattern(context, Address(app, env, ResourceKind.Secret, grant.id)))))
         case ResourceKind.Role => Left(InfraError.InvalidConfig(s"a role can't be granted to an app: ${grant.id.value}"))
     statements.partitionMap(identity) match
       case (Nil, all)     => Right(PolicyDocument(version, all))

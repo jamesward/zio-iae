@@ -33,3 +33,21 @@ object InMemoryCloudSpec extends ZIOSpecDefault:
       program.provide(InMemoryCloud.layer(AppName("photo-app"), EnvName("test")) >>> infra.layer)
     ,
   )
+
+object InMemorySecretSpec extends ZIOSpecDefault:
+  object ApiKey extends Secret.Id(LogicalId("api-key"))
+
+  def spec = suite("InMemoryCloud secrets")(
+    test("a secret has no value until one is set"):
+      val program =
+        for
+          cloud  <- ZIO.service[Cloud]
+          reader <- cloud.secret[ApiKey.type](ApiKey.logicalId, ApiKey.spec)
+          before <- reader.read.either
+          _      <- cloud match
+                      case memory: InMemoryCloud => memory.setSecret(ApiKey.logicalId, "s3cr3t")
+                      case _                     => ZIO.unit
+          after  <- reader.read
+        yield assertTrue(before == Left(SecretError.NotSet(ApiKey.logicalId)), after.value == "s3cr3t")
+      program.provide(InMemoryCloud.layer(AppName("photo-app"), EnvName("test")))
+  )

@@ -13,9 +13,19 @@ final case class InMemoryCloud(
     env: EnvName,
     buckets: Ref[Map[LogicalId, Map[ObjectKey, InMemoryCloud.Stored]]],
     queues: Ref.Synchronized[Map[LogicalId, Ref[InMemoryQueue.State]]],
+    secrets: Ref[Map[LogicalId, Option[String]]],
 ) extends Cloud:
   def bucket[I](id: LogicalId, spec: BucketSpec): IO[InfraError, Bucket[I]] =
     buckets.update(all => if all.contains(id) then all else all + (id -> Map.empty)).as(InMemoryBucket[I](id, buckets))
+
+  def secret[I](id: LogicalId, spec: SecretSpec): IO[InfraError, SecretReader[I]] =
+    secrets.update(all => if all.contains(id) then all else all + (id -> None)).as:
+      new SecretReader[I]:
+        def read: IO[SecretError, SecretValue] =
+          secrets.get.map(_.get(id).flatten).someOrFail(SecretError.NotSet(id)).map(SecretValue(_))
+
+  /** Sets a secret's value, as a person would out of band. */
+  def setSecret(id: LogicalId, value: String): UIO[Unit] = secrets.update(_ + (id -> Some(value)))
 
   def queue[I <: MessageQueue.Id[?]](id: I): IO[InfraError, MessageQueue[I]] =
     queues
@@ -33,7 +43,8 @@ object InMemoryCloud:
       for
         buckets <- Ref.make(Map.empty[LogicalId, Map[ObjectKey, Stored]])
         queues  <- Ref.Synchronized.make(Map.empty[LogicalId, Ref[InMemoryQueue.State]])
-      yield InMemoryCloud(app, env, buckets, queues)
+        secrets <- Ref.make(Map.empty[LogicalId, Option[String]])
+      yield InMemoryCloud(app, env, buckets, queues, secrets)
 
 private final case class InMemoryBucket[I](id: LogicalId, buckets: Ref[Map[LogicalId, Map[ObjectKey, InMemoryCloud.Stored]]])
     extends Bucket[I]:

@@ -44,6 +44,17 @@ object IamPolicySpec extends ZIOSpecDefault:
         send.map(_.permissions.map(_._2)) == Right(Set(arn)),
       )
     ,
+    test("a secret reader may read that one secret"):
+      val doc = IamPolicy.permissions(app, env, RoleSpec(List(Grant(LogicalId("db"), ResourceKind.Secret, Capability.SecretRead)), Nil), naming, context)
+      assertTrue(
+        doc.map(_.permissions) == Right(
+          Set(
+            "secretsmanager:DescribeSecret" -> "arn:aws:secretsmanager:us-east-1:123456789012:secret:iae/photo-app/prod/db-??????",
+            "secretsmanager:GetSecretValue" -> "arn:aws:secretsmanager:us-east-1:123456789012:secret:iae/photo-app/prod/db-??????",
+          )
+        )
+      )
+    ,
     test("documents round-trip through the JSON IAM stores"):
       val spec  = RoleSpec(List(grant("uploads", Capability.BucketRead), grant("thumbs", Capability.BucketWrite)), List(TrustedService.EcsTasks))
       val doc   = IamPolicy.permissions(app, env, spec, naming, context)

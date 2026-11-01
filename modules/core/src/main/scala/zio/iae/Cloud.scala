@@ -10,3 +10,4 @@ trait Cloud:
   def env: EnvName
   def bucket[I](id: LogicalId, spec: BucketSpec): IO[InfraError, Bucket[I]]
   def queue[I <: MessageQueue.Id[?]](id: I): IO[InfraError, MessageQueue[I]]
+  def secret[I](id: LogicalId, spec: SecretSpec): IO[InfraError, SecretReader[I]]

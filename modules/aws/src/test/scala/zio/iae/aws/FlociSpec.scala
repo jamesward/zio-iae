@@ -18,6 +18,8 @@ object FlociSpec extends ZIOSpecDefault:
   object Uploads extends Bucket.Id(LogicalId("uploads"))
 
   final case class Job(photo: String) derives Schema, CanEqual
+
+  object DatabasePassword extends Secret.Id(LogicalId("database-password"))
   object Jobs extends MessageQueue.Id[Job](LogicalId("jobs"), QueueSpec(visibilityTimeout = 1.second, deadLetter = Some(DeadLetter(maxReceives = 3))))
   object Archive extends Bucket.Id(LogicalId("archive"), BucketSpec(versioning = Versioning.Enabled))
 
@@ -30,11 +32,12 @@ object FlociSpec extends ZIOSpecDefault:
 
   def bytes(text: String): ZStream[Any, Nothing, Byte] = ZStream.fromChunk(Chunk.fromArray(text.getBytes(UTF_8)))
 
-  def cloud(env: EnvName, mode: ProvisionMode): URIO[S3Client & SqsClient, Cloud] =
+  def cloud(env: EnvName, mode: ProvisionMode): URIO[S3Client & SqsClient & SecretsClient, Cloud] =
     for
-      s3  <- ZIO.service[S3Client]
-      sqs <- ZIO.service[SqsClient]
-    yield AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs))
+      s3      <- ZIO.service[S3Client]
+      sqs     <- ZIO.service[SqsClient]
+      secrets <- ZIO.service[SecretsClient]
+    yield AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets)
 
   def spec = suite("Floci")(
     suite("BucketProvider")(
@@ -153,6 +156,29 @@ object FlociSpec extends ZIOSpecDefault:
         )
       ,
     ),
+    suite("SecretProvider")(
+      test("a secret is created without a value, tagged, and readable once someone sets it"):
+        for
+          env      <- uniqueEnv
+          secrets  <- ZIO.service[SecretsClient]
+          provider  = SecretProvider(secrets)
+          address   = Address(app, env, ResourceKind.Secret, DatabasePassword.logicalId)
+          c        <- cloud(env, ProvisionMode.AutoProvision)
+          reader   <- c.secret[DatabasePassword.type](DatabasePassword.logicalId, DatabasePassword.spec)
+          before   <- reader.read.either
+          _        <- secrets.putValue(SecretNaming.physical(address), "hunter2")
+          after    <- reader.read
+          observed <- provider.observe(address)
+          changed   = provider.diff(address, SecretSpec("rotated monthly"), observed)
+        yield assertTrue(
+          before == Left(SecretError.NotSet(DatabasePassword.logicalId)),
+          after.value == "hunter2",
+          after.toString == "SecretValue(***)",
+          provider.diff(address, DatabasePassword.spec, observed).isEmpty,
+          changed.exists(_.isInstanceOf[Change.Update[?]]),
+        )
+      ,
+    ),
     suite("AwsCloud")(
       test("binding fails until the bucket is provisioned, then binds"):
         for
@@ -225,4 +251,5 @@ object FlociSpec extends ZIOSpecDefault:
     AwsContext.layer,
     AwsJsonClient.layer,
     SqsClient.layer,
+    SecretsClient.layer,
   ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock
