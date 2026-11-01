@@ -12,8 +12,9 @@ import zio.iae.engine.policy.RiskTableEvaluator
   * `IAE_SLACK_TOKEN`, `IAE_SLACK_API` (default Slack's), `IAE_NAME_SUFFIX`, `IAE_RECONCILE_MINUTES` (default 15),
   * `IAE_APPROVAL_HOURS` (default 24) and the AWS variables. `POLICY.md` is evaluated by the model from
   * `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` (and `IAE_BEDROCK_ENDPOINT` for a Converse-compatible origin); without
-  * them the default risk table applies. The envs come from the repo's `.iae/config.json`; a
-  * change to them takes a restart.
+  * them the default risk table applies. The AWS credentials are the agent's own (the tooling account, where the inbox
+  * is); envs with an account in `.iae/config.json` are reached through its roles. A change to the envs or accounts
+  * takes a restart.
   */
 object AgentApp extends ZIOAppDefault:
   private def env(name: String): IO[AgentError, Option[String]] =
@@ -40,13 +41,10 @@ object AgentApp extends ZIOAppDefault:
         bootstrap  = GitWorkspace(workdir.resolve("bootstrap").nn, repo, branch)
         _         <- bootstrap.sync
         (config, _) <- RepoConfig.load(bootstrap.dir)
+        base        <- ZIO.service[AwsConfig]
         envs <- ZIO.foreach(config.envs): name =>
                   val workspace = GitWorkspace(workdir.resolve(name.value).nn, repo, branch)
-                  AwsEngine
-                    .layer(BucketNaming(suffix))
-                    .build
-                    .provideSome[AwsEngine.Clients & Scope](ZLayer.succeed[CommitOrder](GitCommitOrder(workspace.dir)))
-                    .map(e => EnvRuntime(name, e.get, workspace))
+                  EnvRuntimes.make(name, config.accounts.get(name.value), base, BucketNaming(suffix), workspace)
         http        <- ZIO.service[Client]
         slack        = SlackWebApi(http, SlackToken(token), slackBase)
         self        <- slack.identity
@@ -61,7 +59,7 @@ object AgentApp extends ZIOAppDefault:
       yield ()
     ZIO
       .scoped(program)
-      .provide(AwsConfig.layer, Client.default, AwsEngine.clients)
+      .provide(AwsConfig.layer, Client.default, AwsJsonClient.layer, SqsClient.layer)
       .tapError:
         case e: AgentError => ZIO.logError(e.message)
         case other         => ZIO.logError(other.toString)

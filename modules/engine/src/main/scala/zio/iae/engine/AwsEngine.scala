@@ -28,16 +28,22 @@ object AwsEngine:
   val clients: ZLayer[AwsConfig & Client, AwsError, Clients] =
     AwsCloud.clients ++ ((AwsJsonClient.layer >>> TaggingClient.layer) ++ (AwsQueryClient.layer >>> IamClient.layer))
 
+  /** The engine from one set of clients for both planning and applying (a single account, the CLI, tests). */
   def layer(naming: BucketNaming): ZLayer[Clients & CommitOrder, Nothing, Engine] =
     ZLayer:
       for
-        s3      <- ZIO.service[S3Client]
-        sqs     <- ZIO.service[SqsClient]
-        secrets <- ZIO.service[SecretsClient]
-        dynamo  <- ZIO.service[DynamoClient]
-        sns     <- ZIO.service[SnsClient]
-        tagging <- ZIO.service[TaggingClient]
-        iam     <- ZIO.service[IamClient]
-        context <- ZIO.service[AwsContext]
+        clients <- ZIO.environment[Clients]
         commits <- ZIO.service[CommitOrder]
-      yield Engine.make(drivers(s3, sqs, secrets, dynamo, sns, iam, naming, context), discovery(tagging, iam), commits)
+      yield make(naming, clients, clients, commits)
+
+  /** Plans with the planner's clients and applies with the deployer's, e.g. from an env account's read-only role and
+    * its deploy role.
+    */
+  def make(naming: BucketNaming, planner: ZEnvironment[Clients], deployer: ZEnvironment[Clients], commits: CommitOrder): Engine =
+    def driversOf(c: ZEnvironment[Clients]) =
+      drivers(c.get[S3Client], c.get[SqsClient], c.get[SecretsClient], c.get[DynamoClient], c.get[SnsClient], c.get[IamClient], naming, c.get[AwsContext])
+    Engine(Planner(driversOf(planner), discovery(planner.get[TaggingClient], planner.get[IamClient])), zio.iae.engine.Executor(driversOf(deployer), commits))
+
+  /** The clients for one account's config. */
+  def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =
+    (ZLayer.succeed(config) ++ ZLayer.environment[Client] >>> clients).build

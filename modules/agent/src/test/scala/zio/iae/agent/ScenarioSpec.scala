@@ -4,14 +4,14 @@ import zio.*
 import zio.http.*
 import zio.iae.*
 import zio.iae.agent.harness.*
-import zio.iae.aws.client.AwsError
+import zio.iae.aws.client.{AwsConfig, AwsError}
 import zio.iae.engine.*
 import zio.iae.testkit.FlociLayer
 import zio.test.*
 
 /** Every built-in harness scenario, run headlessly against its own harness: what the UI's buttons do, as tests. */
 object ScenarioSpec extends ZIOSpecDefault:
-  def run(scenario: Scenario): ZIO[Scope & AwsEngine.Clients & Client, String, TestResult] =
+  def run(scenario: Scenario): ZIO[Scope & AwsConfig & AwsEngine.Clients & Client, String, TestResult] =
     for
       staging <- HarnessSpec.uniqueEnv
       prod    <- HarnessSpec.uniqueEnv
@@ -24,7 +24,7 @@ object ScenarioSpec extends ZIOSpecDefault:
   def spec = suite("Scenarios")(
     Scenario.all.map(s => test(s.name)(ZIO.scoped(run(s))))*
   ).provideShared(
-    (((FlociLayer.live ++ Client.default) >>> AwsEngine.clients) ++ Client.default).mapError:
+    ((FlociLayer.live ++ Client.default) >+> AwsEngine.clients).mapError:
       case a: AwsError  => a.message
       case t: Throwable => t.getMessage
   ) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom @@ TestAspect.timeout(8.minutes)

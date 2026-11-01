@@ -64,9 +64,11 @@ modules override it with `scalaNext`. Applications are `publish / skip`.
   AWS variables: `photo-app --iae-manifest | iae plan --env dev`, then `iae apply --env dev`. Without an LLM it
   applies the default risk table (dev free, prod strict); exit code 2 means policy needs an approval.
 - Local harness: `./sbta agent/Test/run` (Docker needed) serves http://localhost:8088 (`IAE_HARNESS_PORT`): a
-  fake Slack channel you can act in as different people, and a GitHub panel that edits the seeded repo and pushes.
-  Pushes and reactions go through the real webhook and an SQS inbox on Floci to the real agent. `HarnessSpec`
-  drives the same loop in tests.
+  fake Slack channel you can act in as different people, a GitHub panel that edits the seeded repo and pushes, the
+  agent's clock (60x by default, with +1h/+1d jumps) and scenario buttons. Pushes and reactions go through the real
+  webhook and an SQS inbox on Floci to the real agent; staging and prod each get their own Floci (account), reached
+  through assumed roles. With `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` set, a real model evaluates
+  `POLICY.md`. `HarnessSpec` drives the loop in tests and `ScenarioSpec` runs every scenario headlessly.
 - The agent (`agent`, main `AgentApp`) and the webhook (`webhook`, main `WebhookServer`) are configured by
   environment variables documented on those objects.
 - Gated tests (none yet; planned in `SPEC.md` §4): real-AWS contract tests behind `IAE_AWS_CONTRACT_TESTS=1`,

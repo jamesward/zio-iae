@@ -6,7 +6,7 @@ import zio.*
 import zio.http.*
 import zio.iae.*
 import zio.iae.agent.harness.*
-import zio.iae.aws.client.AwsError
+import zio.iae.aws.client.{AwsConfig, AwsError}
 import zio.iae.engine.*
 import zio.iae.testkit.FlociLayer
 import zio.test.*
@@ -75,8 +75,24 @@ object HarnessSpec extends ZIOSpecDefault:
           _       <- harness.ui.advance(25.hours)
           second  <- until("a second approval request")(harness.slack.messages.get.map(_.filter(_.request.isDefined).find(_.ts != first.ts)))
         yield assertTrue(second.request.exists(_.expires > first.request.get.expires))
+    ,
+    test("staging and prod in accounts of their own, reached through assumed roles"):
+      ZIO.scoped:
+        for
+          staging   <- uniqueEnv
+          prod      <- uniqueEnv
+          accounts  <- ZIO.foreach(List(staging, prod))(env => FlociLayer.live.build.map(env -> _.get[AwsConfig])).mapError(_.getMessage)
+          harness   <- Harness.make(0, List(staging, prod), accounts = accounts.toMap)
+          seed       = Bucket.readWrite(Harness.Uploads).manifest(Harness.app).toOption.get
+          _         <- until("the seed in prod")(converged(harness.envs(1), seed))
+          bucket     = (env: EnvName) => zio.iae.aws.BucketNaming(None).physical(Address(Harness.app, env, ResourceKind.Bucket, Harness.Uploads.logicalId)).toOption.get
+          inStaging <- harness.s3(0).bucketExists(bucket(staging))
+          inProd    <- harness.s3(1).bucketExists(bucket(prod))
+          crossed   <- harness.s3(0).bucketExists(bucket(prod))
+          tooling   <- ZIO.serviceWithZIO[zio.iae.aws.client.S3Client](_.bucketExists(bucket(staging)))
+        yield assertTrue(inStaging, inProd, !crossed, !tooling)
   ).provideShared(
-    (((FlociLayer.live ++ Client.default) >>> AwsEngine.clients) ++ Client.default).mapError:
+    ((FlociLayer.live ++ Client.default) >+> AwsEngine.clients).mapError:
       case a: AwsError  => a.message
       case t: Throwable => t.getMessage
   ) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom @@ TestAspect.timeout(5.minutes)

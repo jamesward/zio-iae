@@ -172,7 +172,7 @@ object Scenario:
             manifest <- current(harness, Harness.manifest)
             bucket   <- ZIO.fromEither(BucketNaming(None).physical(Address(Harness.app, harness.envs.head.env, ResourceKind.Bucket, Harness.Uploads.logicalId)))
                           .mapError(_.message)
-            _        <- harness.s3.putBucketVersioning(bucket, enabled = manifest.trim != versioned.trim).mapError(_.toString)
+            _        <- harness.s3.head.putBucketVersioning(bucket, enabled = manifest.trim != versioned.trim).mapError(_.toString)
           yield (),
       ),
       Step.Advance(16.minutes),

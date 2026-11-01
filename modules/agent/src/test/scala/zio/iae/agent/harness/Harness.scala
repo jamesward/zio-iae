@@ -5,7 +5,7 @@ import zio.http.*
 import zio.iae.*
 import zio.iae.agent.*
 import zio.iae.aws.BucketNaming
-import zio.iae.aws.client.{S3Client, SqsClient}
+import zio.iae.aws.client.*
 import zio.iae.engine.*
 import zio.iae.engine.policy.{RiskTableEvaluator, SlackGroup}
 import zio.iae.testkit.FlociLayer
@@ -23,7 +23,7 @@ final case class Harness(
     envs: List[EnvRuntime],
     clock: HarnessClock,
     agent: AgentProcess,
-    s3: S3Client,
+    s3: List[S3Client],
 )
 
 /** The agent as a process the harness can stop and start; a restart loses everything in memory, like a new
@@ -64,8 +64,25 @@ object Harness:
        |"slack":{"channel":"$channel","owners":"platform-owners","groups":["infra-approvers"]},
        |"identities":{"dev@example.com":"U_DEV"}}""".stripMargin
 
-  /** `speed` is the agent's clock speed factor: at 60, a day passes in 24 minutes. */
-  def make(port: Int, envNames: List[EnvName], speed: Double = 60): ZIO[Scope & AwsEngine.Clients & Client, String, Harness] =
+  /** Creates an env account's planner and deployer roles, trusting the account's root, as `iae bootstrap` will. */
+  def bootstrapAccount(config: AwsConfig): ZIO[Client, String, EnvAccount] =
+    for
+      http    <- ZIO.service[Client]
+      iam      = IamClient(AwsQueryClient(http, config))
+      account <- StsClient(AwsQueryClient(http, config)).accountId.mapError(_.message)
+      trust    = s"""{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::${account.value}:root"},"Action":"sts:AssumeRole"}]}"""
+      arns <- ZIO.foreach(List("iae-planner", "iae-deployer")): role =>
+                val name = RoleName.from(role).toOption.get
+                iam.getRole(name).flatMap(r => iam.createRole(name, "/", trust, Map.empty).when(r.isEmpty)).mapError(_.message)
+                  .as(s"arn:aws:iam::${account.value}:role/$role")
+    yield EnvAccount(arns(0), arns(1))
+
+  /** `speed` is the agent's clock speed factor: at 60, a day passes in 24 minutes. Envs in `accounts` get their own
+    * account (a Floci of their own), reached through assumed roles like production; the others share the tooling
+    * account's.
+    */
+  def make(port: Int, envNames: List[EnvName], speed: Double = 60, accounts: Map[EnvName, AwsConfig] = Map.empty)
+      : ZIO[Scope & AwsConfig & SqsClient & Client, String, Harness] =
     val githubSecret = WebhookSecret("harness-github")
     val slackSecret  = WebhookSecret("harness-slack")
     for
@@ -84,11 +101,13 @@ object Harness:
       base     <- ZIO.fromEither(URL.decode(s"http://localhost:$bound/api")).mapError(_.getMessage)
       client    = SlackWebApi(http, SlackToken("xoxb-harness"), base)
       self     <- client.identity.mapError(_.message)
+      tooling  <- ZIO.service[AwsConfig]
       envs <- ZIO.foreach(envNames): env =>
-                val workspace = repo.workspace(env)
-                AwsEngine.layer(BucketNaming(None)).build
-                  .provideSome[AwsEngine.Clients & Scope](ZLayer.succeed[CommitOrder](GitCommitOrder(workspace.dir)))
-                  .map(e => EnvRuntime(env, e.get, workspace))
+                val base = accounts.getOrElse(env, tooling)
+                for
+                  account <- ZIO.foreach(accounts.get(env))(bootstrapAccount)
+                  runtime <- EnvRuntimes.make(env, account, base, BucketNaming(None), repo.workspace(env)).mapError(_.message)
+                yield runtime
       scope    <- ZIO.scope
       httpEnv  <- ZIO.environment[Client]
       start = (for
@@ -100,7 +119,7 @@ object Harness:
                 fiber       <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers), 15.minutes).run).forkIn(scope)
               yield (fiber, reconcilers))
       agent    <- AgentProcess.make(start)
-      s3       <- ZIO.service[S3Client]
+      s3        = envNames.map(env => S3Client(http, accounts.getOrElse(env, tooling)))
       harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3)
       _        <- started.succeed(harness)
     yield harness
@@ -111,8 +130,11 @@ object AppTest extends ZIOAppDefault:
     val program =
       for
         port    <- System.env("IAE_HARNESS_PORT").map(_.flatMap(_.toIntOption).getOrElse(8088))
-        harness <- Harness.make(port, List(EnvName("staging"), EnvName("prod")))
-        _       <- ZIO.logInfo(s"iae harness running: open http://localhost:${harness.port}")
+        staging <- FlociLayer.live.build.map(_.get[AwsConfig])
+        prod    <- FlociLayer.live.build.map(_.get[AwsConfig])
+        envs     = List(EnvName("staging"), EnvName("prod"))
+        harness <- Harness.make(port, envs, accounts = envs.zip(List(staging, prod)).toMap)
+        _       <- ZIO.logInfo(s"iae harness running: open http://localhost:${harness.port} (staging and prod each have their own Floci)")
         _       <- ZIO.never
       yield ()
-    ZIO.scoped(program).provide(FlociLayer.live, Client.default, AwsEngine.clients)
+    ZIO.scoped(program).provide(FlociLayer.live, Client.default, AwsJsonClient.layer, SqsClient.layer)
