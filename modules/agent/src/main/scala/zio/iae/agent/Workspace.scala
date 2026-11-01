@@ -34,15 +34,17 @@ object GitWorkspace:
 
 /** Runs a command and returns its standard output, failing with its output when it exits non-zero. */
 object Process:
+  /** The timeout is real time, even when the agent runs on a faster clock (the local harness). */
   def run(dir: Path, command: Seq[String], timeout: Duration): IO[String, String] =
-    ZIO
-      .attemptBlockingInterrupt:
-        val process = ProcessBuilder(command*).directory(dir.toFile).redirectError(ProcessBuilder.Redirect.PIPE).start().nn
-        val out     = String(process.getInputStream.nn.readAllBytes().nn).trim.nn
-        val err     = String(process.getErrorStream.nn.readAllBytes().nn).trim.nn
-        (process.waitFor(), out, err)
-      .mapError(e => s"${command.head}: ${e.getMessage}")
-      .timeoutFail(s"${command.mkString(" ")} timed out after $timeout")(timeout)
-      .flatMap:
-        case (0, out, _)      => ZIO.succeed(out)
-        case (code, out, err) => ZIO.fail(s"${command.mkString(" ")} exited $code: ${(err + "\n" + out).trim.take(2000)}")
+    ZIO.withClock(Clock.ClockLive):
+      ZIO
+        .attemptBlockingInterrupt:
+          val process = ProcessBuilder(command*).directory(dir.toFile).redirectError(ProcessBuilder.Redirect.PIPE).start().nn
+          val out     = String(process.getInputStream.nn.readAllBytes().nn).trim.nn
+          val err     = String(process.getErrorStream.nn.readAllBytes().nn).trim.nn
+          (process.waitFor(), out, err)
+        .mapError(e => s"${command.head}: ${e.getMessage}")
+        .timeoutFail(s"${command.mkString(" ")} timed out after $timeout")(timeout)
+        .flatMap:
+          case (0, out, _)      => ZIO.succeed(out)
+          case (code, out, err) => ZIO.fail(s"${command.mkString(" ")} exited $code: ${(err + "\n" + out).trim.take(2000)}")

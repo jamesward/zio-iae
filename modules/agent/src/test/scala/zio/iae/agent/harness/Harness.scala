@@ -15,7 +15,7 @@ import zio.iae.webhook.*
   * real: with `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` set, `POLICY.md` is evaluated by that model, otherwise
   * by the default risk table.
   */
-final case class Harness(port: Int, ui: HarnessUi, slack: FakeSlack, repo: TestRepo, envs: List[EnvRuntime])
+final case class Harness(port: Int, ui: HarnessUi, slack: FakeSlack, repo: TestRepo, envs: List[EnvRuntime], clock: HarnessClock, reconcilers: Reconcilers)
 
 object Harness:
   object Uploads extends Bucket.Id(LogicalId("uploads"))
@@ -40,17 +40,20 @@ object Harness:
        |"slack":{"channel":"$channel","owners":"platform-owners","groups":["infra-approvers"]},
        |"identities":{"dev@example.com":"U_DEV"}}""".stripMargin
 
-  def make(port: Int, envNames: List[EnvName]): ZIO[Scope & AwsEngine.Clients & Client, String, Harness] =
+  /** `speed` is the agent's clock speed factor: at 60, a day passes in 24 minutes. */
+  def make(port: Int, envNames: List[EnvName], speed: Double = 60): ZIO[Scope & AwsEngine.Clients & Client, String, Harness] =
     val githubSecret = WebhookSecret("harness-github")
     val slackSecret  = WebhookSecret("harness-slack")
     for
       repo     <- TestRepo.make
       _        <- repo.commit(Map(".iae/config.json" -> config(envNames), RepoConfig.policyPath -> policy, manifest -> Bucket.readWrite(Uploads).manifest(app).toOption.get.toJson), "seed")
       sqs      <- ZIO.service[SqsClient]
-      inboxUrl <- sqs.createQueue(s"iae-harness-inbox-$port", Map.empty, Map.empty).mapError(_.message)
+      inboxUrl <- sqs.createQueue(s"iae-harness-inbox-${envNames.map(_.value).mkString("-")}", Map.empty, Map.empty).mapError(_.message)
       webhook   = Webhook(WebhookSettings(githubSecret, slackSecret), SqsInbox(sqs, inboxUrl))
-      slack    <- FakeSlack.make(channel, users, groups, webhook, slackSecret)
-      ui        = HarnessUi(slack, repo, webhook, githubSecret, List(manifest, RepoConfig.policyPath, ".iae/config.json"))
+      clock    <- HarnessClock.make(speed)
+      started  <- Promise.make[Nothing, Reconcilers]
+      slack    <- FakeSlack.make(channel, users, groups, webhook, slackSecret, clock)
+      ui        = HarnessUi(slack, repo, webhook, githubSecret, List(manifest, RepoConfig.policyPath, ".iae/config.json"), clock, started.await.flatMap(_.signalAll))
       server   <- Server.defaultWithPort(port).build.mapError(_.getMessage)
       bound    <- Server.install(slack.api ++ ui.routes).provideEnvironment(server)
       http     <- ZIO.service[Client]
@@ -67,8 +70,9 @@ object Harness:
                          .as(RiskTableEvaluator(SlackGroup.from("infra-approvers").toOption.get))
       pipeline     = Pipeline(CommandManifests(), evaluator, client, self, 24.hours)
       reconcilers <- Reconcilers.make(pipeline, envs)
-      _           <- Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers), 15.minutes).run.forkScoped
-    yield Harness(bound, ui, slack, repo, envs)
+      _           <- started.succeed(reconcilers)
+      _           <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers), 15.minutes).run).forkScoped
+    yield Harness(bound, ui, slack, repo, envs, clock, reconcilers)
 
 /** `./sbta agent/Test/run`: the harness on http://localhost:8088 (or `IAE_HARNESS_PORT`). Needs Docker. */
 object AppTest extends ZIOAppDefault:

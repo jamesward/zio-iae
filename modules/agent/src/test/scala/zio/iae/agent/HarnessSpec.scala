@@ -60,6 +60,21 @@ object HarnessSpec extends ZIOSpecDefault:
           posted.exists(m => m.text.startsWith("Applied") && m.text.contains("<@U_ALICE>")),
           page.contains("iae harness"),
         )
+    ,
+    test("an unanswered approval expires when the clock moves on a day, and is asked again"):
+      ZIO.scoped:
+        for
+          staging <- uniqueEnv
+          prod    <- uniqueEnv
+          harness <- Harness.make(0, List(staging, prod))
+          v1       = Bucket.readWrite(Harness.Uploads).manifest(Harness.app).toOption.get
+          _       <- until("v1 in prod")(converged(harness.envs(1), v1))
+          v2       = Bucket.readWrite(UploadsVersioned).manifest(Harness.app).toOption.get
+          _       <- harness.ui.push(Map(Harness.manifest -> v2.toJson), "turn on versioning")
+          first   <- until("an approval request")(harness.slack.messages.get.map(_.find(_.request.isDefined)))
+          _       <- harness.ui.advance(25.hours)
+          second  <- until("a second approval request")(harness.slack.messages.get.map(_.filter(_.request.isDefined).find(_.ts != first.ts)))
+        yield assertTrue(second.request.exists(_.expires > first.request.get.expires))
   ).provideShared(
     (((FlociLayer.live ++ Client.default) >>> AwsEngine.clients) ++ Client.default).mapError:
       case a: AwsError  => a.message

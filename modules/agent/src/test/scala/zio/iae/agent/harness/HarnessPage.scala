@@ -23,7 +23,10 @@ object HarnessPage:
       |  h2 { font-size:15px; margin:0 0 8px; } select { width:auto; font:inherit; }
       |</style></head><body>
       |<header><strong>iae harness</strong> <span id="channel"></span>
-      |  <label>You are <select id="user"></select></label></header>
+      |  <label>You are <select id="user"></select></label>
+      |  <span id="clock" title="The agent's clock"></span>
+      |  <label>speed <input id="speed" type="number" min="1" max="10000" style="width:80px"></label>
+      |  <button onclick="advance(60)">+1h</button> <button onclick="advance(1440)">+1d</button></header>
       |<main>
       |  <section><h2>Slack</h2><div id="messages"></div></section>
       |  <section><h2>GitHub</h2><div id="files"></div>
@@ -61,7 +64,12 @@ object HarnessPage:
       |    filesShown = true;
       |  }
       |  document.getElementById('commits').textContent = s.commits.join('\n');
+      |  document.getElementById('clock').textContent = '🕑 ' + s.clock.now.replace('T', ' ').slice(0, 16) + ' UTC';
+      |  const speed = document.getElementById('speed');
+      |  if (document.activeElement !== speed) speed.value = s.clock.speed;
       |}
+      |function advance(minutes) { post('/ui/clock/advance', {minutes}).then(refresh); }
+      |document.getElementById('speed').onchange = e => post('/ui/clock/speed', {speed: Number(e.target.value)}).then(refresh);
       |function react(ts, reaction) { post('/ui/react', {ts, user: document.getElementById('user').value, reaction}).then(refresh); }
       |function reply(thread, text) { post('/ui/reply', {thread, user: document.getElementById('user').value, text}).then(refresh); }
       |document.getElementById('push').onclick = () => {

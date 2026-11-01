@@ -35,6 +35,7 @@ final case class FakeSlack(
     counter: Ref[Long],
     webhook: Webhook,
     signingSecret: WebhookSecret,
+    clock: Clock,
 ):
   import FakeSlack.*
 
@@ -71,7 +72,8 @@ final case class FakeSlack(
       _  <- deliver(s"""{"type":"event_callback","event":{"type":"message","user":"$user","channel":"$channel","thread_ts":"$thread","text":${JsonCodec.jsonEncoder(Schema[String]).encodeJson(text, None)}}}""")
     yield ()
 
-  private def deliver(body: String): IO[String, Unit] =
+  /** On the harness clock, like the agent, so timestamps and the webhook's replay window agree. */
+  private def deliver(body: String): IO[String, Unit] = ZIO.withClock(clock):
     for
       now      <- Clock.instant.map(_.getEpochSecond.toString)
       request   = Request.post(URL.root / "slack", Body.fromString(body)).addHeaders(
@@ -97,7 +99,7 @@ final case class FakeSlack(
 
   private def nextTs: UIO[String] =
     for
-      now <- Clock.instant
+      now <- clock.instant
       n   <- counter.updateAndGet(_ + 1)
     yield s"${now.getEpochSecond}.${f"$n%06d"}"
 
@@ -113,11 +115,18 @@ object FakeSlack:
       reactions: List[ReactionJson],
   ) derives Schema
 
-  def make(channel: String, users: List[FakeUser], groups: Map[String, Set[String]], webhook: Webhook, signingSecret: WebhookSecret): UIO[FakeSlack] =
+  def make(
+      channel: String,
+      users: List[FakeUser],
+      groups: Map[String, Set[String]],
+      webhook: Webhook,
+      signingSecret: WebhookSecret,
+      clock: Clock,
+  ): UIO[FakeSlack] =
     for
       messages <- Ref.make(Vector.empty[FakeMessage])
       counter  <- Ref.make(0L)
-    yield FakeSlack(channel, users, groups, messages, counter, webhook, signingSecret)
+    yield FakeSlack(channel, users, groups, messages, counter, webhook, signingSecret, clock)
 
   private def decode[A: Schema](body: String): IO[String, A] = ZIO.fromEither(JsonCodec.jsonDecoder(Schema[A]).decodeJson(body))
 
