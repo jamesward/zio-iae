@@ -13,6 +13,8 @@ final case class ReactAction(ts: String, user: String, reaction: String) derives
 final case class ReplyAction(thread: String, user: String, text: String) derives Schema
 final case class PushAction(files: Map[String, String], message: String) derives Schema
 final case class SpeedAction(speed: Double) derives Schema
+final case class ScenarioAction(name: String) derives Schema
+final case class ScenarioInfo(name: String, description: String, steps: List[String]) derives Schema
 final case class AdvanceAction(minutes: Long) derives Schema
 final case class HarnessState(
     users: List[FakeUser],
@@ -21,6 +23,8 @@ final case class HarnessState(
     files: Map[String, String],
     commits: List[String],
     clock: ClockState,
+    scenarios: List[ScenarioInfo],
+    run: Option[ScenarioRun],
 ) derives Schema
 
 /** The harness's web UI: the Slack channel (as anyone), and a GitHub panel that edits files and pushes. A push sends
@@ -33,7 +37,8 @@ final case class HarnessUi(
     githubSecret: WebhookSecret,
     editable: List[String],
     clock: HarnessClock,
-    signal: UIO[Unit],
+    harness: UIO[Harness],
+    run: Ref[Option[ScenarioRun]],
 ):
   val routes: Routes[Any, Nothing] = Routes(
     Method.GET / ""         -> handler(Response(body = Body.fromString(HarnessPage.html), headers = Headers(Header.ContentType(MediaType.text.html)))),
@@ -43,10 +48,21 @@ final case class HarnessUi(
     Method.POST / "ui" / "push"  -> handler((req: Request) => act[PushAction](req)(a => push(a.files, a.message))),
     Method.POST / "ui" / "clock" / "speed"   -> handler((req: Request) => act[SpeedAction](req)(a => clock.setSpeed(a.speed))),
     Method.POST / "ui" / "clock" / "advance" -> handler((req: Request) => act[AdvanceAction](req)(a => advance(a.minutes.minutes))),
+    Method.POST / "ui" / "scenario" -> handler((req: Request) => act[ScenarioAction](req)(a => start(a.name))),
   )
 
   /** Jumps the clock and wakes the reconcilers, since a jump doesn't end their sleep. */
-  def advance(by: Duration): IO[String, Unit] = clock.advance(by) *> signal
+  def advance(by: Duration): IO[String, Unit] = clock.advance(by) *> harness.flatMap(_.agent.signal)
+
+  /** Starts a scenario in the background; one at a time. */
+  private def start(name: String): IO[String, Unit] =
+    for
+      scenario <- ZIO.fromOption(Scenario.all.find(_.name == name)).orElseFail(s"no scenario $name")
+      busy     <- run.get.map(_.exists(_.status == RunStatus.Running))
+      _        <- ZIO.fail("a scenario is already running").when(busy)
+      h        <- harness
+      _        <- Scenario.run(h, scenario, r => run.set(Some(r))).ignoreLogged.forkDaemon
+    yield ()
 
   def push(files: Map[String, String], message: String): IO[String, Unit] =
     for
@@ -69,7 +85,9 @@ final case class HarnessUi(
       files <- ZIO.foreach(editable)(f => ZIO.attemptBlocking(f -> Files.readString(repo.authorClone.resolve(f), UTF_8).nn).mapError(_.getMessage))
       log   <- zio.iae.agent.Process.run(repo.authorClone, Seq("git", "log", "--format=%h %s", "-n", "20"), 30.seconds)
       time  <- clock.state
-    yield HarnessState(slack.bot :: slack.users, slack.channel, messages.toList, files.toMap, log.linesIterator.toList, time)
+      now   <- run.get
+      infos  = Scenario.all.map(s => ScenarioInfo(s.name, s.description, s.steps.map(_.describe)))
+    yield HarnessState(slack.bot :: slack.users, slack.channel, messages.toList, files.toMap, log.linesIterator.toList, time, infos, now)
 
   private def act[A: Schema](req: Request)(f: A => IO[String, Unit]): UIO[Response] =
     req.body.asString
@@ -78,3 +96,15 @@ final case class HarnessUi(
       .flatMap(f)
       .as(Response.ok)
       .catchAll(e => ZIO.logWarning(s"harness action failed: $e").as(Response.text(e).status(Status.BadRequest)))
+
+object HarnessUi:
+  def make(
+      slack: FakeSlack,
+      repo: TestRepo,
+      webhook: Webhook,
+      githubSecret: WebhookSecret,
+      editable: List[String],
+      clock: HarnessClock,
+      harness: UIO[Harness],
+  ): UIO[HarnessUi] =
+    Ref.make(Option.empty[ScenarioRun]).map(HarnessUi(slack, repo, webhook, githubSecret, editable, clock, harness, _))

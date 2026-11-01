@@ -32,12 +32,13 @@ object HarnessPage:
       |  <section><h2>GitHub</h2><div id="files"></div>
       |    <input id="commitMessage" placeholder="commit message" value="change infra">
       |    <p><button id="push">Commit and push</button></p>
-      |    <h2>Commits</h2><pre id="commits"></pre></section>
+      |    <h2>Commits</h2><pre id="commits"></pre>
+      |    <h2>Scenarios</h2><div id="run"></div><div id="scenarios"></div></section>
       |</main>
       |<script>
       |const post = (path, body) => fetch(path, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
       |const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-      |let filesShown = false, usersShown = false;
+      |let filesShown = false, usersShown = false, scenariosShown = false;
       |async function refresh() {
       |  const s = await (await fetch('/ui/state')).json();
       |  document.getElementById('channel').textContent = '#' + s.channel;
@@ -67,7 +68,15 @@ object HarnessPage:
       |  document.getElementById('clock').textContent = '🕑 ' + s.clock.now.replace('T', ' ').slice(0, 16) + ' UTC';
       |  const speed = document.getElementById('speed');
       |  if (document.activeElement !== speed) speed.value = s.clock.speed;
+      |  const r = s.run;
+      |  document.getElementById('run').innerHTML = r ? `<p><strong>${esc(r.name)}</strong>: ${r.status} — step ${Math.min(r.step, r.total)}/${r.total}: ${esc(r.current)}${r.error ? '<br>' + esc(r.error) : ''}</p>` : '';
+      |  if (!scenariosShown) {
+      |    document.getElementById('scenarios').innerHTML = s.scenarios.map(sc =>
+      |      `<p><button onclick="runScenario('${sc.name}')">Run ${esc(sc.name)}</button> ${esc(sc.description)}</p>`).join('');
+      |    scenariosShown = true;
+      |  }
       |}
+      |function runScenario(name) { post('/ui/scenario', {name}).then(refresh); }
       |function advance(minutes) { post('/ui/clock/advance', {minutes}).then(refresh); }
       |document.getElementById('speed').onchange = e => post('/ui/clock/speed', {speed: Number(e.target.value)}).then(refresh);
       |function react(ts, reaction) { post('/ui/react', {ts, user: document.getElementById('user').value, reaction}).then(refresh); }
