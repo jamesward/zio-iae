@@ -39,7 +39,10 @@ final case class SlackIdentity(botId: String, userId: String)
 trait SlackApi:
   def identity: IO[AgentError, SlackIdentity]
   def post(channel: String, text: String, thread: Option[String], request: Option[ApprovalRequest]): IO[AgentError, String]
-  def update(channel: String, ts: String, text: String): IO[AgentError, Unit]
+  /** Replaces a message's text; a request's metadata is sent again so it's kept. */
+  def update(channel: String, ts: String, text: String, request: Option[ApprovalRequest]): IO[AgentError, Unit]
   def history(channel: String, since: Instant): IO[AgentError, List[SlackMessage]]
   def groupMembers(group: SlackGroup): IO[AgentError, Set[String]]
+  /** The user group's id, for mentions (`<!subteam^ID>`); None if there's no such group. */
+  def groupId(group: SlackGroup): IO[AgentError, Option[String]]
   def isBot(user: String): IO[AgentError, Boolean]

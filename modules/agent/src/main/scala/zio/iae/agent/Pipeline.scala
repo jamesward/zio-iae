@@ -89,8 +89,9 @@ final case class Pipeline(manifests: ManifestSource, evaluator: PolicyEvaluator,
                    case (_, Decision.Deny)       => stopped(config, plan, decision, "the policy denies it")
                    case (_, approve: Decision.Approve) =>
                      approvals.status(plan, decision, approve, author, examples(runtime, governance)).flatMap:
-                       case ApprovalStatus.Approved(by)  => applied(runtime, config, plan, s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", commit)
-                       case ApprovalStatus.Rejected(by)  => stopped(config, plan, decision, s"<@$by> rejected it")
+                       case ApprovalStatus.Approved(by, request) =>
+                         applied(runtime, config, plan, s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", commit) <* approvals.applied(request)
+                       case ApprovalStatus.Rejected(by, _) => stopped(config, plan, decision, s"<@$by> rejected it")
                        case ApprovalStatus.Pending(ts)   => ZIO.succeed(Outcome.WaitingForApproval(plan.app, ts))
     yield outcome
 

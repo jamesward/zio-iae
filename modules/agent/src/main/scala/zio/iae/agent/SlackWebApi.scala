@@ -23,8 +23,8 @@ final case class SlackWebApi(http: Client, token: SlackToken, base: URL) extends
   def post(channel: String, text: String, thread: Option[String], request: Option[ApprovalRequest]): IO[AgentError, String] =
     json[PostMessage, Posted]("chat.postMessage", PostMessage(channel, text, thread, request.map(Metadata(requestType, _)))).map(_.ts)
 
-  def update(channel: String, ts: String, text: String): IO[AgentError, Unit] =
-    json[UpdateMessage, Ok]("chat.update", UpdateMessage(channel, ts, text)).unit
+  def update(channel: String, ts: String, text: String, request: Option[ApprovalRequest]): IO[AgentError, Unit] =
+    json[UpdateMessage, Ok]("chat.update", UpdateMessage(channel, ts, text, request.map(Metadata(requestType, _)))).unit
 
   /** Other apps' message metadata can have any shape, so each message is read on its own (as JSON, at this boundary)
     * and only our requests' payloads are decoded.
@@ -52,6 +52,9 @@ final case class SlackWebApi(http: Client, token: SlackToken, base: URL) extends
   def groupMembers(group: SlackGroup): IO[AgentError, Set[String]] =
     form[UserGroups]("usergroups.list", List("include_users" -> "true"))
       .map(_.usergroups.find(_.handle == group.handle).fold(Set.empty[String])(_.users.getOrElse(Nil).toSet))
+
+  def groupId(group: SlackGroup): IO[AgentError, Option[String]] =
+    form[UserGroups]("usergroups.list", Nil).map(_.usergroups.find(_.handle == group.handle).map(_.id))
 
   def isBot(user: String): IO[AgentError, Boolean] =
     form[UserInfo]("users.info", List("user" -> user)).map(_.user.isBot)
@@ -87,7 +90,7 @@ object SlackWebApi:
   final case class Metadata(@fieldName("event_type") eventType: String, @fieldName("event_payload") eventPayload: ApprovalRequest) derives Schema
   final case class PostMessage(channel: String, text: String, @fieldName("thread_ts") threadTs: Option[String], metadata: Option[Metadata]) derives Schema
   final case class Posted(ts: String) derives Schema
-  final case class UpdateMessage(channel: String, ts: String, text: String) derives Schema
+  final case class UpdateMessage(channel: String, ts: String, text: String, metadata: Option[Metadata]) derives Schema
   final case class ReactionJson(name: String, users: List[String]) derives Schema
   final case class MetadataType(@fieldName("event_type") eventType: String) derives Schema
   final case class MessageJson(

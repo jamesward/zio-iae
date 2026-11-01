@@ -48,7 +48,10 @@ final case class FakeSlack(
         result <- method match
                     case "auth.test"             => ok(AuthTest(Some(bot.id), Some(botId)))
                     case "chat.postMessage"      => decode[PostMessage](body).flatMap(post).flatMap(ts => ok(Posted(ts)))
-                    case "chat.update"           => decode[UpdateMessage](body).flatMap(u => messages.update(_.map(m => if m.ts == u.ts then m.copy(text = u.text) else m))) *> okEmpty
+                    case "chat.update" =>
+                      decode[UpdateMessage](body).flatMap: u =>
+                        messages.update(_.map(m => if m.ts == u.ts then m.copy(text = u.text, request = u.metadata.map(_.eventPayload).orElse(m.request)) else m))
+                      *> okEmpty
                     case "conversations.history" => history
                     case "usergroups.list"       => ok(UserGroups(groups.toList.sortBy(_._1).map((h, us) => UserGroup(s"S_$h", h, Some(us.toList.sorted)))))
                     case "users.info"            => ok(UserInfo(User(form(body)("user"), users.exists(u => u.id == form(body)("user") && u.bot) || form(body)("user") == bot.id)))

@@ -11,6 +11,7 @@ final case class InMemorySlack(
     groups: Map[String, Set[String]],
     bots: Set[String],
     clock: Ref[Long],
+    threads: Ref[Map[(String, String), List[String]]],
 ) extends SlackApi:
   def identity: IO[AgentError, SlackIdentity] = ZIO.succeed(self)
 
@@ -19,16 +20,23 @@ final case class InMemorySlack(
       now <- Clock.instant
       seq <- clock.updateAndGet(_ + 1)
       ts   = s"${now.getEpochSecond}.${f"$seq%06d"}"
-      _   <- messages.update(_ :+ (channel -> SlackMessage(ts, Some(self.userId), Some(self.botId), text, request, Nil)))
+      _ <- thread match
+             case Some(t) => threads.update(m => m.updated((channel, t), m.getOrElse((channel, t), Nil) :+ text))
+             case None    => messages.update(_ :+ (channel -> SlackMessage(ts, Some(self.userId), Some(self.botId), text, request, Nil)))
     yield ts
 
-  def update(channel: String, ts: String, text: String): IO[AgentError, Unit] =
-    messages.update(_.map((c, m) => if c == channel && m.ts == ts then c -> m.copy(text = text) else c -> m))
+  def update(channel: String, ts: String, text: String, request: Option[ApprovalRequest]): IO[AgentError, Unit] =
+    messages.update(_.map((c, m) => if c == channel && m.ts == ts then c -> m.copy(text = text, request = request.orElse(m.request)) else c -> m))
 
   def history(channel: String, since: Instant): IO[AgentError, List[SlackMessage]] =
     messages.get.map(_.collect { case (`channel`, m) if !m.postedAt.isBefore(since.minusSeconds(1)) => m }.toList.reverse)
 
   def groupMembers(group: SlackGroup): IO[AgentError, Set[String]] = ZIO.succeed(groups.getOrElse(group.handle, Set.empty))
+
+  def groupId(group: SlackGroup): IO[AgentError, Option[String]] = ZIO.succeed(Option.when(groups.contains(group.handle))(s"S_${group.handle}"))
+
+  /** Thread replies posted by the agent. */
+  def replies(channel: String, thread: String): UIO[List[String]] = threads.get.map(_.getOrElse((channel, thread), Nil))
 
   def isBot(user: String): IO[AgentError, Boolean] = ZIO.succeed(bots.contains(user) || user == self.userId)
 
@@ -48,4 +56,5 @@ object InMemorySlack:
     for
       messages <- Ref.make(Vector.empty[(String, SlackMessage)])
       clock    <- Ref.make(0L)
-    yield InMemorySlack(SlackIdentity("B_IAE", "U_IAE"), messages, groups, bots, clock)
+      threads  <- Ref.make(Map.empty[(String, String), List[String]])
+    yield InMemorySlack(SlackIdentity("B_IAE", "U_IAE"), messages, groups, bots, clock, threads)
