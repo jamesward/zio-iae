@@ -8,16 +8,32 @@ import zio.iae.*
 import zio.stream.ZStream
 
 /** A `Cloud` whose buckets live in memory: the fast, fake layer of the test onion. */
-final case class InMemoryCloud(app: AppName, env: EnvName, buckets: Ref[Map[LogicalId, Map[ObjectKey, InMemoryCloud.Stored]]])
-    extends Cloud:
+final case class InMemoryCloud(
+    app: AppName,
+    env: EnvName,
+    buckets: Ref[Map[LogicalId, Map[ObjectKey, InMemoryCloud.Stored]]],
+    queues: Ref.Synchronized[Map[LogicalId, Ref[InMemoryQueue.State]]],
+) extends Cloud:
   def bucket[I](id: LogicalId, spec: BucketSpec): IO[InfraError, Bucket[I]] =
     buckets.update(all => if all.contains(id) then all else all + (id -> Map.empty)).as(InMemoryBucket[I](id, buckets))
+
+  def queue[I <: MessageQueue.Id[?]](id: I): IO[InfraError, MessageQueue[I]] =
+    queues
+      .modifyZIO: all =>
+        all.get(id.logicalId) match
+          case Some(state) => ZIO.succeed((state, all))
+          case None        => Ref.make(InMemoryQueue.empty).map(state => (state, all + (id.logicalId -> state)))
+      .map(InMemoryQueue(id, _))
 
 object InMemoryCloud:
   final case class Stored(bytes: Chunk[Byte], contentType: Option[String], eTag: String, lastModified: Instant)
 
   def layer(app: AppName, env: EnvName): ULayer[Cloud] =
-    ZLayer(Ref.make(Map.empty[LogicalId, Map[ObjectKey, Stored]]).map(InMemoryCloud(app, env, _)))
+    ZLayer:
+      for
+        buckets <- Ref.make(Map.empty[LogicalId, Map[ObjectKey, Stored]])
+        queues  <- Ref.Synchronized.make(Map.empty[LogicalId, Ref[InMemoryQueue.State]])
+      yield InMemoryCloud(app, env, buckets, queues)
 
 private final case class InMemoryBucket[I](id: LogicalId, buckets: Ref[Map[LogicalId, Map[ObjectKey, InMemoryCloud.Stored]]])
     extends Bucket[I]:

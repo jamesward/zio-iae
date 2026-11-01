@@ -15,7 +15,7 @@ final case class AwsJsonClient(http: Client, config: AwsConfig):
 
   def call[Req: Schema, Res: Schema](protocol: AwsJsonProtocol, operation: String, request: Req): IO[AwsError, Res] =
     val serviceName = protocol.service.signingName
-    val body        = Chunk.fromArray(JsonCodec.jsonEncoder(Schema[Req]).encodeJson(request, None).toString.getBytes(UTF_8))
+    val body        = Chunk.fromArray(encode(request).getBytes(UTF_8))
     val headers = List(
       "content-type" -> s"application/x-amz-json-${protocol.jsonVersion}",
       "x-amz-target" -> s"${protocol.targetPrefix}.$operation",
@@ -35,6 +35,11 @@ final case class AwsJsonClient(http: Client, config: AwsConfig):
     attempt.retry(AwsHttp.retryPolicy && Schedule.recurWhile[AwsError](_.retryable))
 
 object AwsJsonClient:
+  /** AWS JSON APIs expect absent optional members to be left out, not written as null. */
+  private val configuration = JsonCodec.Configuration(explicitNulls = JsonCodec.ExplicitConfig(encoding = false, decoding = false))
+
+  def encode[A: Schema](value: A): String = JsonCodec.jsonEncoder(configuration)(Schema[A]).encodeJson(value, None).toString
+
   val layer: ZLayer[Client & AwsConfig, Nothing, AwsJsonClient] = ZLayer.fromFunction(AwsJsonClient.apply)
 
   /** Responses of operations that return nothing useful. */

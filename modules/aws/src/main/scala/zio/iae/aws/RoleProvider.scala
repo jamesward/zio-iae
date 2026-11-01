@@ -7,7 +7,7 @@ import zio.iae.aws.client.*
 final case class ObservedRole(name: RoleName, trust: Option[TrustDocument], permissions: Option[PolicyDocument], tags: Map[String, String])
 
 /** Runtime roles: `iae-<app>-<env>` under the `/iae/` path, with one inline policy generated from the app's grants. */
-final case class RoleProvider(iam: IamClient, buckets: BucketNaming) extends Provider[RoleSpec, ObservedRole]:
+final case class RoleProvider(iam: IamClient, buckets: BucketNaming, context: AwsContext) extends Provider[RoleSpec, ObservedRole]:
   import RoleProvider.*
 
   val kind: ResourceKind = ResourceKind.Role
@@ -78,7 +78,7 @@ final case class RoleProvider(iam: IamClient, buckets: BucketNaming) extends Pro
     yield ()
 
   private def documents(address: Address, spec: RoleSpec): Either[InfraError, (TrustDocument, PolicyDocument)] =
-    IamPolicy.permissions(address.app, address.env, spec, buckets).map(IamPolicy.trust(spec) -> _)
+    IamPolicy.permissions(address.app, address.env, spec, buckets, context).map(IamPolicy.trust(spec) -> _)
 
   private def nameOf(address: Address): IO[ProviderError, RoleName] =
     ZIO.fromEither(RoleProvider.roleName(address.app, address.env)).mapError(e => ProviderError(address, "name", e))

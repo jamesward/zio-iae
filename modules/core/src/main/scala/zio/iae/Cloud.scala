@@ -9,3 +9,4 @@ trait Cloud:
   def app: AppName
   def env: EnvName
   def bucket[I](id: LogicalId, spec: BucketSpec): IO[InfraError, Bucket[I]]
+  def queue[I <: MessageQueue.Id[?]](id: I): IO[InfraError, MessageQueue[I]]

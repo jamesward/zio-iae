@@ -6,6 +6,7 @@ import zio.iae.*
 import zio.iae.aws.*
 import zio.iae.aws.client.*
 import zio.iae.testkit.FlociLayer
+import zio.schema.{Schema, derived}
 import zio.test.*
 
 object EngineSpec extends ZIOSpecDefault:
@@ -15,6 +16,9 @@ object EngineSpec extends ZIOSpecDefault:
   object Uploads extends Bucket.Id(LogicalId("uploads"), BucketSpec(versioning = Versioning.Enabled))
   object Thumbs  extends Bucket.Id(LogicalId("thumbs"))
   object Logs    extends Bucket.Id(LogicalId("logs"))
+
+  final case class Job(photo: String) derives Schema, CanEqual
+  object Jobs extends MessageQueue.Id[Job](LogicalId("jobs"), QueueSpec(deadLetter = Some(DeadLetter(maxReceives = 5))))
 
   /** The same logical bucket as `Thumbs`, at an older commit that had a different spec. */
   object ThumbsVersioned extends Bucket.Id(LogicalId("thumbs"), BucketSpec(versioning = Versioning.Enabled))
@@ -44,12 +48,14 @@ object EngineSpec extends ZIOSpecDefault:
   val uniqueEnv: UIO[EnvName] =
     ZIO.collectAll(List.fill(8)(Random.nextIntBounded(26).map(i => ('a' + i).toChar))).map(cs => EnvName.from("e" + cs.mkString).toOption.get)
 
-  def engineWith(history: CommitOrder): URIO[S3Client & TaggingClient & IamClient, Engine] =
+  def engineWith(history: CommitOrder): URIO[S3Client & SqsClient & TaggingClient & IamClient & AwsContext, Engine] =
     for
       s3      <- ZIO.service[S3Client]
+      sqs     <- ZIO.service[SqsClient]
       tagging <- ZIO.service[TaggingClient]
       iam     <- ZIO.service[IamClient]
-    yield Engine.make(AwsEngine.drivers(s3, iam, naming), AwsEngine.discovery(tagging, iam), history)
+      context <- ZIO.service[AwsContext]
+    yield Engine.make(AwsEngine.drivers(s3, sqs, iam, naming, context), AwsEngine.discovery(tagging, iam), history)
 
   /** After converging, planning again finds nothing to do in either phase. */
   def assertConverges(engine: Engine, manifest: Manifest, env: EnvName, target: Option[CommitSha]): IO[EngineError, TestResult] =
@@ -84,7 +90,8 @@ object EngineSpec extends ZIOSpecDefault:
         iam       <- ZIO.service[IamClient]
         manifest  <- manifestOf(everything)
         remaining <- Ref.make(1)
-        crashing   = Engine.make(Drivers(AwsEngine.drivers(s3, iam, naming).all.map(CrashingDriver(_, remaining))), AwsEngine.discovery(tagging, iam), LinearHistory(Nil))
+        normal    <- engineWith(LinearHistory(Nil))
+        crashing   = Engine.make(Drivers(normal.planner.drivers.all.map(CrashingDriver(_, remaining))), AwsEngine.discovery(tagging, iam), LinearHistory(Nil))
         crashed   <- crashing.converge(manifest, env, None).either
         engine    <- engineWith(LinearHistory(Nil))
         leftOver  <- engine.plan(manifest, env, None, Phase.Expand)
@@ -134,6 +141,23 @@ object EngineSpec extends ZIOSpecDefault:
         case _ => false
       )
     ,
+    test("an app with a bucket, a queue and a role converges, and the role may only use its own queue"):
+      for
+        env      <- uniqueEnv
+        engine   <- engineWith(LinearHistory(Nil))
+        manifest <- manifestOf(Bucket.reader(Uploads) ++ MessageQueue.sender(Jobs))
+        result   <- assertConverges(engine, manifest, env, None)
+        iam      <- ZIO.service[IamClient]
+        context  <- ZIO.service[AwsContext]
+        role     <- ZIO.fromEither(RoleProvider.roleName(app, env)).mapError(e => EngineError.CommitOrder(e))
+        policy   <- iam.getInlinePolicy(role, RoleProvider.policyName).mapError(e => EngineError.CommitOrder(e.message))
+        actions   = policy.flatMap(IamPolicy.parsePermissions).fold(Set.empty[(String, String)])(_.permissions)
+      yield result && assertTrue(
+        actions.contains("sqs:SendMessage" -> QueueNaming.arn(context, s"photo-app-${env.value}-jobs")),
+        !actions.exists(_._1 == "sqs:ReceiveMessage"),
+        !actions.exists(_._1 == "s3:PutObject"),
+      )
+    ,
     test("plans are data: they round-trip through JSON and hash by content"):
       for
         env      <- uniqueEnv
@@ -152,4 +176,7 @@ object EngineSpec extends ZIOSpecDefault:
     TaggingClient.layer,
     AwsQueryClient.layer,
     IamClient.layer,
+    StsClient.layer,
+    AwsContext.layer,
+    SqsClient.layer,
   ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock @@ TestAspect.timeout(3.minutes)

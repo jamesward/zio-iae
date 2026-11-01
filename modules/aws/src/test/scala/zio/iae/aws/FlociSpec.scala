@@ -7,6 +7,7 @@ import zio.iae.*
 import zio.iae.aws.client.*
 import zio.iae.testkit.FlociLayer
 import zio.stream.ZStream
+import zio.schema.{Schema, derived}
 import zio.test.*
 
 /** Integration tests against Floci. Each test uses its own env name, so tests share one container safely. */
@@ -15,6 +16,9 @@ object FlociSpec extends ZIOSpecDefault:
   val naming = BucketNaming(None)
 
   object Uploads extends Bucket.Id(LogicalId("uploads"))
+
+  final case class Job(photo: String) derives Schema, CanEqual
+  object Jobs extends MessageQueue.Id[Job](LogicalId("jobs"), QueueSpec(visibilityTimeout = 1.second, deadLetter = Some(DeadLetter(maxReceives = 3))))
   object Archive extends Bucket.Id(LogicalId("archive"), BucketSpec(versioning = Versioning.Enabled))
 
   val uniqueEnv: UIO[EnvName] =
@@ -26,8 +30,11 @@ object FlociSpec extends ZIOSpecDefault:
 
   def bytes(text: String): ZStream[Any, Nothing, Byte] = ZStream.fromChunk(Chunk.fromArray(text.getBytes(UTF_8)))
 
-  def cloud(env: EnvName, mode: ProvisionMode): URIO[S3Client, Cloud] =
-    ZIO.serviceWith[S3Client](s3 => AwsCloud(app, env, mode, s3, BucketProvider(s3, naming)))
+  def cloud(env: EnvName, mode: ProvisionMode): URIO[S3Client & SqsClient, Cloud] =
+    for
+      s3  <- ZIO.service[S3Client]
+      sqs <- ZIO.service[SqsClient]
+    yield AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs))
 
   def spec = suite("Floci")(
     suite("BucketProvider")(
@@ -78,7 +85,8 @@ object FlociSpec extends ZIOSpecDefault:
         for
           env      <- uniqueEnv
           iam      <- ZIO.service[IamClient]
-          provider  = RoleProvider(iam, naming)
+          context  <- ZIO.service[AwsContext]
+          provider  = RoleProvider(iam, naming, context)
           address   = Address(app, env, ResourceKind.Role, Manifest.runtimeRole)
           create    = provider.diff(address, read, None)
           _        <- ZIO.foreachDiscard(create)(provider.applyChange(_, ApplyContext.local))
@@ -95,6 +103,53 @@ object FlociSpec extends ZIOSpecDefault:
           provider.diff(address, write, widened).isEmpty,
           narrow.exists(c => provider.assess(c, widened) == Assessment(Risk.Medium, Set.empty)),
           found.map(_.address) == List(address),
+        )
+      ,
+    ),
+    suite("QueueProvider")(
+      test("a queue with a dead-letter queue converges, then changes settings and drops the redrive"):
+        val desired = QueueSpec(visibilityTimeout = 45.seconds, deadLetter = Some(DeadLetter(maxReceives = 5)))
+        val changed = QueueSpec(visibilityTimeout = 90.seconds)
+        for
+          env      <- uniqueEnv
+          provider <- ZIO.serviceWith[SqsClient](QueueProvider(_))
+          address   = Address(app, env, ResourceKind.Queue, LogicalId("jobs"))
+          create    = provider.diff(address, desired, None)
+          _        <- ZIO.foreachDiscard(create)(provider.applyChange(_, ApplyContext.local))
+          _        <- ZIO.foreachDiscard(create)(provider.applyChange(_, ApplyContext.local))
+          created  <- provider.observe(address)
+          update    = provider.diff(address, changed, created)
+          _        <- ZIO.foreachDiscard(update)(provider.applyChange(_, ApplyContext.local))
+          after    <- provider.observe(address)
+        yield assertTrue(
+          created.exists(_.deadLetterExists),
+          created.flatMap(_.attributes.get(QueueProvider.Redrive)).flatMap(QueueProvider.maxReceives).contains(5),
+          provider.diff(address, desired, created).isEmpty,
+          update.exists:
+            case Change.Update(_, _, fields) => fields.map(_.field).toSet == Set("visibility timeout (s)", "dead-letter max receives", s"tag ${TagKey.Spec.wire}")
+            case _                           => false
+          ,
+          provider.diff(address, changed, after).isEmpty,
+        )
+      ,
+      test("typed messages go through SQS, and unacknowledged ones come back"):
+        for
+          env     <- uniqueEnv
+          c       <- cloud(env, ProvisionMode.AutoProvision)
+          jobs    <- c.queue(Jobs)
+          _       <- jobs.send(Job("a.jpg"))
+          first   <- jobs.receive(max = 10, wait = 2.seconds)
+          _       <- ZIO.sleep(1500.millis)
+          again   <- jobs.receive(max = 10, wait = 2.seconds)
+          _       <- ZIO.foreachDiscard(again)(r => jobs.ack(r.receipt))
+          _       <- ZIO.sleep(1500.millis)
+          gone    <- jobs.receive(max = 10, wait = 1.second)
+          bindOk  <- cloud(env, ProvisionMode.BindOnly).flatMap(_.queue(Jobs)).either
+        yield assertTrue(
+          first.map(_.message) == Chunk(Job("a.jpg")),
+          again.map(r => (r.message, r.receiveCount)) == Chunk((Job("a.jpg"), 2)),
+          gone.isEmpty,
+          bindOk.isRight,
         )
       ,
     ),
@@ -160,4 +215,14 @@ object FlociSpec extends ZIOSpecDefault:
         yield result
       ,
     ),
-  ).provideShared(FlociLayer.live, Client.default, S3Client.layer, AwsQueryClient.layer, IamClient.layer) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock
+  ).provideShared(
+    FlociLayer.live,
+    Client.default,
+    S3Client.layer,
+    AwsQueryClient.layer,
+    IamClient.layer,
+    StsClient.layer,
+    AwsContext.layer,
+    AwsJsonClient.layer,
+    SqsClient.layer,
+  ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock

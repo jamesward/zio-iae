@@ -5,7 +5,7 @@ import zio.*
 import zio.http.Client
 import zio.iae.*
 import zio.iae.aws.*
-import zio.iae.aws.client.S3Client
+import zio.iae.aws.client.{AwsJsonClient, S3Client, SqsClient}
 import zio.iae.testkit.{FlociLayer, InMemoryCloud}
 import zio.test.*
 
@@ -28,7 +28,7 @@ object PhotosSpec extends ZIOSpecDefault:
     InMemoryCloud.layer(PhotoApp.appName, EnvName("test")) >>> PhotoApp.infra.layer
 
   val floci: ZLayer[Any, Any, Photos.Env] =
-    (FlociLayer.live ++ Client.default) >>> S3Client.layer >>>
+    (FlociLayer.live ++ Client.default) >>> (S3Client.layer ++ (AwsJsonClient.layer >>> SqsClient.layer)) >>>
       AwsCloud.layer(PhotoApp.appName, EnvName("test"), ProvisionMode.AutoProvision, BucketNaming(None)) >>>
       PhotoApp.infra.layer
 

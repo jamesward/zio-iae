@@ -37,17 +37,29 @@ final case class TrustDocument(@fieldName("Version") version: String, @fieldName
 object IamPolicy:
   val version = "2012-10-17"
 
-  def permissions(app: AppName, env: EnvName, spec: RoleSpec, buckets: BucketNaming): Either[InfraError, PolicyDocument] =
+  def permissions(app: AppName, env: EnvName, spec: RoleSpec, buckets: BucketNaming, context: AwsContext): Either[InfraError, PolicyDocument] =
     val statements = spec.grants.map: grant =>
+      val sid = s"${grant.capability}${camel(grant.id)}"
       grant.kind match
         case ResourceKind.Bucket =>
           buckets.physical(Address(app, env, ResourceKind.Bucket, grant.id)).map: name =>
             val bucket  = s"arn:aws:s3:::${name.value}"
             val objects = s"$bucket/*"
-            val sid     = s"${grant.capability}${camel(grant.id)}"
             grant.capability match
               case Capability.BucketRead  => Statement(sid, "Allow", List("s3:GetObject", "s3:ListBucket"), List(bucket, objects))
-              case Capability.BucketWrite => Statement(sid, "Allow", List("s3:DeleteObject", "s3:PutObject"), List(objects))
+              case _                      => Statement(sid, "Allow", List("s3:DeleteObject", "s3:PutObject"), List(objects))
+        case ResourceKind.Queue =>
+          QueueNaming.physical(Address(app, env, ResourceKind.Queue, grant.id)).map: name =>
+            val queue = QueueNaming.arn(context, name)
+            grant.capability match
+              case Capability.QueueSend => Statement(sid, "Allow", List("sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:SendMessage"), List(queue))
+              case _ =>
+                Statement(
+                  sid,
+                  "Allow",
+                  List("sqs:ChangeMessageVisibility", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:GetQueueUrl", "sqs:ReceiveMessage"),
+                  List(queue),
+                )
         case ResourceKind.Role => Left(InfraError.InvalidConfig(s"a role can't be granted to an app: ${grant.id.value}"))
     statements.partitionMap(identity) match
       case (Nil, all)     => Right(PolicyDocument(version, all))
