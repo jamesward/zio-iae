@@ -22,6 +22,7 @@ final case class AwsCloud(
     sqs: SqsClient,
     queues: QueueProvider,
     secrets: SecretsClient,
+    dynamo: DynamoClient,
 ) extends Cloud:
   def bucket[I](id: LogicalId, spec: BucketSpec): IO[InfraError, Bucket[I]] =
     val address = Address(app, env, ResourceKind.Bucket, id)
@@ -40,6 +41,10 @@ final case class AwsCloud(
   def secret[I](id: LogicalId, spec: SecretSpec): IO[InfraError, SecretReader[I]] =
     val address = Address(app, env, ResourceKind.Secret, id)
     bind(SecretProvider(secrets), address, spec, ResourceSpec.Secret(spec))(_.tags).as(AwsSecret[I](id, secrets, SecretNaming.physical(address)))
+
+  def table[I <: Table.Id[?, ?]](id: I): IO[InfraError, Table[I]] =
+    val address = Address(app, env, ResourceKind.Table, id.logicalId)
+    bind(TableProvider(dynamo), address, id.spec, ResourceSpec.Table(id.spec))(_.tags).as(DynamoKeyValue[I](id, dynamo, TableNaming.physical(address)))
 
   /** Checks (or, when auto-provisioning, converges) the resource, and returns what is there afterwards. */
   private def bind[S, O](provider: Provider[S, O], address: Address, spec: S, resource: ResourceSpec)(tags: O => Map[String, String]): IO[InfraError, Option[O]] =
@@ -62,9 +67,9 @@ final case class AwsCloud(
     yield after
 
 object AwsCloud:
-  def layer(app: AppName, env: EnvName, mode: ProvisionMode, naming: BucketNaming): ZLayer[S3Client & SqsClient & SecretsClient, Nothing, Cloud] =
-    ZLayer.fromFunction((s3: S3Client, sqs: SqsClient, secrets: SecretsClient) =>
-      AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets)
+  def layer(app: AppName, env: EnvName, mode: ProvisionMode, naming: BucketNaming): ZLayer[S3Client & SqsClient & SecretsClient & DynamoClient, Nothing, Cloud] =
+    ZLayer.fromFunction((s3: S3Client, sqs: SqsClient, secrets: SecretsClient, dynamo: DynamoClient) =>
+      AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets, dynamo)
     )
 
   /** Configuration from the environment: `IAE_ENV` (required), `IAE_PROVISION` (`bind`, the default, or `auto`),
@@ -87,4 +92,4 @@ object AwsCloud:
         Client.default.mapError(e => InfraError.Unavailable(s"HTTP client: ${e.getMessage}"))
     ZLayer.fromZIO(settings).flatMap: env =>
       val (envName, mode, naming) = env.get
-      (clients >>> (S3Client.layer ++ (AwsJsonClient.layer >>> (SqsClient.layer ++ SecretsClient.layer)))) >>> layer(app, envName, mode, naming)
+      (clients >>> (S3Client.layer ++ (AwsJsonClient.layer >>> (SqsClient.layer ++ SecretsClient.layer ++ DynamoClient.layer)))) >>> layer(app, envName, mode, naming)

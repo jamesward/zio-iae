@@ -51,3 +51,30 @@ object InMemorySecretSpec extends ZIOSpecDefault:
         yield assertTrue(before == Left(SecretError.NotSet(ApiKey.logicalId)), after.value == "s3cr3t")
       program.provide(InMemoryCloud.layer(AppName("photo-app"), EnvName("test")))
   )
+
+object InMemoryTableSpec extends ZIOSpecDefault:
+  import zio.schema.{Schema, derived}
+
+  final case class UserId(value: Int) derives Schema
+  final case class User(name: String) derives Schema, CanEqual
+  object Users extends Table.Id[UserId, User](LogicalId("users"))
+
+  def spec = suite("InMemoryCloud tables")(
+    test("put, get and delete typed items"):
+      val program =
+        for
+          users <- ZIO.service[Table[Users.type]]
+          _     <- users.put(UserId(1), User("ada"))
+          found <- users.get(UserId(1))
+          _     <- users.delete(UserId(1))
+          gone  <- users.get(UserId(1))
+        yield assertTrue(found.contains(User("ada")), gone.isEmpty)
+      program.provide(InMemoryCloud.layer(AppName("photo-app"), EnvName("test")) >>> Table.readWrite(Users).layer)
+    ,
+    test("keys and values must have the declared types"):
+      typeCheck("""
+        val users: Table[Users.type] = ???
+        users.put("1", User("ada"))
+      """).map(result => assertTrue(result.isLeft))
+    ,
+  )

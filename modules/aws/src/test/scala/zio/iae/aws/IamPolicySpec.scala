@@ -55,6 +55,15 @@ object IamPolicySpec extends ZIOSpecDefault:
         )
       )
     ,
+    test("table readers may only get items; writers may put and delete them"):
+      val read  = IamPolicy.permissions(app, env, RoleSpec(List(Grant(LogicalId("photos"), ResourceKind.Table, Capability.TableRead)), Nil), naming, context)
+      val write = IamPolicy.permissions(app, env, RoleSpec(List(Grant(LogicalId("photos"), ResourceKind.Table, Capability.TableWrite)), Nil), naming, context)
+      val arn   = "arn:aws:dynamodb:us-east-1:123456789012:table/photo-app-prod-photos"
+      assertTrue(
+        read.map(_.permissions) == Right(Set("dynamodb:DescribeTable" -> arn, "dynamodb:GetItem" -> arn)),
+        write.map(_.permissions) == Right(Set("dynamodb:DeleteItem" -> arn, "dynamodb:PutItem" -> arn)),
+      )
+    ,
     test("documents round-trip through the JSON IAM stores"):
       val spec  = RoleSpec(List(grant("uploads", Capability.BucketRead), grant("thumbs", Capability.BucketWrite)), List(TrustedService.EcsTasks))
       val doc   = IamPolicy.permissions(app, env, spec, naming, context)

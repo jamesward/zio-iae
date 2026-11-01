@@ -9,7 +9,7 @@ import zio.schema.codec.JsonCodec
 
 @simpleEnum
 enum ResourceKind derives Schema, CanEqual:
-  case Bucket, Queue, Secret, Role
+  case Bucket, Queue, Secret, Table, Role
 
 @simpleEnum
 enum Versioning derives Schema, CanEqual:
@@ -30,12 +30,14 @@ enum ResourceSpec derives Schema, CanEqual:
   case Bucket(spec: BucketSpec)
   case Queue(spec: QueueSpec)
   case Secret(spec: SecretSpec)
+  case Table(spec: TableSpec)
   case Role(spec: RoleSpec)
 
   def kind: ResourceKind = this match
     case Bucket(_) => ResourceKind.Bucket
     case Queue(_)  => ResourceKind.Queue
     case Secret(_) => ResourceKind.Secret
+    case Table(_)  => ResourceKind.Table
     case Role(_)   => ResourceKind.Role
 
 final case class ResourceDecl(id: LogicalId, spec: ResourceSpec) derives Schema, CanEqual:

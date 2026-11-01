@@ -27,7 +27,7 @@ object Iae extends ZIOAppDefault:
     val failed = (detail: String) => CliError.Failed(EngineError.CommitOrder(detail))
     val naming = ZLayer.fromZIO(System.env("IAE_NAME_SUFFIX").orElseFail(failed("cannot read IAE_NAME_SUFFIX")).map(BucketNaming(_)))
     val clients = AwsConfig.layer.mapError(e => failed(e.message)) ++ Client.default.mapError(e => failed(s"HTTP client: ${e.getMessage}"))
-    val json    = AwsJsonClient.layer >>> (TaggingClient.layer ++ SqsClient.layer ++ SecretsClient.layer)
+    val json    = AwsJsonClient.layer >>> (TaggingClient.layer ++ SqsClient.layer ++ SecretsClient.layer ++ DynamoClient.layer)
     val query   = AwsQueryClient.layer >>> (IamClient.layer ++ StsClient.layer)
     val aws     = clients >>> (S3Client.layer ++ json ++ (ZLayer.service[AwsConfig] ++ query >>> (ZLayer.service[IamClient] ++ AwsContext.layer.mapError(e => failed(s"finding the AWS account: ${e.message}")))))
     naming.flatMap(n => (aws ++ ZLayer.succeed[CommitOrder](GitCommitOrder(repository))) >>> AwsEngine.layer(n.get))

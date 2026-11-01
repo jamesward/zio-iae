@@ -44,6 +44,7 @@ object CliSpec extends ZIOSpecDefault:
       TaggingClient.layer,
       SqsClient.layer,
       SecretsClient.layer,
+      DynamoClient.layer,
       AwsQueryClient.layer,
       IamClient.layer,
       StsClient.layer,

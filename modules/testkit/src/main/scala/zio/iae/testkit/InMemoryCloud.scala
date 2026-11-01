@@ -14,6 +14,7 @@ final case class InMemoryCloud(
     buckets: Ref[Map[LogicalId, Map[ObjectKey, InMemoryCloud.Stored]]],
     queues: Ref.Synchronized[Map[LogicalId, Ref[InMemoryQueue.State]]],
     secrets: Ref[Map[LogicalId, Option[String]]],
+    tables: Ref[Map[(LogicalId, String), String]],
 ) extends Cloud:
   def bucket[I](id: LogicalId, spec: BucketSpec): IO[InfraError, Bucket[I]] =
     buckets.update(all => if all.contains(id) then all else all + (id -> Map.empty)).as(InMemoryBucket[I](id, buckets))
@@ -23,6 +24,18 @@ final case class InMemoryCloud(
       new SecretReader[I]:
         def read: IO[SecretError, SecretValue] =
           secrets.get.map(_.get(id).flatten).someOrFail(SecretError.NotSet(id)).map(SecretValue(_))
+
+  def table[I <: Table.Id[?, ?]](id: I): IO[InfraError, Table[I]] =
+    ZIO.succeed:
+      new Table[I]:
+        def get[K, V](key: K)(using ev: I <:< Table.Id[K, V]): IO[TableError, Option[V]] =
+          tables.get.flatMap: all =>
+            ZIO.foreach(all.get(id.logicalId -> Table.encode(ev(id).keySchema, key))): json =>
+              ZIO.fromEither(Table.decode(ev(id).valueSchema, json)).mapError(TableError.Undecodable(_))
+        def put[K, V](key: K, value: V)(using ev: I <:< Table.Id[K, V]): IO[TableError, Unit] =
+          tables.update(_ + ((id.logicalId -> Table.encode(ev(id).keySchema, key)) -> Table.encode(ev(id).valueSchema, value)))
+        def delete[K, V](key: K)(using ev: I <:< Table.Id[K, V]): IO[TableError, Unit] =
+          tables.update(_ - (id.logicalId -> Table.encode(ev(id).keySchema, key)))
 
   /** Sets a secret's value, as a person would out of band. */
   def setSecret(id: LogicalId, value: String): UIO[Unit] = secrets.update(_ + (id -> Some(value)))
@@ -44,7 +57,8 @@ object InMemoryCloud:
         buckets <- Ref.make(Map.empty[LogicalId, Map[ObjectKey, Stored]])
         queues  <- Ref.Synchronized.make(Map.empty[LogicalId, Ref[InMemoryQueue.State]])
         secrets <- Ref.make(Map.empty[LogicalId, Option[String]])
-      yield InMemoryCloud(app, env, buckets, queues, secrets)
+        tables  <- Ref.make(Map.empty[(LogicalId, String), String])
+      yield InMemoryCloud(app, env, buckets, queues, secrets, tables)
 
 private final case class InMemoryBucket[I](id: LogicalId, buckets: Ref[Map[LogicalId, Map[ObjectKey, InMemoryCloud.Stored]]])
     extends Bucket[I]:

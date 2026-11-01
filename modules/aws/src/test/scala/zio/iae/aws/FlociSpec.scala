@@ -20,6 +20,10 @@ object FlociSpec extends ZIOSpecDefault:
   final case class Job(photo: String) derives Schema, CanEqual
 
   object DatabasePassword extends Secret.Id(LogicalId("database-password"))
+
+  final case class PhotoId(value: String) derives Schema, CanEqual
+  final case class PhotoInfo(width: Int, height: Int, tags: List[String]) derives Schema, CanEqual
+  object PhotoInfos extends Table.Id[PhotoId, PhotoInfo](LogicalId("photo-info"))
   object Jobs extends MessageQueue.Id[Job](LogicalId("jobs"), QueueSpec(visibilityTimeout = 1.second, deadLetter = Some(DeadLetter(maxReceives = 3))))
   object Archive extends Bucket.Id(LogicalId("archive"), BucketSpec(versioning = Versioning.Enabled))
 
@@ -32,12 +36,13 @@ object FlociSpec extends ZIOSpecDefault:
 
   def bytes(text: String): ZStream[Any, Nothing, Byte] = ZStream.fromChunk(Chunk.fromArray(text.getBytes(UTF_8)))
 
-  def cloud(env: EnvName, mode: ProvisionMode): URIO[S3Client & SqsClient & SecretsClient, Cloud] =
+  def cloud(env: EnvName, mode: ProvisionMode): URIO[S3Client & SqsClient & SecretsClient & DynamoClient, Cloud] =
     for
       s3      <- ZIO.service[S3Client]
       sqs     <- ZIO.service[SqsClient]
       secrets <- ZIO.service[SecretsClient]
-    yield AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets)
+      dynamo  <- ZIO.service[DynamoClient]
+    yield AwsCloud(app, env, mode, s3, BucketProvider(s3, naming), sqs, QueueProvider(sqs), secrets, dynamo)
 
   def spec = suite("Floci")(
     suite("BucketProvider")(
@@ -156,6 +161,31 @@ object FlociSpec extends ZIOSpecDefault:
         )
       ,
     ),
+    suite("TableProvider")(
+      test("a table converges, and typed items go in and come out"):
+        for
+          env      <- uniqueEnv
+          provider <- ZIO.serviceWith[DynamoClient](TableProvider(_))
+          address   = Address(app, env, ResourceKind.Table, PhotoInfos.logicalId)
+          c        <- cloud(env, ProvisionMode.AutoProvision)
+          photos   <- c.table(PhotoInfos)
+          observed <- provider.observe(address)
+          _        <- photos.put(PhotoId("cat"), PhotoInfo(640, 480, List("cute")))
+          found    <- photos.get(PhotoId("cat"))
+          missing  <- photos.get(PhotoId("dog"))
+          _        <- photos.delete(PhotoId("cat"))
+          gone     <- photos.get(PhotoId("cat"))
+          bound    <- cloud(env, ProvisionMode.BindOnly).flatMap(_.table(PhotoInfos)).either
+        yield assertTrue(
+          observed.exists(_.table.status == "ACTIVE"),
+          provider.diff(address, PhotoInfos.spec, observed).isEmpty,
+          found.contains(PhotoInfo(640, 480, List("cute"))),
+          missing.isEmpty,
+          gone.isEmpty,
+          bound.isRight,
+        )
+      ,
+    ),
     suite("SecretProvider")(
       test("a secret is created without a value, tagged, and readable once someone sets it"):
         for
@@ -252,4 +282,5 @@ object FlociSpec extends ZIOSpecDefault:
     AwsJsonClient.layer,
     SqsClient.layer,
     SecretsClient.layer,
+    DynamoClient.layer,
   ) @@ TestAspect.withLiveRandom @@ TestAspect.withLiveClock

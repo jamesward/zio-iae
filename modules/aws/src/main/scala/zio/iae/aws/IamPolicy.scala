@@ -62,6 +62,11 @@ object IamPolicy:
                 )
         case ResourceKind.Secret =>
           Right(Statement(sid, "Allow", List("secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue"), List(SecretNaming.arnPattern(context, Address(app, env, ResourceKind.Secret, grant.id)))))
+        case ResourceKind.Table =>
+          val table = TableNaming.arn(context, Address(app, env, ResourceKind.Table, grant.id))
+          grant.capability match
+            case Capability.TableRead => Right(Statement(sid, "Allow", List("dynamodb:DescribeTable", "dynamodb:GetItem"), List(table)))
+            case _                    => Right(Statement(sid, "Allow", List("dynamodb:DeleteItem", "dynamodb:PutItem"), List(table)))
         case ResourceKind.Role => Left(InfraError.InvalidConfig(s"a role can't be granted to an app: ${grant.id.value}"))
     statements.partitionMap(identity) match
       case (Nil, all)     => Right(PolicyDocument(version, all))
