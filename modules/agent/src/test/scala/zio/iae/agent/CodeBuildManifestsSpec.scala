@@ -54,6 +54,16 @@ object CodeBuildManifestsSpec extends ZIOSpecDefault:
           _      <- ws.sync.mapError(_.message)
           builds <- builds
           error  <- builds.manifests(ws.dir, config(entry), commit).flip
-        yield assertTrue(error.message.contains("failed"), error.message.contains("BUILD")),
+          start  <- Clock.ClockLive.nanoTime
+          again  <- builds.manifests(ws.dir, config(entry), commit).flip
+          took   <- Clock.ClockLive.nanoTime.map(n => Duration.fromNanos(n - start))
+          kept   <- builds.failures.get
+        yield assertTrue(
+          error.message.contains("failed"),
+          error.message.contains("BUILD"),
+          again == error,
+          took < 2.seconds,
+          kept.keySet == Set(s"photo-app@${commit.value}"),
+        ),
   ).provideShared(FlociLayer.live.mapError(_.getMessage), Client.default.mapError(_.getMessage)) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom
     @@ TestAspect.timeout(5.minutes)

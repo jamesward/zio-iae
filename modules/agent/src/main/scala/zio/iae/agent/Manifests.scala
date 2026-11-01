@@ -45,14 +45,25 @@ final case class CodeBuildManifests(
     serviceRole: String,
     image: String,
     inflight: Ref.Synchronized[Map[String, Promise[AgentError, Manifest]]],
+    failures: Ref[Map[String, (AgentError, java.time.Instant)]],
     timeout: Duration = 30.minutes,
+    retryFailedAfter: Duration = 30.minutes,
 ) extends ManifestSource:
   def manifests(dir: Path, config: RepoConfig, commit: CommitSha): IO[AgentError, List[Manifest]] =
     ZIO.foreach(config.apps)(app => cached(app, commit).someOrElseZIO(once(dir, app, commit)))
 
-  /** Envs asking for the same commit at once share one build. */
+  /** Envs asking for the same commit at once share one build, and a commit whose build failed isn't built again for
+    * a while (every reconcile would otherwise start a build); its failure is repeated instead.
+    */
   private def once(dir: Path, app: AppEntry, commit: CommitSha): IO[AgentError, Manifest] =
     val id = s"${app.name.value}@${commit.value}"
+    for
+      now    <- Clock.instant
+      failed <- failures.get.map(_.get(id).filter(_._2.plus(retryFailedAfter).nn.isAfter(now)))
+      result <- failed.fold(shared(dir, app, commit, id))((e, _) => ZIO.fail(e))
+    yield result
+
+  private def shared(dir: Path, app: AppEntry, commit: CommitSha, id: String): IO[AgentError, Manifest] =
     Promise.make[AgentError, Manifest].flatMap: mine =>
       inflight
         .modify: m =>
@@ -61,7 +72,10 @@ final case class CodeBuildManifests(
             case None          => ((true, mine), m + (id -> mine))
         .flatMap: (leader, promise) =>
           if !leader then promise.await
-          else build(dir, app, commit).onExit(e => promise.done(e) *> inflight.update(_ - id))
+          else
+            build(dir, app, commit)
+              .tapError(e => Clock.instant.flatMap(now => failures.update(_ + (id -> (e, now)))))
+              .onExit(e => promise.done(e) *> inflight.update(_ - id))
 
   private def fail(app: AppEntry)(detail: String) = AgentError.Manifest(app.name.value, detail)
 
@@ -138,7 +152,8 @@ object CodeBuildManifests:
       exists <- s3.bucketExists(bucket).mapError(e => AgentError.Config(s"build bucket: $e"))
       _      <- s3.createBucket(bucket).mapError(e => AgentError.Config(s"creating the build bucket: $e")).unless(exists)
       inflight <- Ref.Synchronized.make(Map.empty[String, Promise[AgentError, Manifest]])
-    yield CodeBuildManifests(codebuild, s3, bucket, serviceRole, image, inflight)
+      failures <- Ref.make(Map.empty[String, (AgentError, java.time.Instant)])
+    yield CodeBuildManifests(codebuild, s3, bucket, serviceRole, image, inflight, failures)
 
   /** The app's build commands, then its manifest command with its output kept as the build's artifact. */
   def buildspec(app: AppEntry, output: String): String =
