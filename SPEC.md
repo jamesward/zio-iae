@@ -124,7 +124,7 @@ Everything it does is explained in Slack and recorded as evidence.
 | `iae-core` | zio, zio-streams, zio-json (or zio-schema) | Resource/Capability/Infra model, `ResourceId`, `Spec`, `Change`, `Plan`, `Risk`, `Policy`, `Provider` SPI, `InfraApp`, manifest codecs, IAM policy model. **No AWS.** |
 | `iae-aws-client` | zio, zio-http | Thin ZIO-native AWS clients: SigV4 signing, credentials chain, retries, and the operations we need for S3, SQS, DynamoDB, Secrets Manager, IAM, STS, ECR, ECS, ELBv2, CloudWatch, CloudTrail, Audit Manager. Endpoint override for Floci. |
 | `iae-aws` | `iae-core`, `iae-aws-client` | AWS implementations: runtime capability layers (`Bucket` backed by S3, ...) and `Provider`s (observe/diff/apply) per resource kind, naming, tagging, IAM generation. |
-| `iae-testkit` | `iae-core`, `iae-aws-client`, `testcontainers-floci-aws` | `FlociLayer` (a Floci container and an `AwsConfig` for it), `InMemoryCloud` (in-memory capabilities for fast app tests), fakes for services Floci doesn't emulate (Audit Manager), test helpers (`assertConverges`). `iae-aws` uses it in its own tests. |
+| `iae-testkit` | `iae-core`, `iae-aws-client`, `testcontainers-floci-aws` | `FlociLayer` (a Floci container and an `AwsConfig` for it), `InMemoryCloud` (in-memory capabilities for fast app tests), fakes for services Floci doesn't emulate (Audit Manager), in-memory queues and secrets with SQS-like delivery. `iae-aws` uses it in its own tests (convergence helpers live in the engine's tests, since the engine depends on `iae-aws`). |
 
 Library modules use the Scala LTS (per the `zen-of-projects` compatibility rules). Package: `zio.iae` (see open
 question Q1).
@@ -137,7 +137,7 @@ object that carries its logical id and spec:
 ```scala
 object Uploads extends Bucket.Id(LogicalId("uploads"), BucketSpec(versioning = Versioning.Enabled))
 object Thumbs  extends Bucket.Id(LogicalId("thumbs"),  BucketSpec(lifecycle = List(Expire(after = 30.days))))
-object Jobs    extends Queue.Id(LogicalId("jobs"),     QueueSpec(visibilityTimeout = 30.seconds, dlq = Some(Dlq(maxReceives = 5))))
+object Jobs    extends MessageQueue.Id[Job](LogicalId("jobs"), QueueSpec(visibilityTimeout = 30.seconds, deadLetter = Some(DeadLetter(maxReceives = 5))))
 ```
 
 `LogicalId("…")`, `AppName("…")` and `EnvName("…")` are opaque types whose literals are checked at compile time
@@ -185,7 +185,7 @@ MVP resource kinds and capabilities:
 | Kind | AWS | Capabilities | Stateful (retain by default) |
 |---|---|---|---|
 | `Bucket` | S3 | `BucketReader`, `BucketWriter`, `Bucket` | yes |
-| `Queue` | SQS (+DLQ) | `QueueSender`, `QueueReceiver`, `Queue` | yes (messages) |
+| `MessageQueue` | SQS (+DLQ) | `QueueSender`, `QueueReceiver`, `MessageQueue` | yes (messages) |
 | `Table` | DynamoDB (key-value, typed by a zio-schema `Schema[A]`) | `TableReader`, `TableWriter`, `Table` | yes |
 | `Secret` | Secrets Manager | `SecretReader` (writes are out-of-band) | yes |
 | `Topic` | SNS | `TopicPublisher`, subscriptions declared in infra | no |
@@ -213,7 +213,7 @@ Constructors live on each resource kind:
 ```scala
 Bucket.reader(Uploads)   : Infra[BucketReader[Uploads]]
 Bucket.readWrite(Uploads): Infra[Bucket[Uploads]]
-Queue.sender(Jobs)       : Infra[QueueSender[Jobs]]
+MessageQueue.sender(Jobs): Infra[QueueSender[Jobs]]
 Topic.publisher(Events).subscribe(Jobs)  // wiring is part of the declaration
 ```
 
@@ -235,13 +235,20 @@ needs no engine.
 ### 3.5 `InfraApp`
 
 ```scala
-object PhotoApp extends AwsInfraApp(AppName("photo-app"), Bucket.readWrite(Uploads) ++ Bucket.readWrite(Thumbs) ++ Queue.sender(Jobs)):
+object PhotoApp extends AwsInfraApp(AppName("photo-app"), Bucket.readWrite(Uploads) ++ Bucket.readWrite(Thumbs) ++ MessageQueue.sender(Jobs)):
   def program: ZIO[Bucket[Uploads.type] & Bucket[Thumbs.type] & QueueSender[Jobs.type], Any, Any] =
     for
       _ <- ZIO.serviceWithZIO[Bucket[Uploads.type]](_.put(key, body))
       _ <- ZIO.serviceWithZIO[QueueSender[Jobs.type]](_.send(Job.Resize(key)))
     yield ()
 ```
+
+Queues are named `MessageQueue` (not `Queue`) so they don't clash with `zio.Queue` under `import zio.*`. A queue is
+declared with its message type (`MessageQueue.Id[Job]`), messages travel as JSON from the type's `Schema`, and
+`send`/`receive` only accept that type: they take evidence `I <:< MessageQueue.Id[M]`, so `M` is inferred from the
+queue and sending anything else is a compile error. `Secret.reader(DatabasePassword)` gives a `SecretReader` whose
+value is set out of band and redacted in `toString`; the engine creates and tags the secret but never handles its
+value.
 
 `InfraApp[R]` takes the infra as a constructor argument, so `R` is inferred from it and `program: ZIO[R, Any, Any]`
 can't require a resource that isn't declared (a compile error). `AwsInfraApp` is the AWS-bound subclass. Its
@@ -262,16 +269,20 @@ Apps that aren't a single `main` (a library module of shared infra, or several s
 - Every managed resource is tagged `iae:managed`, `iae:app`, `iae:env`, `iae:id`, `iae:kind`, `iae:spec-hash`,
   and (from M2) `iae:commit`. Tags the user adds by hand are kept when the engine re-tags.
 - **Tags are the ownership record.** There is no state file, so nothing can drift from reality. The engine
-  discovers what it owns through the Resource Groups Tagging API and per-service list calls. `iae:commit` is
+  discovers what it owns through the Resource Groups Tagging API (S3, SQS, Secrets Manager) and, because that API
+  doesn't cover IAM on AWS, by listing roles under the `/iae/` path. `iae:commit` is
   also the concurrency guard (§5.3).
 - IAM policies for the deploy role are conditioned on `aws:ResourceTag/iae:managed = true`, so the engine
   can't touch resources it doesn't own.
 
 ### 3.7 IAM generation
 
-From `Infra.grants` the engine generates one runtime role per app per env, with one statement per (capability,
-resource), for example `BucketReader[Uploads]` gives `s3:GetObject` and `s3:ListBucket` on that bucket only.
-The role is itself a managed resource, so widening it is a plan change with its own risk class (see §5.5).
+From `Infra.grants` the manifest derives one `Role` resource (logical id `runtime`) per app, and the engine
+provisions it per env as `iae-<app>-<env>` under the `/iae/` path, with one inline policy statement per (capability,
+resource). For example `BucketReader[Uploads]` gives `s3:GetObject` and `s3:ListBucket` on that bucket only, and
+`QueueSender[Jobs]` gives `sqs:SendMessage` on that queue only. Queue and secret ARNs need the account, which the
+engine reads once from STS (`AwsContext`). The role is itself a managed resource, so a permission change is a plan
+change: adding permissions is `High` and flagged `IamWidening`, removing them is `Medium` (see §5.5).
 
 ### 3.8 Provider SPI
 
@@ -976,7 +987,7 @@ and the "iae" GitHub App installed.
 |---|---|---|
 | M0 ✅ | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
-| M2 | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
+| M2 (in progress) | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue` ✅, `Secret` ✅, `Table`, `Topic`; IAM generation ✅; `iae` CLI ✅ | `assertConverges` end-to-end on Floci for the example app, including crash/re-run ✅ |
 | M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, `EvaluatePolicy` with `POLICY.md` + policy examples, approval requests + verification, notices, rehydrate on restart; local harness (`AppTest`, `FakeSlack` + web UI, `FakeGitHub`, per-account Floci, clock control, first scenarios); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval. Then the same on a real staging account |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
