@@ -6,7 +6,10 @@ import zio.iae.engine.*
 import zio.iae.engine.policy.*
 
 /** One env's view of the world: its engine (its account) and its own clone of the repo. */
-final case class EnvRuntime(env: EnvName, engine: Engine, workspace: GitWorkspace)
+final case class EnvRuntime(env: EnvName, engine: Engine, workspace: GitWorkspace, evidence: Option[EvidenceRecorder] = None)
+
+/** Who wrote the commit: their email, and their Slack user if the identities map knows them. */
+final case class Author(email: String, slack: Option[String])
 
 enum Outcome derives CanEqual:
   /** Nothing left to do at this commit. */
@@ -16,7 +19,7 @@ enum Outcome derives CanEqual:
   case Stopped(app: AppName, reason: String)
 
 /** The policy a reconcile is judged by (the deployed one), and the policy change the target proposes, if any. */
-final case class Governance(config: RepoConfig, text: String, proposed: Option[(RepoConfig, String)]):
+final case class Governance(config: RepoConfig, text: String, proposed: Option[(RepoConfig, String)], deployed: Option[CommitSha] = None):
   def policy: PolicyConfig = config.policy(text)
 
 /** Reconciles one env to the head of the branch: expand, then contract, each through the user's policy. Level-
@@ -38,7 +41,7 @@ final case class Pipeline(
       apps             <- manifests.manifests(runtime.workspace.dir, target, commit)
       governance       <- governance(runtime, apps, commit, target, newText)
       authorEmail      <- runtime.workspace.author
-      author            = governance.config.identities.get(authorEmail)
+      author            = Author(authorEmail, governance.config.identities.get(authorEmail))
       gate             <- ZIO.foreach(Option.when(index > 0)(envs(index - 1)))(previous => converged(previous, apps, commit).map(previous -> _))
       outcome <- gate match
                    case Some((previous, false)) => ZIO.succeed(Outcome.WaitingForPreviousEnv(previous.env))
@@ -56,11 +59,11 @@ final case class Pipeline(
     for
       deployed <- runtime.engine.deployed(apps.map(_.app), runtime.env).mapError(AgentError.Engine(_))
       governance <- deployed.filterNot(_ == commit) match
-                      case None => ZIO.succeed(Governance(target, newText, None))
+                      case None => ZIO.succeed(Governance(target, newText, None, deployed))
                       case Some(sha) =>
                         RepoConfig.loadAt(runtime.workspace, sha).map: (old, oldText) =>
                           val changed = RepoConfig.encode(old.copy(apps = target.apps)) != RepoConfig.encode(target) || oldText.trim != newText.trim
-                          Governance(old.copy(apps = target.apps, slack = old.slack.copy(channel = target.slack.channel)), oldText, Option.when(changed)((target, newText)))
+                          Governance(old.copy(apps = target.apps, slack = old.slack.copy(channel = target.slack.channel)), oldText, Option.when(changed)((target, newText)), deployed)
     yield governance
 
   /** The previous env is done with this commit when neither phase has anything left to do there. */
@@ -69,7 +72,7 @@ final case class Pipeline(
       .forall(apps)(m => ZIO.forall(List(Phase.Expand, Phase.Contract))(p => previous.engine.plan(m, previous.env, Some(commit), p).map(_.isEmpty)))
       .mapError(AgentError.Engine(_))
 
-  private def applyAll(runtime: EnvRuntime, governance: Governance, author: Option[String], apps: List[Manifest], commit: CommitSha): IO[AgentError, Outcome] =
+  private def applyAll(runtime: EnvRuntime, governance: Governance, author: Author, apps: List[Manifest], commit: CommitSha): IO[AgentError, Outcome] =
     val approvals = Approvals(slack, self, governance.config.slack.channel, approvalExpiry)
     val steps     = for app <- apps; phase <- List(Phase.Expand, Phase.Contract) yield (app, phase)
     ZIO.foldLeft(steps)(Outcome.Converged(commit)): (outcome, step) =>
@@ -80,7 +83,7 @@ final case class Pipeline(
   private def phase(
       runtime: EnvRuntime,
       governance: Governance,
-      author: Option[String],
+      author: Author,
       approvals: Approvals,
       manifest: Manifest,
       phase: Phase,
@@ -89,15 +92,17 @@ final case class Pipeline(
     val config = governance.config
     for
       plan     <- runtime.engine.plan(manifest, runtime.env, Some(commit), phase).mapError(AgentError.Engine(_))
-      decision <- decide(governance.policy, plan, governance.proposed.isDefined, author)
+      decision <- decide(governance.policy, plan, governance.proposed.isDefined, author.slack)
+      done      = applied(runtime, governance, author, plan, decision, commit)
       outcome <- (plan.isEmpty, decision.decision) match
                    case (true, _)                => ZIO.succeed(Outcome.Converged(commit))
-                   case (_, Decision.Auto)       => applied(runtime, config, plan, "the policy lets it go ahead", commit)
+                   case (_, Decision.Auto)       => done("the policy lets it go ahead", None)
                    case (_, Decision.Deny)       => stopped(config, plan, decision, "the policy denies it")
                    case (_, approve: Decision.Approve) =>
-                     approvals.status(plan, decision, approve, author, examples(runtime, governance), explain(config, plan, decision)).flatMap:
+                     approvals.status(plan, decision, approve, author.slack, examples(runtime, governance), explain(config, plan, decision)).flatMap:
                        case ApprovalStatus.Approved(by, request) =>
-                         applied(runtime, config, plan, s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", commit) <* approvals.applied(request)
+                         val approval = ApprovalEvidence(config.slack.channel, request.ts, by.toList.sorted)
+                         done(s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", Some(approval)) <* approvals.applied(request)
                        case ApprovalStatus.Rejected(by, _) => stopped(config, plan, decision, s"<@$by> rejected it")
                        case ApprovalStatus.Pending(ts)   => ZIO.succeed(Outcome.WaitingForApproval(plan.app, ts))
     yield outcome
@@ -128,10 +133,32 @@ final case class Pipeline(
         .flatMap(PolicyExamples.run(evaluator, governance.policy, config.policy(text), _))
         .map(PolicyExamples.report)
 
-  private def applied(runtime: EnvRuntime, config: RepoConfig, plan: Plan, why: String, commit: CommitSha): IO[AgentError, Outcome] =
+  private def applied(runtime: EnvRuntime, governance: Governance, author: Author, plan: Plan, decision: PlanDecision, commit: CommitSha)(
+      why: String,
+      approval: Option[ApprovalEvidence],
+  ): IO[AgentError, Outcome] =
+    val config = governance.config
     for
       report <- runtime.engine.apply(plan).mapError(AgentError.Engine(_))
       _      <- notice(config, s"Applied ${report.applied.size} change(s) to ${plan.app.value}/${plan.env.value} at `${commit.short}` ($why)\n```\n${PlanText.render(plan)}\n```")
+      now    <- Clock.instant
+      change  = ChangeEvidence(
+                  plan.app.value,
+                  plan.env.value,
+                  commit.value,
+                  author.email,
+                  author.slack,
+                  governance.deployed.map(_.value),
+                  plan.hash.value,
+                  plan.phase.toString,
+                  PlanText.render(plan).linesIterator.drop(1).map(_.trim).toList,
+                  PlanText.describe(decision.decision),
+                  decision.changes.flatMap(c => c.reasons.map(r => s"${c.change.value}: $r")),
+                  approval,
+                  report.applied.map(_.show),
+                  now,
+                )
+      _ <- ZIO.foreachDiscard(runtime.evidence)(_.record(change).catchAll(e => ZIO.logError(s"evidence for ${plan.app.value}/${plan.env.value} plan ${plan.hash.short}: $e")))
     yield Outcome.Converged(commit)
 
   /** Stopping is announced once per plan, not on every reconcile. */

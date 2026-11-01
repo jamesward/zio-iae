@@ -8,7 +8,7 @@ import zio.iae.aws.BucketNaming
 import zio.iae.aws.client.*
 import zio.iae.engine.*
 import zio.iae.engine.policy.{RiskTableEvaluator, SlackGroup}
-import zio.iae.testkit.FlociLayer
+import zio.iae.testkit.{AuditManagerFake, FlociLayer}
 import zio.iae.webhook.*
 
 /** The local harness: the real agent and webhook, with GitHub and Slack emulated and AWS on Floci. Only the LLM is
@@ -24,6 +24,7 @@ final case class Harness(
     clock: HarnessClock,
     agent: AgentProcess,
     s3: List[S3Client],
+    audit: AuditManagerFake,
 )
 
 /** The agent as a process the harness can stop and start; a restart loses everything in memory, like a new
@@ -64,8 +65,10 @@ object Harness:
        |"slack":{"channel":"$channel","owners":"platform-owners","groups":["infra-approvers"]},
        |"identities":{"dev@example.com":"U_DEV"}}""".stripMargin
 
-  /** Creates an env account's planner and deployer roles, trusting the account's root, as `iae bootstrap` will. */
-  def bootstrapAccount(config: AwsConfig): ZIO[Client, String, EnvAccount] =
+  /** Creates an env account's planner and deployer roles, trusting the account's root, and its evidence bucket, as
+    * `iae bootstrap` will. The assessment's ids are the ones the harness's Audit Manager fake accepts.
+    */
+  def bootstrapAccount(env: EnvName, config: AwsConfig): ZIO[Client, String, EnvAccount] =
     for
       http    <- ZIO.service[Client]
       iam      = IamClient(AwsQueryClient(http, config))
@@ -75,7 +78,12 @@ object Harness:
                 val name = RoleName.from(role).toOption.get
                 iam.getRole(name).flatMap(r => iam.createRole(name, "/", trust, Map.empty).when(r.isEmpty)).mapError(_.message)
                   .as(s"arn:aws:iam::${account.value}:role/$role")
-    yield EnvAccount(arns(0), arns(1))
+      bucket   = BucketName.from(s"iae-evidence-${env.value}").toOption.get
+      s3       = S3Client(http, config)
+      exists  <- s3.bucketExists(bucket).mapError(_.toString)
+      _       <- s3.createBucket(bucket).mapError(_.toString).unless(exists)
+      audit    = AuditSettings(bucket.value, s"assessment-${env.value}", "IAE Change Management", Map("IAE-CM-1" -> "iae-cm-1", "IAE-CM-3" -> "iae-cm-3"))
+    yield EnvAccount(arns(0), arns(1), audit = Some(audit))
 
   /** `speed` is the agent's clock speed factor: at 60, a day passes in 24 minutes. Envs in `accounts` get their own
     * account (a Floci of their own), reached through assumed roles like production; the others share the tooling
@@ -102,11 +110,12 @@ object Harness:
       client    = SlackWebApi(http, SlackToken("xoxb-harness"), base)
       self     <- client.identity.mapError(_.message)
       tooling  <- ZIO.service[AwsConfig]
+      audit    <- AuditManagerFake.make.mapError(_.getMessage)
       envs <- ZIO.foreach(envNames): env =>
                 val base = accounts.getOrElse(env, tooling)
                 for
-                  account <- ZIO.foreach(accounts.get(env))(bootstrapAccount)
-                  runtime <- EnvRuntimes.make(env, account, base, BucketNaming(None), repo.workspace(env)).mapError(_.message)
+                  account <- ZIO.foreach(accounts.get(env))(bootstrapAccount(env, _))
+                  runtime <- EnvRuntimes.make(env, account, base, BucketNaming(None), repo.workspace(env), Endpoint.parse(audit.url.encode).toOption).mapError(_.message)
                 yield runtime
       // Builds run in the tooling account's CodeBuild (Floci runs them as containers).
       buildsAt  = BucketName.from(s"iae-builds-${envNames.head.value}").toOption.get
@@ -126,7 +135,7 @@ object Harness:
               yield (fiber, reconcilers))
       agent    <- AgentProcess.make(start)
       s3        = envNames.map(env => S3Client(http, accounts.getOrElse(env, tooling)))
-      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3)
+      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3, audit)
       _        <- started.succeed(harness)
     yield harness
 

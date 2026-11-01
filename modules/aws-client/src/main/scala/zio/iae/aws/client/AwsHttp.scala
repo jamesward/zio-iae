@@ -55,10 +55,13 @@ private[client] object AwsHttp:
       headers: List[(String, String)],
       body: Chunk[Byte],
       contentSha256Header: Boolean,
+      doubleEncodePath: Boolean = false,
   ): IO[String, Request] =
     val payloadHash = SigV4.sha256Hex(body.toArray)
     val all         = if contentSha256Header then ("x-amz-content-sha256" -> payloadHash) :: headers else headers
-    val signable    = SigV4.Request(method.name, target.authority, target.path, target.query, all, payloadHash)
+    // Services other than S3 sign the already-encoded path encoded once more.
+    val canonical = if doubleEncodePath then target.path.split("/", -1).map(SigV4.uriEncode(_, encodeSlash = true)).mkString("/") else target.path
+    val signable  = SigV4.Request(method.name, target.authority, canonical, target.query, all, payloadHash)
     for
       now   <- Clock.ClockLive.instant // AWS checks the signing time against its own clock
       url   <- ZIO.fromEither(URL.decode(target.url)).mapError(e => s"${target.url}: ${e.getMessage}")

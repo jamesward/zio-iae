@@ -90,7 +90,12 @@ object HarnessSpec extends ZIOSpecDefault:
           inProd    <- harness.s3(1).bucketExists(bucket(prod))
           crossed   <- harness.s3(0).bucketExists(bucket(prod))
           tooling   <- ZIO.serviceWithZIO[zio.iae.aws.client.S3Client](_.bucketExists(bucket(staging)))
-        yield assertTrue(inStaging, inProd, !crossed, !tooling)
+          evidence  <- harness.audit.all
+        yield assertTrue(
+          inStaging, inProd, !crossed, !tooling,
+          evidence.keySet.map(_._1) == Set(s"assessment-${staging.value}", s"assessment-${prod.value}"),
+          evidence.keySet.map(_._3) == Set("iae-cm-1", "iae-cm-3"),
+        )
   ).provideShared(
     ((FlociLayer.live ++ Client.default) >+> AwsEngine.clients).mapError:
       case a: AwsError  => a.message

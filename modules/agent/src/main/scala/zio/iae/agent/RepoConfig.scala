@@ -16,10 +16,10 @@ final case class AppEntry(name: AppName, manifest: List[String], build: List[Str
 
 final case class SlackSettings(channel: String, owners: SlackGroup, groups: List[SlackGroup]) derives Schema
 
-/** An env's AWS account: the role ARNs the agent assumes there to plan (read-only) and to apply, and its region if
-  * not the agent's.
+/** An env's AWS account: the role ARNs the agent assumes there to plan (read-only) and to apply, its region if not
+  * the agent's, and where its audit evidence goes.
   */
-final case class EnvAccount(planner: String, deployer: String, region: Option[String] = None) derives Schema
+final case class EnvAccount(planner: String, deployer: String, region: Option[String] = None, audit: Option[AuditSettings] = None) derives Schema
 
 /** `.iae/config.json` of a managed repo. `identities` maps commit author emails to Slack user ids, so an author can't
   * approve their own change. `accounts` maps env names to their accounts; an env without one uses the agent's own

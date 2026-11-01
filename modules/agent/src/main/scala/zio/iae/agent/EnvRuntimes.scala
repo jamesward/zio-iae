@@ -12,8 +12,14 @@ object EnvRuntimes:
     * both assumed from `base` (the agent's own credentials); without one, `base` does both (a single account).
     * Building it checks that the roles can be assumed.
     */
-  def make(env: EnvName, account: Option[EnvAccount], base: AwsConfig, naming: BucketNaming, workspace: GitWorkspace)
-      : ZIO[Client & Scope, AgentError, EnvRuntime] =
+  def make(
+      env: EnvName,
+      account: Option[EnvAccount],
+      base: AwsConfig,
+      naming: BucketNaming,
+      workspace: GitWorkspace,
+      auditEndpoint: Option[Endpoint] = None,
+  ): ZIO[Client & Scope, AgentError, EnvRuntime] =
     def failed(e: AwsError) = AgentError.Config(s"env ${env.value}: ${e.message}")
     for
       http   <- ZIO.service[Client]
@@ -25,4 +31,8 @@ object EnvRuntimes:
                        .zip(StsClient.assumed(base, http, a.deployer, s"iae-deploy-${env.value}", region))
       planner  <- AwsEngine.clientsFor(configs._1).mapError(failed)
       deployer <- if account.isEmpty then ZIO.succeed(planner) else AwsEngine.clientsFor(configs._2).mapError(failed)
-    yield EnvRuntime(env, AwsEngine.make(naming, planner, deployer, GitCommitOrder(workspace.dir)), workspace)
+      // Evidence is written with the deployer's credentials, into the env's account.
+      evidence = account.flatMap(_.audit).map: audit =>
+                   val auditConfig = auditEndpoint.fold(configs._2)(e => configs._2.copy(endpoint = Some(e)))
+                   EvidenceRecorder(S3Client(http, configs._2), AuditManagerClient(http, auditConfig), audit)
+    yield EnvRuntime(env, AwsEngine.make(naming, planner, deployer, GitCommitOrder(workspace.dir)), workspace, evidence)
