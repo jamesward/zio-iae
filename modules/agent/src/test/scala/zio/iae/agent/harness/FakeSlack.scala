@@ -53,6 +53,7 @@ final case class FakeSlack(
                         messages.update(_.map(m => if m.ts == u.ts then m.copy(text = u.text, request = u.metadata.map(_.eventPayload).orElse(m.request)) else m))
                       *> okEmpty
                     case "conversations.history" => history
+                    case "conversations.replies" => thread(form(body)("ts"))
                     case "usergroups.list"       => ok(UserGroups(groups.toList.sortBy(_._1).map((h, us) => UserGroup(s"S_$h", h, Some(us.toList.sorted)))))
                     case "users.info"            => ok(UserInfo(User(form(body)("user"), users.exists(u => u.id == form(body)("user") && u.bot) || form(body)("user") == bot.id)))
                     case other                   => ZIO.succeed(Response.json(s"""{"ok":false,"error":"unknown_method $other"}"""))
@@ -99,6 +100,24 @@ final case class FakeSlack(
       val out = all.reverse.map: m =>
         MessageOut(m.ts, m.user, m.botId, m.text, m.request.map(Metadata(SlackWebApi.requestType, _)), m.reactions.toList.map((n, us) => ReactionJson(n, us)))
       Response.json(s"""{"ok":true,"messages":${JsonCodec.jsonEncoder(Schema[List[MessageOut]]).encodeJson(out.toList, None)}}""")
+
+  private def thread(ts: String): UIO[Response] =
+    messages.get.map: all =>
+      val out = all.find(_.ts == ts).toList.flatMap: m =>
+        MessageOut(m.ts, m.user, m.botId, m.text, m.request.map(Metadata(SlackWebApi.requestType, _)), m.reactions.toList.map((n, us) => ReactionJson(n, us))) ::
+          m.replies.map(r => MessageOut(r.ts, r.user, Option.when(r.user == bot.id)(botId), r.text, None, Nil))
+      Response.json(s"""{"ok":true,"messages":${JsonCodec.jsonEncoder(Schema[List[MessageOut]]).encodeJson(out, None)}}""")
+
+  /** Someone posting at the top of the channel, e.g. mentioning the bot; sent to the webhook as `app_mention` when it
+    * mentions the bot.
+    */
+  def say(user: String, text: String): IO[String, String] =
+    for
+      ts <- nextTs
+      _  <- messages.update(_ :+ FakeMessage(ts, user, None, text, None, Map.empty, Nil))
+      _  <- deliver(s"""{"type":"event_callback","event":{"type":"app_mention","user":"$user","channel":"$channel","ts":"$ts","text":${JsonCodec.jsonEncoder(Schema[String]).encodeJson(text, None)}}}""")
+              .when(text.contains(s"<@${bot.id}>"))
+    yield ts
 
   private def nextTs: UIO[String] =
     for

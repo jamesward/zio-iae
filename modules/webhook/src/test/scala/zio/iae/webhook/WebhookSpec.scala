@@ -81,6 +81,16 @@ object WebhookSpec extends ZIOSpecDefault:
         sent           <- events.get
       yield assertTrue(sent == Chunk(InboxEvent.SlackReaction("C1", "111.1", "white_check_mark", "U1"), InboxEvent.SlackReply("C1", "111.1", "U2")))
     ,
+    test("a mention at the top of the channel becomes a mention; one in a thread is left to the thread's message event"):
+      val top      = """{"type":"event_callback","event":{"type":"app_mention","user":"U4","channel":"C1","ts":"222.2","text":"<@U_IAE> status?"}}"""
+      val inThread = """{"type":"event_callback","event":{"type":"app_mention","user":"U4","channel":"C1","ts":"333.3","thread_ts":"111.1","text":"<@U_IAE> and?"}}"""
+      for
+        (hook, events) <- webhook
+        now            <- Clock.instant.map(_.getEpochSecond)
+        _              <- ZIO.foreachDiscard(List(top, inThread))(b => hook.slack(slackRequest(b, now)))
+        sent           <- events.get
+      yield assertTrue(sent == Chunk(InboxEvent.SlackMention("C1", "222.2", "U4")))
+    ,
     test("Slack requests that are stale or unsigned are rejected; URL verification is answered"):
       val challenge = """{"type":"url_verification","challenge":"xyz"}"""
       for

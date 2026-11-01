@@ -30,17 +30,22 @@ final case class SlackWebApi(http: Client, token: SlackToken, base: URL) extends
     * and only our requests' payloads are decoded.
     */
   def history(channel: String, since: Instant): IO[AgentError, List[SlackMessage]] =
-    val params = List("channel" -> channel, "oldest" -> since.getEpochSecond.toString, "limit" -> "200", "include_all_metadata" -> "true")
+    messages("conversations.history", List("channel" -> channel, "oldest" -> since.getEpochSecond.toString, "limit" -> "200", "include_all_metadata" -> "true"))
+
+  def replies(channel: String, thread: String): IO[AgentError, List[SlackMessage]] =
+    messages("conversations.replies", List("channel" -> channel, "ts" -> thread, "limit" -> "200", "include_all_metadata" -> "true")).map(_.sortBy(_.ts))
+
+  private def messages(method: String, params: List[(String, String)]): IO[AgentError, List[SlackMessage]] =
     for
-      text     <- call("conversations.history", formBody(params), formType)
+      text     <- call(method, formBody(params), formType)
       messages <- ZIO
                     .fromEither(text.fromJson[Json].flatMap(_.asObject.flatMap(_.get("messages")).flatMap(_.asArray).toRight("no messages")))
-                    .mapError(e => AgentError.Slack(s"conversations.history: $e"))
+                    .mapError(e => AgentError.Slack(s"$method: $e"))
       decoded <- ZIO.foreach(messages.toList): raw =>
                    val json = raw.toJson
                    ZIO
                      .fromEither(JsonCodec.jsonDecoder(Schema[MessageJson]).decodeJson(json))
-                     .mapError(e => AgentError.Slack(s"conversations.history: $e"))
+                     .mapError(e => AgentError.Slack(s"$method: $e"))
                      .map: m =>
                        val request = Option
                          .when(m.metadata.exists(_.eventType == requestType))(JsonCodec.jsonDecoder(Schema[RequestMessage]).decodeJson(json).toOption)

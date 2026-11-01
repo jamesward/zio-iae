@@ -188,10 +188,10 @@ object AgentSpec extends ZIOSpecDefault:
           _        <- pipeline.reconcile(w.envs, 0)
           _        <- pipeline.reconcile(w.envs, 1)
           request  <- requests(w.slack).map(_.head)
-          _        <- w.slack.replies(channel, request.ts).repeat(Schedule.spaced(100.millis) && Schedule.recurUntil[List[String]](_.nonEmpty) && Schedule.recurs(50))
-          replies  <- w.slack.replies(channel, request.ts)
+          _        <- w.slack.threadTexts(channel, request.ts).repeat(Schedule.spaced(100.millis) && Schedule.recurUntil[List[String]](_.nonEmpty) && Schedule.recurs(50))
+          replies  <- w.slack.threadTexts(channel, request.ts)
           _        <- pipeline.reconcile(w.envs, 1)
-          again    <- w.slack.replies(channel, request.ts)
+          again    <- w.slack.threadTexts(channel, request.ts)
         yield assertTrue(replies.size == 1, replies.head.contains("turns on versioning"), again.size == 1)
     ,
     test("the reconcile loops promote a push from staging to prod on their own"):

@@ -11,7 +11,7 @@ final case class InMemorySlack(
     groups: Map[String, Set[String]],
     bots: Set[String],
     clock: Ref[Long],
-    threads: Ref[Map[(String, String), List[String]]],
+    threads: Ref[Map[(String, String), List[SlackMessage]]],
 ) extends SlackApi:
   def identity: IO[AgentError, SlackIdentity] = ZIO.succeed(self)
 
@@ -21,7 +21,7 @@ final case class InMemorySlack(
       seq <- clock.updateAndGet(_ + 1)
       ts   = s"${now.getEpochSecond}.${f"$seq%06d"}"
       _ <- thread match
-             case Some(t) => threads.update(m => m.updated((channel, t), m.getOrElse((channel, t), Nil) :+ text))
+             case Some(t) => threads.update(m => m.updated((channel, t), m.getOrElse((channel, t), Nil) :+ SlackMessage(ts, Some(self.userId), Some(self.botId), text, None, Nil)))
              case None    => messages.update(_ :+ (channel -> SlackMessage(ts, Some(self.userId), Some(self.botId), text, request, Nil)))
     yield ts
 
@@ -35,8 +35,26 @@ final case class InMemorySlack(
 
   def groupId(group: SlackGroup): IO[AgentError, Option[String]] = ZIO.succeed(Option.when(groups.contains(group.handle))(s"S_${group.handle}"))
 
-  /** Thread replies posted by the agent. */
-  def replies(channel: String, thread: String): UIO[List[String]] = threads.get.map(_.getOrElse((channel, thread), Nil))
+  /** The texts of a thread's replies. */
+  def threadTexts(channel: String, thread: String): UIO[List[String]] = threads.get.map(_.getOrElse((channel, thread), Nil).map(_.text))
+
+  def replies(channel: String, thread: String): IO[AgentError, List[SlackMessage]] =
+    for
+      root <- messages.get.map(_.collectFirst { case (`channel`, m) if m.ts == thread => m })
+      rest <- threads.get.map(_.getOrElse((channel, thread), Nil))
+    yield root.toList ++ rest
+
+  /** A person posting: in a thread, or at the top of the channel. Returns the message's ts. */
+  def say(channel: String, user: String, text: String, thread: Option[String] = None): UIO[String] =
+    for
+      now <- Clock.instant
+      seq <- clock.updateAndGet(_ + 1)
+      ts   = s"${now.getEpochSecond}.${f"$seq%06d"}"
+      m    = SlackMessage(ts, Some(user), None, text, None, Nil)
+      _ <- thread match
+             case Some(t) => threads.update(all => all.updated((channel, t), all.getOrElse((channel, t), Nil) :+ m))
+             case None    => messages.update(_ :+ (channel -> m))
+    yield ts
 
   def isBot(user: String): IO[AgentError, Boolean] = ZIO.succeed(bots.contains(user) || user == self.userId)
 
@@ -56,5 +74,5 @@ object InMemorySlack:
     for
       messages <- Ref.make(Vector.empty[(String, SlackMessage)])
       clock    <- Ref.make(0L)
-      threads  <- Ref.make(Map.empty[(String, String), List[String]])
+      threads  <- Ref.make(Map.empty[(String, String), List[SlackMessage]])
     yield InMemorySlack(SlackIdentity("B_IAE", "U_IAE"), messages, groups, bots, clock, threads)

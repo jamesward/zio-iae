@@ -71,9 +71,10 @@ object AgentApp extends ZIOAppDefault:
         manifests   <- buildsFrom(base, http)
         pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours, explainer)
         reconcilers <- Reconcilers.make(pipeline, envs)
+        talk        <- ZIO.foreach(model)(m => Converse.make(slack, self, m, envs, manifests).flatMap(Conversations.make))
         sqs         <- ZIO.service[SqsClient]
         _           <- ZIO.logInfo(s"agent started for $repo ($branch): envs ${config.envs.map(_.value).mkString(", ")}")
-        _           <- Agent(reconcilers, InboxConsumer(sqs, QueueUrl(inboxUrl), branch, reconcilers), every.minutes).run
+        _           <- Agent(reconcilers, InboxConsumer(sqs, QueueUrl(inboxUrl), branch, reconcilers, talk), every.minutes).run
       yield ()
     ZIO
       .scoped(program)

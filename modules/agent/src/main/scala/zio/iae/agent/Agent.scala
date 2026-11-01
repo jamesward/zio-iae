@@ -27,7 +27,7 @@ object Reconcilers:
     ZIO.foreach(Chunk.fromIterable(envs))(_ => Queue.sliding[Unit](1)).map(Reconcilers(pipeline, envs, _))
 
 /** Reads the inbox. Every event is only a reason to reconcile: the pipeline re-reads git, the cloud and Slack. */
-final case class InboxConsumer(sqs: SqsClient, url: QueueUrl, branch: String, reconcilers: Reconcilers):
+final case class InboxConsumer(sqs: SqsClient, url: QueueUrl, branch: String, reconcilers: Reconcilers, conversations: Option[Conversations] = None):
   def run: UIO[Nothing] = poll.forever
 
   private def poll: UIO[Unit] =
@@ -42,7 +42,9 @@ final case class InboxConsumer(sqs: SqsClient, url: QueueUrl, branch: String, re
     InboxEvent.decode(body) match
       case Left(error) => ZIO.logWarning(s"ignoring an unreadable inbox message: $error")
       case Right(InboxEvent.Pushed(_, _, b, _)) if b != branch => ZIO.unit
-      case Right(event)                                         => ZIO.logDebug(s"inbox: $event") *> reconcilers.signalAll
+      case Right(event @ (_: InboxEvent.SlackReply | _: InboxEvent.SlackMention)) =>
+        ZIO.logDebug(s"inbox: $event") *> reconcilers.signalAll *> ZIO.foreachDiscard(conversations)(_.offer(event))
+      case Right(event) => ZIO.logDebug(s"inbox: $event") *> reconcilers.signalAll
 
 /** The always-on agent: reconcile everything at start (that is all a restart needs), then react to the inbox and a
   * periodic tick, which also covers events that were dropped.
@@ -50,4 +52,6 @@ final case class InboxConsumer(sqs: SqsClient, url: QueueUrl, branch: String, re
 final case class Agent(reconcilers: Reconcilers, inbox: InboxConsumer, every: Duration):
   def run: UIO[Nothing] =
     reconcilers.signalAll *>
-      (reconcilers.run <&> inbox.run <&> reconcilers.signalAll.repeat(Schedule.spaced(every)).forever).as(()).forever
+      (reconcilers.run <&> inbox.run <&> ZIO.foreachDiscard(inbox.conversations)(_.run) <&> reconcilers.signalAll.repeat(Schedule.spaced(every)).forever)
+        .as(())
+        .forever

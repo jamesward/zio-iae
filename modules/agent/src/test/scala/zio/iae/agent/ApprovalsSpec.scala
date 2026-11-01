@@ -28,10 +28,10 @@ object ApprovalsSpec extends ZIOSpecDefault:
         first   <- approvals.status(plan("a"), decision(plan("a")), approve, None)
         ts       = first match { case ApprovalStatus.Pending(ts) => ts; case _ => "" }
         _       <- approvals.status(plan("a"), decision(plan("a")), approve, None)
-        early   <- slack.replies(channel, ts)
+        early   <- slack.threadTexts(channel, ts)
         _       <- TestClock.adjust(61.minutes)
         _       <- approvals.status(plan("a"), decision(plan("a")), approve, None).repeatN(2)
-        later   <- slack.replies(channel, ts)
+        later   <- slack.threadTexts(channel, ts)
         request <- slack.posted(channel).map(_.head)
       yield assertTrue(
         early.isEmpty,

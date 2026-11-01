@@ -74,6 +74,14 @@ final case class Webhook(settings: WebhookSettings, inbox: Inbox):
               ch     <- e.channel
             yield InboxEvent.SlackReply(ch, thread, user)
             event.fold(ZIO.succeed(Response.ok))(enqueue)
+          // In a thread, the message event above already covers it.
+          case Some(e) if e.tpe == "app_mention" && e.threadTs.isEmpty =>
+            val event = for
+              user <- e.user
+              ts   <- e.ts
+              ch   <- e.channel
+            yield InboxEvent.SlackMention(ch, ts, user)
+            event.fold(ZIO.succeed(Response.ok))(enqueue)
           case _ => ZIO.succeed(Response.ok)
       case _ => ZIO.succeed(Response.ok)
 
@@ -106,5 +114,6 @@ object Webhook:
       channel: Option[String],
       @fieldName("thread_ts") threadTs: Option[String],
       @fieldName("bot_id") botId: Option[String],
+      ts: Option[String] = None,
   ) derives Schema
   final case class SlackEnvelope(@fieldName("type") tpe: String, challenge: Option[String], event: Option[SlackEvent]) derives Schema

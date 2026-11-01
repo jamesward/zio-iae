@@ -42,6 +42,8 @@ trait SlackApi:
   /** Replaces a message's text; a request's metadata is sent again so it's kept. */
   def update(channel: String, ts: String, text: String, request: Option[ApprovalRequest]): IO[AgentError, Unit]
   def history(channel: String, since: Instant): IO[AgentError, List[SlackMessage]]
+  /** A thread, oldest first: its root message, then the replies. */
+  def replies(channel: String, thread: String): IO[AgentError, List[SlackMessage]]
   def groupMembers(group: SlackGroup): IO[AgentError, Set[String]]
   /** The user group's id, for mentions (`<!subteam^ID>`); None if there's no such group. */
   def groupId(group: SlackGroup): IO[AgentError, Option[String]]

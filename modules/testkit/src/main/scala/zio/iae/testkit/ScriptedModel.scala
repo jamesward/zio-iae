@@ -22,6 +22,8 @@ object ScriptedModel:
     case Text(text: String)
     /** A Bedrock error response, e.g. 429 throttling or 400 validation. */
     case Failure(status: Int, message: String)
+    /** A call of one of the request's tools; the caller runs it and sends the result in its next request. */
+    case ToolUse(name: String, input: Json)
 
   /** Starts the server on a free port for the scope's lifetime. */
   val make: ZIO[Scope, Throwable, ScriptedModel] =
@@ -43,12 +45,26 @@ object ScriptedModel:
         yield turn match
           case Some(Turn.Text(text))               => Response.json(converse(text).toJson)
           case Some(Turn.Failure(status, message)) => error(status, message)
+          case Some(Turn.ToolUse(name, input))     => Response.json(toolUse(name, input).toJson)
           case None                                => error(500, "ScriptedModel: no scripted turn left"),
     )
 
   private def error(status: Int, message: String): Response =
     Response(Status.fromInt(status), body = Body.fromString(Json.Obj("message" -> Json.Str(message)).toJson))
       .contentType(MediaType.application.json)
+
+  private def toolUse(name: String, input: Json): Json =
+    Json.Obj(
+      "output" -> Json.Obj(
+        "message" -> Json.Obj(
+          "role"    -> Json.Str("assistant"),
+          "content" -> Json.Arr(Json.Obj("toolUse" -> Json.Obj("toolUseId" -> Json.Str(s"tool-$name"), "name" -> Json.Str(name), "input" -> input))),
+        )
+      ),
+      "stopReason" -> Json.Str("tool_use"),
+      "usage"      -> Json.Obj("inputTokens" -> Json.Num(0), "outputTokens" -> Json.Num(0), "totalTokens" -> Json.Num(0)),
+      "metrics"    -> Json.Obj("latencyMs" -> Json.Num(0)),
+    )
 
   private def converse(text: String): Json =
     Json.Obj(

@@ -11,6 +11,8 @@ enum InboxEvent derives Schema, CanEqual:
   case Pushed(delivery: String, repository: String, branch: String, commit: CommitSha)
   case SlackReaction(channel: String, messageTs: String, reaction: String, user: String)
   case SlackReply(channel: String, threadTs: String, user: String)
+  /** The bot mentioned at the top of the channel; the message starts a thread. */
+  case SlackMention(channel: String, ts: String, user: String)
   case Tick
 
 object InboxEvent:
