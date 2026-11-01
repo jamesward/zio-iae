@@ -45,6 +45,7 @@ and deployments. The design is in [`SPEC.md`](SPEC.md); read it before working.
 | `cli` (`iae-cli`) | `modules/cli` | application (`JavaAppPackaging`) | Next |
 | `agent` (`iae-agent`) | `modules/agent` | server (`JavaAppPackaging`) | Next |
 | `webhook` (`iae-webhook`) | `modules/webhook` | Lambda | Next |
+| `photoApp` (`photo-app`) | `examples/photo-app` | example `InfraApp` (`JavaAppPackaging`) | Next |
 
 The library modules set `scalaVersion` to the Scala LTS (bare setting in `build.sbt`); the application
 modules override it with `scalaNext`. Applications are `publish / skip`.
@@ -52,8 +53,13 @@ modules override it with `scalaNext`. Applications are `publish / skip`.
 ## Commands
 
 - Full validation: `./sbta shutdown`, `./sbta extractSkillsJars`, then `./sbta "Test / compile; testFull; stage"`
-  (`stage` covers the `cli` and `agent` applications). CI runs the same command.
-- Docker: not needed yet. Once `iae-testkit` adds the Floci Testcontainer, the AWS-facing tests need Docker.
+  (`stage` covers the applications and the example). CI runs the same command.
+- Docker: required. The `aws` and `photoApp` tests start Floci (`FlociLayer` in `iae-testkit`) through
+  Testcontainers.
+- Run the example against a local Floci (`docker run --rm -p 4566:4566 floci/floci:2.4.0`), after `photoApp/stage`:
+  `AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_ENDPOINT_URL=http://localhost:4566
+  IAE_ENV=dev IAE_PROVISION=auto target/out/jvm/scala-3.10.0/photo-app/universal/stage/bin/photo-app`; add
+  `--iae-manifest` to print the manifest instead.
 - Gated tests (none yet; planned in `SPEC.md` §4): real-AWS contract tests behind `IAE_AWS_CONTRACT_TESTS=1`,
   real-model policy evals, and the nightly sandbox smoke test. All are paid and stay out of the default
   validation.
@@ -64,4 +70,6 @@ modules override it with `scalaNext`. Applications are `publish / skip`.
 
 ## Exceptions
 
-- None.
+- **Floci image (`floci/floci:2.4.0` in `FlociLayer.image`):** Floci emulates the AWS APIs, which have no
+  production version to track, so the maintenance routine bumps it to the latest Floci release like a
+  dependency (unlike images that mirror a production service).
