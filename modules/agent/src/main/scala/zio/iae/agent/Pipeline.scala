@@ -32,8 +32,37 @@ final case class Pipeline(
     self: SlackIdentity,
     approvalExpiry: Duration,
     explainer: Option[PlanExplainer] = None,
+    diagnoser: Option[FailureDiagnoser] = None,
 ):
   def reconcile(envs: List[EnvRuntime], index: Int): IO[AgentError, Outcome] =
+    attempt(envs, index).tapError(failed(envs(index), _))
+
+  /** A failure is announced once per env, commit and kind of failure, with the model's diagnosis in its thread. */
+  private def failed(runtime: EnvRuntime, error: AgentError): UIO[Unit] =
+    val kind = error match
+      case AgentError.Manifest(app, _) => s"building $app"
+      case AgentError.Engine(_)        => "planning or applying"
+      case AgentError.Git(_)           => "reading the repository"
+      case AgentError.Config(_)        => "reading .iae/config.json"
+      case AgentError.Slack(_)         => "talking to Slack"
+    (for
+      head       <- runtime.workspace.git("rev-parse", "HEAD").flatMap(h => ZIO.fromEither(CommitSha.from(h)).mapError(AgentError.Git(_)))
+      (config, _) <- RepoConfig.load(runtime.workspace.dir)
+      marker      = s"`${runtime.env.value}` at `${head.short}`: $kind failed"
+      now        <- Clock.instant
+      recent     <- slack.history(config.slack.channel, now.minus(approvalExpiry).nn)
+      _ <- ZIO.unless(recent.exists(m => m.botId.contains(self.botId) && m.text.startsWith(s"*Failed* $marker"))):
+             for
+               ts <- slack.post(config.slack.channel, s"*Failed* $marker\n```\n${error.message.take(2500)}\n```", None, None)
+               _ <- ZIO.foreachDiscard(diagnoser): d =>
+                      d.diagnose(runtime.workspace, head, runtime.env, error.message)
+                        .flatMap(text => slack.post(config.slack.channel, text, Some(ts), None).mapError(_.message))
+                        .catchAll(e => ZIO.logWarning(s"diagnosing ${runtime.env.value} at ${head.short}: $e"))
+                        .forkDaemon
+             yield ()
+    yield ()).catchAll(e => ZIO.logWarning(s"announcing a failure in ${runtime.env.value}: ${e.message}"))
+
+  private def attempt(envs: List[EnvRuntime], index: Int): IO[AgentError, Outcome] =
     val runtime = envs(index)
     for
       commit           <- runtime.workspace.sync

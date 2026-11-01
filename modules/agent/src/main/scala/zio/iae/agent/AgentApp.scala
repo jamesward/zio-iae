@@ -68,8 +68,9 @@ object AgentApp extends ZIOAppDefault:
                          ZIO.logWarning("no Bedrock model configured: using the default risk table instead of POLICY.md")
                            .as(RiskTableEvaluator(config.slack.groups.headOption.getOrElse(config.slack.owners)))
         explainer   <- ZIO.foreach(model)(ExplainPlan.make)
+        diagnoser   <- ZIO.foreach(model)(DiagnoseFailure.make)
         manifests   <- buildsFrom(base, http)
-        pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours, explainer)
+        pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours, explainer, diagnoser)
         reconcilers <- Reconcilers.make(pipeline, envs)
         talk        <- ZIO.foreach(model)(m => Converse.make(slack, self, m, envs, manifests).flatMap(Conversations.make))
         sqs         <- ZIO.service[SqsClient]

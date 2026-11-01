@@ -202,4 +202,13 @@ object Scenario:
     ),
   )
 
-  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange)
+  val buildFailure = Scenario(
+    "build-failure",
+    "A push whose build fails is announced once (with the model's diagnosis in the thread when one is configured).",
+    List(
+      Step.Push("break the manifest", "break the manifest", _ => ZIO.succeed(Map(Harness.manifest -> """{"app"""))),
+      Step.WaitFor("the failure notice for env 1", (h, text) => text.startsWith("*Failed*") && text.contains(s"`${env(h, 0)}`")),
+    ),
+  )
+
+  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure)
