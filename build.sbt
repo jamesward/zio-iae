@@ -98,7 +98,7 @@ lazy val agent = (project in file("modules/agent"))
     name := "iae-agent",
     scalaVersion := scalaNext,
     publish / skip := true,
-    libraryDependencies ++= zioTest,
+    libraryDependencies ++= Seq("com.jamesward" %% "zio-bedrock" % "0.1.0") ++ zioTest,
     Compile / mainClass := Some("zio.iae.agent.AgentApp"),
     Test / mainClass := Some("zio.iae.agent.harness.AppTest"),
   )

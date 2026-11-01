@@ -62,6 +62,17 @@ final case class Engine(planner: Planner, executor: Executor):
 
   def apply(plan: Plan): IO[EngineError, ApplyReport] = executor.apply(plan)
 
+  /** The newest commit any of the apps' managed resources in the env were changed by (their `iae:commit` tags), or
+    * None before the first apply. Commits on diverged branches can't be ordered and fail.
+    */
+  def deployed(apps: List[AppName], env: EnvName): IO[EngineError, Option[CommitSha]] =
+    for
+      found <- ZIO.foreach(apps)(app => planner.discovery.managed(app, env)).mapError(EngineError.Provider(_))
+      commits = found.flatten.flatMap(_.commit).distinct
+      newest <- ZIO.filter(commits)(c => ZIO.forall(commits.filterNot(_ == c))(other => executor.commits.isAncestor(other, c)))
+      _      <- ZIO.fail(EngineError.CommitOrder(s"no newest of ${commits.map(_.short).mkString(", ")}")).when(commits.nonEmpty && newest.isEmpty)
+    yield newest.headOption
+
   /** Plans and applies both phases without any approval step. For dev envs, tests and the CLI's `apply`; the agent
     * puts policy and approvals between planning and applying.
     */

@@ -11,8 +11,9 @@ import zio.iae.engine.policy.{RiskTableEvaluator, SlackGroup}
 import zio.iae.testkit.FlociLayer
 import zio.iae.webhook.*
 
-/** The local harness: the real agent and webhook, with GitHub and Slack emulated and AWS on Floci. Only the LLM would
-  * be real, and the agent doesn't use one yet.
+/** The local harness: the real agent and webhook, with GitHub and Slack emulated and AWS on Floci. Only the LLM is
+  * real: with `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` set, `POLICY.md` is evaluated by that model, otherwise
+  * by the default risk table.
   */
 final case class Harness(port: Int, ui: HarnessUi, slack: FakeSlack, repo: TestRepo, envs: List[EnvRuntime])
 
@@ -61,7 +62,10 @@ object Harness:
                 AwsEngine.layer(BucketNaming(None)).build
                   .provideSome[AwsEngine.Clients & Scope](ZLayer.succeed[CommitOrder](GitCommitOrder(workspace.dir)))
                   .map(e => EnvRuntime(env, e.get, workspace))
-      pipeline     = Pipeline(CommandManifests(), RiskTableEvaluator(SlackGroup.from("infra-approvers").toOption.get), client, self, 24.hours)
+      evaluator   <- EvaluatePolicy.fromEnvironment.mapError(_.message).someOrElseZIO:
+                       ZIO.logInfo("no Bedrock model configured: the harness uses the default risk table instead of POLICY.md")
+                         .as(RiskTableEvaluator(SlackGroup.from("infra-approvers").toOption.get))
+      pipeline     = Pipeline(CommandManifests(), evaluator, client, self, 24.hours)
       reconcilers <- Reconcilers.make(pipeline, envs)
       _           <- Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers), 15.minutes).run.forkScoped
     yield Harness(bound, ui, slack, repo, envs)

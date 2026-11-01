@@ -21,6 +21,11 @@ final case class GitWorkspace(dir: Path, remote: String, branch: String):
   /** The email of the head commit's author. */
   def author: IO[AgentError, String] = git("log", "-1", "--format=%ae")
 
+  /** A file's content at a commit, or None if the file doesn't exist there. */
+  def show(commit: CommitSha, path: String): IO[AgentError, Option[String]] =
+    git("ls-tree", "--name-only", commit.value, "--", path).flatMap: listed =>
+      ZIO.when(listed.nonEmpty)(git("show", s"${commit.value}:$path"))
+
   def git(args: String*): IO[AgentError, String] = GitWorkspace.run(dir, args*)
 
 object GitWorkspace:

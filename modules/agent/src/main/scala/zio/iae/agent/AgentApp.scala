@@ -10,7 +10,9 @@ import zio.iae.engine.policy.RiskTableEvaluator
 
 /** The always-on agent. Configured by `IAE_REPO_URL`, `IAE_BRANCH` (default `main`), `IAE_WORKDIR`, `IAE_INBOX_URL`,
   * `IAE_SLACK_TOKEN`, `IAE_SLACK_API` (default Slack's), `IAE_NAME_SUFFIX`, `IAE_RECONCILE_MINUTES` (default 15),
-  * `IAE_APPROVAL_HOURS` (default 24) and the AWS variables. The envs come from the repo's `.iae/config.json`; a
+  * `IAE_APPROVAL_HOURS` (default 24) and the AWS variables. `POLICY.md` is evaluated by the model from
+  * `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` (and `IAE_BEDROCK_ENDPOINT` for a Converse-compatible origin); without
+  * them the default risk table applies. The envs come from the repo's `.iae/config.json`; a
   * change to them takes a restart.
   */
 object AgentApp extends ZIOAppDefault:
@@ -48,7 +50,9 @@ object AgentApp extends ZIOAppDefault:
         http        <- ZIO.service[Client]
         slack        = SlackWebApi(http, SlackToken(token), slackBase)
         self        <- slack.identity
-        evaluator    = RiskTableEvaluator(config.slack.groups.headOption.getOrElse(config.slack.owners))
+        evaluator   <- EvaluatePolicy.fromEnvironment.someOrElseZIO:
+                         ZIO.logWarning("no Bedrock model configured: using the default risk table instead of POLICY.md")
+                           .as(RiskTableEvaluator(config.slack.groups.headOption.getOrElse(config.slack.owners)))
         pipeline     = Pipeline(CommandManifests(), evaluator, slack, self, expiry.hours)
         reconcilers <- Reconcilers.make(pipeline, envs)
         sqs         <- ZIO.service[SqsClient]

@@ -7,7 +7,9 @@ import zio.iae.aws.BucketNaming
 import zio.iae.aws.client.AwsError
 import zio.iae.engine.*
 import zio.iae.engine.policy.*
-import zio.iae.testkit.FlociLayer
+import com.jamesward.zio_bedrock.ConverseConfig
+import com.jamesward.zio_bedrock.Bedrock.{ApiKey, ModelId}
+import zio.iae.testkit.{FlociLayer, ScriptedModel}
 import zio.test.*
 
 object AgentSpec extends ZIOSpecDefault:
@@ -113,6 +115,66 @@ object AgentSpec extends ZIOSpecDefault:
           staging.isInstanceOf[Outcome.Converged],
         )
     ,
+    test("POLICY.md is evaluated by the model: a denied change is stopped and the clause is quoted"):
+      val clause = "Never create buckets in staging."
+      ZIO.scoped:
+        for
+          w       <- world
+          _       <- w.repo.commit(Map(RepoConfig.policyPath -> s"# Approval policy\n\n- $clause\n- Roles are fine.\n"), "policy")
+          model   <- ScriptedModel.make.orDie
+          staging  = w.envs.head.env.value
+          _       <- model.replyText(
+                       s"""{"verdicts":[
+                          |{"change":"0:photo-app/$staging/Bucket/uploads","decision":"Deny","approvals":0,"groups":[],"clauses":["$clause"],"reasoning":"a new bucket in staging","confident":true},
+                          |{"change":"1:photo-app/$staging/Role/runtime","decision":"Auto","approvals":0,"groups":[],"clauses":["Roles are fine."],"reasoning":"a role","confident":true}
+                          |]}""".stripMargin,
+                     )
+          eval    <- EvaluatePolicy.make(ConverseConfig(ApiKey("test-key"), model.url, ModelId("scripted"))).mapError(_.message)
+          outcome <- w.pipeline.copy(evaluator = eval).reconcile(w.envs, 0)
+          notices <- w.slack.posted(channel).map(_.filter(_.text.startsWith("Not applying")))
+          asked   <- model.requests
+        yield assertTrue(
+          outcome match
+            case Outcome.Stopped(_, why) => why.contains("denies")
+            case _                       => false
+          ,
+          notices.size == 1,
+          notices.head.text.contains("a new bucket in staging"),
+          asked.size == 1,
+        )
+    ,
+    test("a push that changes the policy or config needs an owner and is judged by the deployed config"):
+      ZIO.scoped:
+        for
+          w        <- world
+          _        <- w.pipeline.reconcile(w.envs, 0)
+          loosened  = configJson(w.envs(0).env, w.envs(1).env).replace("\"dev@example.com\":\"U_DEV\"", "")
+          example   = PolicyExamplesSpec.exampleJson(Risk.Medium, Decision.Auto)
+          _        <- w.repo.commit(
+                        Map(
+                          ".iae/config.json"                         -> loosened,
+                          ".iae/manifest.json"                       -> manifestJson(Bucket.readWrite(UploadsVersioned)),
+                          s"${PolicyExamples.dir}/medium-is-fine.json" -> example,
+                        ),
+                        "versioning, and forget who dev is",
+                      )
+          waiting  <- w.pipeline.reconcile(w.envs, 0)
+          request  <- requests(w.slack).map(_.head)
+          _        <- w.slack.react(request.ts, "U_BOB", Approvals.approveReaction)
+          approved <- w.pipeline.reconcile(w.envs, 0)
+          v3       <- w.repo.commit(Map(".iae/manifest.json" -> manifestJson(Bucket.readWrite(Uploads))), "versioning off again")
+          next     <- w.pipeline.reconcile(w.envs, 0)
+          all      <- requests(w.slack)
+        yield assertTrue(
+          waiting.isInstanceOf[Outcome.WaitingForApproval],
+          request.text.contains("@platform-owners"),
+          request.text.contains(":white_check_mark: `medium-is-fine`: can go ahead"),
+          request.request.exists(_.author.contains("U_DEV")),
+          approved.isInstanceOf[Outcome.Converged],
+          next == Outcome.Converged(v3),
+          all.size == 1,
+        )
+    ,
     test("the reconcile loops promote a push from staging to prod on their own"):
       ZIO.scoped:
         for
@@ -127,7 +189,7 @@ object AgentSpec extends ZIOSpecDefault:
         yield assertTrue(done.exists(_._2))
     ,
   ).provideShared(
-    ((FlociLayer.live ++ Client.default) >>> AwsEngine.clients).mapError(e => e match
+    ((FlociLayer.live ++ Client.default) >>> (AwsEngine.clients ++ ZLayer.environment[Client])).mapError(e => e match
       case a: AwsError  => a.message
       case t: Throwable => t.getMessage
     )
