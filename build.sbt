@@ -97,7 +97,9 @@ lazy val agent = (project in file("modules/agent"))
   .settings(name := "iae-agent", scalaVersion := scalaNext, publish / skip := true)
 
 lazy val webhook = (project in file("modules/webhook"))
-  .settings(name := "iae-webhook", scalaVersion := scalaNext, publish / skip := true)
+  .dependsOn(engine, testkit % Test)
+  .enablePlugins(JavaAppPackaging)
+  .settings(name := "iae-webhook", scalaVersion := scalaNext, publish / skip := true, libraryDependencies ++= zioTest)
 
 lazy val photoApp = (project in file("examples/photo-app"))
   .dependsOn(aws, testkit % Test)
