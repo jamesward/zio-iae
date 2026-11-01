@@ -3,10 +3,11 @@ package zio.iae
 import zio.*
 import zio.schema.{Schema, derived}
 
-/** How a new version takes traffic: the share (in percent) the new version gets at each step, and how long each step
-  * bakes while its alarms are watched. The last step should be 100.
+/** How a new version takes traffic: the share (in percent) the new version gets at each step, how long each step
+  * bakes while its alarms are watched, and the alarms' period (60 seconds for the load balancer's metrics). The last
+  * step should be 100.
   */
-final case class CanarySpec(steps: List[Int] = List(10, 50, 100), bakeSeconds: Int = 300) derives Schema, CanEqual
+final case class CanarySpec(steps: List[Int] = List(10, 50, 100), bakeSeconds: Int = 300, alarmPeriodSeconds: Int = 60) derives Schema, CanEqual
 
 /** The app running as a web service: containers of its image behind a load balancer, deployed by canary.
   * `environment` and `command` are passed to the container as they are. `image` is filled in by the agent after a

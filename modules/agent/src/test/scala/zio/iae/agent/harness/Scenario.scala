@@ -212,4 +212,31 @@ object Scenario:
     ),
   )
 
-  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure)
+  /** The example's web service: http-echo, whose answer and status code are its arguments. */
+  private def web(text: String, status: Int): ServiceSpec =
+    ServiceSpec(
+      5678,
+      healthPath = "/",
+      canary = CanarySpec(List(50, 100), bakeSeconds = 1200, alarmPeriodSeconds = 10),
+      command = List(s"-text=$text", s"-status-code=$status"),
+      image = Some("hashicorp/http-echo:1.0"),
+    )
+
+  object Web    extends Service.Id(LogicalId("web"), web("v1", 200))
+  object WebBad extends Service.Id(LogicalId("web"), web("v2", 500))
+
+  private def withService(id: Service.Id & Singleton): Map[String, String] =
+    Map(Harness.manifest -> (Bucket.readWrite(Harness.Uploads) ++ Service.run(id)).manifest(Harness.app).toOption.get.toJson)
+
+  val badDeploy = Scenario(
+    "bad-deploy",
+    "A web service goes live everywhere; then a version that answers 500s is rolled back by its canary in staging and never reaches prod.",
+    List(
+      Step.Push("add the web service (v1)", "add the web service", _ => ZIO.succeed(withService(Web))),
+      appliedIn(1),
+      Step.Push("deploy v2, which answers 500", "deploy v2", _ => ZIO.succeed(withService(WebBad))),
+      Step.WaitFor("the canary in env 1 to roll back", (h, text) => text.contains("rolled back") && text.contains(s"${Harness.app.value}/${env(h, 0)}")),
+    ),
+  )
+
+  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy)

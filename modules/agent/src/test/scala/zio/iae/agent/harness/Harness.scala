@@ -129,6 +129,7 @@ object Harness:
       scope    <- ZIO.scope
       executor  = ExecutorService(SlackWebApi(http, SlackToken("xoxb-executor"), base), self, executorEnvs, builds, SqsInbox(sqs, inboxUrl), 24.hours)
       _        <- ZIO.withClock(clock)(executor.consume(sqs, executorUrl)).forkIn(scope)
+      _        <- TrafficGenerator(http, app, Scenario.Web.logicalId, envNames.map(e => e -> accounts.getOrElse(e, tooling))).run.forkIn(scope)
       httpEnv  <- ZIO.environment[Client]
       start = (for
                 model     <- Model.fromEnvironment.provideEnvironment(httpEnv).mapError(_.message)

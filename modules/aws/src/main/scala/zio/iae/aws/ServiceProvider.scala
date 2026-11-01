@@ -126,7 +126,7 @@ final case class ServiceProvider(
       listeners <- elb.listeners(lb.arn)
       _ <- elb.createListener(lb.arn, spec.listenerPort, Map(groups(0).arn -> 100, groups(1).arn -> 0)).when(listeners.isEmpty)
       _ <- ZIO.foreachDiscard(Color.values.toList.zip(groups)): (c, g) =>
-             cloudwatch.putAlarm(alarm(address, c, lb, g))
+             cloudwatch.putAlarm(alarm(address, c, lb, g, spec.canary.alarmPeriodSeconds))
       _ <- elb.tag(lb.arn, tags + (ColorTag -> Color.Blue.toString))
     yield ()).mapError(failed(address, "create"))
 
@@ -195,14 +195,14 @@ final case class ServiceProvider(
       .withClock(Clock.ClockLive)
       .unit
 
-  private def alarm(address: Address, color: Color, lb: LoadBalancer, group: TargetGroup): MetricAlarm =
+  private def alarm(address: Address, color: Color, lb: LoadBalancer, group: TargetGroup, period: Int): MetricAlarm =
     MetricAlarm(
       ServiceNaming.alarm(address, color),
       "AWS/ApplicationELB",
       "HTTPCode_Target_5XX_Count",
       Map("LoadBalancer" -> arnSuffix(lb.arn, "loadbalancer/"), "TargetGroup" -> arnSuffix(group.arn, "")),
       "Sum",
-      60,
+      period,
       1,
       1,
       "GreaterThanOrEqualToThreshold",
