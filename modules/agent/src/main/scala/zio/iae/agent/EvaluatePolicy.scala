@@ -1,12 +1,11 @@
 package zio.iae.agent
 
-import com.jamesward.zio_bedrock.{Bedrock, Converse, ConverseConfig}
-import com.jamesward.zio_bedrock.Bedrock.{ApiKey, InferenceConfig, Message, ModelId, Region, RequestConfig}
+import com.jamesward.zio_bedrock.Bedrock
+import com.jamesward.zio_bedrock.Bedrock.{InferenceConfig, Message, RequestConfig}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.security.MessageDigest
 import java.time.ZoneOffset
 import zio.*
-import zio.http.{Client, URL}
 import zio.iae.engine.policy.*
 import zio.schema.{Schema, derived}
 import zio.schema.annotation.simpleEnum
@@ -76,41 +75,10 @@ object EvaluatePolicy:
         Decision.Approve(v.approvals, if named.isEmpty then Set(policy.owners) else named)
     ChangeVerdict(ChangeId(v.change), decision, v.clauses, (v.reasoning :: bad).mkString("; "), v.confident && bad.isEmpty)
 
-  val instructions: IO[String, String] =
-    ZIO
-      .attemptBlocking(Option(getClass.getResourceAsStream("/prompts/evaluate-policy.md")).map(s => String(s.readAllBytes(), UTF_8)))
-      .orElseFail("cannot read prompts/evaluate-policy.md")
-      .someOrFail("prompts/evaluate-policy.md is missing")
+  val instructions: IO[String, String] = Model.prompt("evaluate-policy")
 
-  /** The model from `AWS_BEARER_TOKEN_BEDROCK`, `BEDROCK_MODEL_ID` and `AWS_REGION`, or from `IAE_BEDROCK_ENDPOINT`
-    * for a Converse-compatible origin (acprock, or a fake). None when no model is configured.
-    */
-  val fromEnvironment: ZIO[Client, AgentError, Option[PolicyEvaluator]] =
-    def env(name: String) = System.env(name).orElseFail(AgentError.Config(s"cannot read $name")).map(_.filter(_.nonEmpty))
-    for
-      key      <- env("AWS_BEARER_TOKEN_BEDROCK")
-      model    <- env("BEDROCK_MODEL_ID")
-      region   <- env("AWS_REGION").map(_.getOrElse(Region.UsEast1.code))
-      endpoint <- env("IAE_BEDROCK_ENDPOINT")
-      config <- (key, model) match
-                  case (Some(k), Some(m)) =>
-                    endpoint match
-                      case Some(e) =>
-                        ZIO.fromEither(URL.decode(e)).orElseFail(AgentError.Config(s"IAE_BEDROCK_ENDPOINT is not a URL: $e"))
-                          .map(url => Some(ConverseConfig(ApiKey(k), url, ModelId(m))))
-                      case None =>
-                        ZIO.fromOption(Region.fromCode(region)).orElseFail(AgentError.Config(s"AWS_REGION $region has no Bedrock"))
-                          .map(r => Some(ConverseConfig(ApiKey(k), r, ModelId(m))))
-                  case _ => ZIO.none
-      evaluator <- ZIO.foreach(config)(make)
-    yield evaluator
-
-  def make(config: ConverseConfig): ZIO[Client, AgentError, PolicyEvaluator] =
-    for
-      bedrock <- ZIO.scoped(Converse.layer(config).build).map(_.get[Bedrock])
-      text    <- instructions.mapError(AgentError.Config(_))
-      cached  <- CachedEvaluator.make(EvaluatePolicy(bedrock, text))
-    yield cached
+  def make(bedrock: Bedrock): IO[AgentError, PolicyEvaluator] =
+    instructions.mapError(AgentError.Config(_)).flatMap(text => CachedEvaluator.make(EvaluatePolicy(bedrock, text)))
 
 /** Keeps verdicts per (policy text, change facts), so re-planning the same change doesn't re-roll the model. The time
   * of the facts only counts by its UTC date, for policies about dates. Failures aren't kept.

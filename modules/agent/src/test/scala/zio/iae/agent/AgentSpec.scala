@@ -129,7 +129,7 @@ object AgentSpec extends ZIOSpecDefault:
                           |{"change":"1:photo-app/$staging/Role/runtime","decision":"Auto","approvals":0,"groups":[],"clauses":["Roles are fine."],"reasoning":"a role","confident":true}
                           |]}""".stripMargin,
                      )
-          eval    <- EvaluatePolicy.make(ConverseConfig(ApiKey("test-key"), model.url, ModelId("scripted"))).mapError(_.message)
+          eval    <- Model.make(ConverseConfig(ApiKey("test-key"), model.url, ModelId("scripted"))).flatMap(EvaluatePolicy.make).mapError(_.message)
           outcome <- w.pipeline.copy(evaluator = eval).reconcile(w.envs, 0)
           notices <- w.slack.posted(channel).map(_.filter(_.text.startsWith("Not applying")))
           asked   <- model.requests
@@ -174,6 +174,25 @@ object AgentSpec extends ZIOSpecDefault:
           next == Outcome.Converged(v3),
           all.size == 1,
         )
+    ,
+    test("a new approval request gets the model's explanation in its thread"):
+      object Explainer extends PlanExplainer:
+        def explain(plan: Plan, decision: PlanDecision): IO[String, String] = ZIO.succeed(s"Plan ${plan.hash.short} turns on versioning.")
+      ZIO.scoped:
+        for
+          w        <- world
+          pipeline  = w.pipeline.copy(explainer = Some(Explainer))
+          _        <- pipeline.reconcile(w.envs, 0)
+          _        <- pipeline.reconcile(w.envs, 1)
+          _        <- w.repo.commit(Map(".iae/manifest.json" -> manifestJson(Bucket.readWrite(UploadsVersioned))), "turn on versioning")
+          _        <- pipeline.reconcile(w.envs, 0)
+          _        <- pipeline.reconcile(w.envs, 1)
+          request  <- requests(w.slack).map(_.head)
+          _        <- w.slack.replies(channel, request.ts).repeat(Schedule.spaced(100.millis) && Schedule.recurUntil[List[String]](_.nonEmpty) && Schedule.recurs(50))
+          replies  <- w.slack.replies(channel, request.ts)
+          _        <- pipeline.reconcile(w.envs, 1)
+          again    <- w.slack.replies(channel, request.ts)
+        yield assertTrue(replies.size == 1, replies.head.contains("turns on versioning"), again.size == 1)
     ,
     test("the reconcile loops promote a push from staging to prod on their own"):
       ZIO.scoped:

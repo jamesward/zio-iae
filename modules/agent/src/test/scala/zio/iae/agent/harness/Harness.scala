@@ -115,10 +115,12 @@ object Harness:
       scope    <- ZIO.scope
       httpEnv  <- ZIO.environment[Client]
       start = (for
-                evaluator <- EvaluatePolicy.fromEnvironment.provideEnvironment(httpEnv).mapError(_.message).someOrElseZIO:
+                model     <- Model.fromEnvironment.provideEnvironment(httpEnv).mapError(_.message)
+                evaluator <- ZIO.foreach(model)(EvaluatePolicy.make).mapError(_.message).someOrElseZIO:
                                ZIO.logInfo("no Bedrock model configured: the harness uses the default risk table instead of POLICY.md")
                                  .as(RiskTableEvaluator(SlackGroup.from("infra-approvers").toOption.get))
-                pipeline     = Pipeline(builds, evaluator, client, self, 24.hours)
+                explainer <- ZIO.foreach(model)(ExplainPlan.make).mapError(_.message)
+                pipeline     = Pipeline(builds, evaluator, client, self, 24.hours, explainer)
                 reconcilers <- Reconcilers.make(pipeline, envs)
                 fiber       <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers), 15.minutes).run).forkIn(scope)
               yield (fiber, reconcilers))

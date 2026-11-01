@@ -22,7 +22,14 @@ final case class Governance(config: RepoConfig, text: String, proposed: Option[(
 /** Reconciles one env to the head of the branch: expand, then contract, each through the user's policy. Level-
   * triggered and idempotent: running it again after a crash or a dropped event just does what is left.
   */
-final case class Pipeline(manifests: ManifestSource, evaluator: PolicyEvaluator, slack: SlackApi, self: SlackIdentity, approvalExpiry: Duration):
+final case class Pipeline(
+    manifests: ManifestSource,
+    evaluator: PolicyEvaluator,
+    slack: SlackApi,
+    self: SlackIdentity,
+    approvalExpiry: Duration,
+    explainer: Option[PlanExplainer] = None,
+):
   def reconcile(envs: List[EnvRuntime], index: Int): IO[AgentError, Outcome] =
     val runtime = envs(index)
     for
@@ -88,7 +95,7 @@ final case class Pipeline(manifests: ManifestSource, evaluator: PolicyEvaluator,
                    case (_, Decision.Auto)       => applied(runtime, config, plan, "the policy lets it go ahead", commit)
                    case (_, Decision.Deny)       => stopped(config, plan, decision, "the policy denies it")
                    case (_, approve: Decision.Approve) =>
-                     approvals.status(plan, decision, approve, author, examples(runtime, governance)).flatMap:
+                     approvals.status(plan, decision, approve, author, examples(runtime, governance), explain(config, plan, decision)).flatMap:
                        case ApprovalStatus.Approved(by, request) =>
                          applied(runtime, config, plan, s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", commit) <* approvals.applied(request)
                        case ApprovalStatus.Rejected(by, _) => stopped(config, plan, decision, s"<@$by> rejected it")
@@ -103,6 +110,16 @@ final case class Pipeline(manifests: ManifestSource, evaluator: PolicyEvaluator,
       facts     = ChangeFacts.of(plan, Origin.Human, author, now) ++ policyFact
       verdicts <- evaluator.evaluate(policy, facts).catchAll(e => ZIO.logWarning(s"policy evaluation failed, asking the owners: $e").as(Nil))
     yield Verdicts.decide(facts, verdicts, policy)
+
+  /** The model's explanation, as a reply in the request's thread. Best effort, in the background: an explanation
+    * informs approvers but decides nothing, so a failure is only logged.
+    */
+  private def explain(config: RepoConfig, plan: Plan, decision: PlanDecision)(ts: String): UIO[Unit] =
+    ZIO.foreachDiscard(explainer): e =>
+      e.explain(plan, decision)
+        .flatMap(text => slack.post(config.slack.channel, text, Some(ts), None).mapError(_.message))
+        .catchAll(err => ZIO.logWarning(s"explaining plan ${plan.hash.short}: $err"))
+        .forkDaemon
 
   /** For a policy change, how the policy examples fare under the proposed policy, for the owners deciding on it. */
   private def examples(runtime: EnvRuntime, governance: Governance): IO[AgentError, List[String]] =

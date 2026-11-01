@@ -46,7 +46,7 @@ object EvaluatePolicySpec extends ZIOSpecDefault:
   private val evaluator: ZIO[ScriptedModel & Client, Nothing, PolicyEvaluator] =
     for
       model <- ZIO.service[ScriptedModel]
-      eval  <- EvaluatePolicy.make(ConverseConfig(ApiKey("test-key"), model.url, ModelId("scripted"))).orDieWith(e => RuntimeException(e.message))
+      eval  <- Model.make(ConverseConfig(ApiKey("test-key"), model.url, ModelId("scripted"))).flatMap(EvaluatePolicy.make).orDieWith(e => RuntimeException(e.message))
     yield eval
 
   private def decide(answer: String, facts: List[ChangeFacts] = List(widening)): ZIO[ScriptedModel & Client, Nothing, PlanDecision] =

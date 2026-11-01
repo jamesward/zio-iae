@@ -63,11 +63,13 @@ object AgentApp extends ZIOAppDefault:
         http        <- ZIO.service[Client]
         slack        = SlackWebApi(http, SlackToken(token), slackBase)
         self        <- slack.identity
-        evaluator   <- EvaluatePolicy.fromEnvironment.someOrElseZIO:
+        model       <- Model.fromEnvironment
+        evaluator   <- ZIO.foreach(model)(EvaluatePolicy.make).someOrElseZIO:
                          ZIO.logWarning("no Bedrock model configured: using the default risk table instead of POLICY.md")
                            .as(RiskTableEvaluator(config.slack.groups.headOption.getOrElse(config.slack.owners)))
+        explainer   <- ZIO.foreach(model)(ExplainPlan.make)
         manifests   <- buildsFrom(base, http)
-        pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours)
+        pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours, explainer)
         reconcilers <- Reconcilers.make(pipeline, envs)
         sqs         <- ZIO.service[SqsClient]
         _           <- ZIO.logInfo(s"agent started for $repo ($branch): envs ${config.envs.map(_.value).mkString(", ")}")

@@ -21,13 +21,14 @@ enum ApprovalStatus derives CanEqual:
 final case class Approvals(slack: SlackApi, self: SlackIdentity, channel: String, expiry: Duration, reminder: Duration = 1.hour):
   import Approvals.*
 
-  /** `extra` adds sections to a new request; it only runs when one is posted. */
+  /** `extra` adds sections to a new request and `posted` runs after one is posted, with its ts. */
   def status(
       plan: Plan,
       decision: PlanDecision,
       approve: Decision.Approve,
       author: Option[String],
       extra: IO[AgentError, List[String]] = ZIO.succeed(Nil),
+      posted: String => UIO[Unit] = _ => ZIO.unit,
   ): IO[AgentError, ApprovalStatus] =
     for
       now      <- Clock.instant
@@ -43,6 +44,7 @@ final case class Approvals(slack: SlackApi, self: SlackIdentity, channel: String
                     for
                       ts <- extra.flatMap(request(plan, decision, approve, author, now.plus(expiry).nn.getEpochSecond, _))
                       _  <- ZIO.foreachDiscard(live)((m, r) => label(m, r, Superseded))
+                      _  <- posted(ts)
                     yield ApprovalStatus.Pending(ts)
                   case Some((m, r)) =>
                     evaluate(m, approve, author).tap:
