@@ -22,6 +22,25 @@ object ApprovalsSpec extends ZIOSpecDefault:
     InMemorySlack.make(Map("infra-approvers" -> Set("U_ALICE"))).map(s => (s, Approvals(s, s.self, channel, 24.hours)))
 
   def spec = suite("Approvals")(
+    test("an approval needed from two groups needs the count from each: one group's members alone don't approve"):
+      val owners = SlackGroup.from("platform-owners").toOption.get
+      val both: Decision.Approve = Decision.Approve(1, Set(approvers, owners))
+      for
+        slack    <- InMemorySlack.make(Map("infra-approvers" -> Set("U_ALICE", "U_CAROL"), "platform-owners" -> Set("U_BOB")))
+        approvals = Approvals(slack, slack.self, channel, 24.hours)
+        pending  <- approvals.status(plan("a"), PlanDecision(both, Nil), both, None)
+        ts        = pending match { case ApprovalStatus.Pending(ts) => ts; case _ => "" }
+        _        <- slack.react(ts, "U_ALICE", Approvals.approveReaction)
+        _        <- slack.react(ts, "U_CAROL", Approvals.approveReaction)
+        twoOfOne <- approvals.status(plan("a"), PlanDecision(both, Nil), both, None)
+        _        <- slack.react(ts, "U_BOB", Approvals.approveReaction)
+        done     <- approvals.status(plan("a"), PlanDecision(both, Nil), both, None)
+        text     <- slack.posted(channel).map(_.head.text)
+      yield assertTrue(
+        twoOfOne.isInstanceOf[ApprovalStatus.Pending],
+        done.isInstanceOf[ApprovalStatus.Approved],
+        text.contains("needs 1 approval(s) from each of @infra-approvers, @platform-owners"),
+      ),
     test("an unanswered request gets one reminder after an hour, mentioning the group"):
       for
         (slack, approvals) <- setup

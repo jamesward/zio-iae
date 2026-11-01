@@ -10,7 +10,9 @@ enum Decision derives Schema, CanEqual:
   case Deny
 
 object Decision:
-  /** Deny beats Approve beats Auto; two approvals need the larger count from all the groups of both. */
+  /** Deny beats Approve beats Auto; two approvals combine into the larger count from each of the groups of both, which
+    * is at least as strict as either.
+    */
   def strictest(a: Decision, b: Decision): Decision = (a, b) match
     case (Deny, _) | (_, Deny)                  => Deny
     case (Approve(c1, g1), Approve(c2, g2))     => Approve(c1.max(c2), g1 ++ g2)

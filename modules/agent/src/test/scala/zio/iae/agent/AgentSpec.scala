@@ -161,13 +161,16 @@ object AgentSpec extends ZIOSpecDefault:
           waiting  <- w.pipeline.reconcile(w.envs, 0)
           request  <- requests(w.slack).map(_.head)
           _        <- w.slack.react(request.ts, "U_BOB", Approvals.approveReaction)
+          ownerOnly <- w.pipeline.reconcile(w.envs, 0)
+          _        <- w.slack.react(request.ts, "U_ALICE", Approvals.approveReaction)
           approved <- w.pipeline.reconcile(w.envs, 0)
           v3       <- w.repo.commit(Map(".iae/manifest.json" -> manifestJson(Bucket.readWrite(Uploads))), "versioning off again")
           next     <- w.pipeline.reconcile(w.envs, 0)
           all      <- requests(w.slack)
         yield assertTrue(
           waiting.isInstanceOf[Outcome.WaitingForApproval],
-          request.text.contains("@platform-owners"),
+          request.text.contains("from each of @infra-approvers, @platform-owners"),
+          ownerOnly.isInstanceOf[Outcome.WaitingForApproval],
           request.text.contains(":white_check_mark: `medium-is-fine`: can go ahead"),
           request.request.exists(_.author.contains("U_DEV")),
           approved.isInstanceOf[Outcome.Converged],

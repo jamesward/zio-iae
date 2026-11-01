@@ -11,7 +11,7 @@ enum ApprovalStatus derives CanEqual:
   case Pending(requestTs: String)
 
 /** Approval requests live in Slack: a message from the agent's bot whose metadata says what it covers. Approval is
-  * ✅ reactions from enough members of the required groups; ❌ from a member rejects. Nothing is stored elsewhere.
+  * ✅ reactions from enough members of each required group; ❌ from a member rejects. Nothing is stored elsewhere.
   *
   * A request's first line says where it stands: `*Approval needed*` while open, then `*Approved*` once applied,
   * `*Rejected*`, `*Superseded*` when a newer request for the env replaces it, or `*Expired*`. Superseded, expired
@@ -47,7 +47,7 @@ final case class Approvals(slack: SlackApi, self: SlackIdentity, channel: String
                       _  <- posted(ts)
                     yield ApprovalStatus.Pending(ts)
                   case Some((m, r)) =>
-                    evaluate(m, approve, author).tap:
+                    verify(m, approve, author).tap:
                       case ApprovalStatus.Pending(_)     => remind(m, r, approve, now)
                       case ApprovalStatus.Rejected(_, _) => label(m, r, Rejected).unless(m.text.startsWith(Rejected))
                       case ApprovalStatus.Approved(_, _) => ZIO.unit
@@ -57,18 +57,24 @@ final case class Approvals(slack: SlackApi, self: SlackIdentity, channel: String
   def applied(request: SlackMessage): IO[AgentError, Unit] =
     ZIO.foreachDiscard(request.request)(label(request, _, Approved))
 
-  private def evaluate(message: SlackMessage, approve: Decision.Approve, author: Option[String]): IO[AgentError, ApprovalStatus] =
+  /** Whether a request's reactions approve: at least `count` eligible approvals from members of each required group
+    * (one person in two groups counts for both), so combining two requirements never weakens either. Eligible means a
+    * member of a required group who is human, not the change's author and not the agent. A ❌ from any of them rejects.
+    */
+  def verify(message: SlackMessage, approve: Decision.Approve, author: Option[String]): IO[AgentError, ApprovalStatus] =
     for
-      members  <- ZIO.foreach(approve.groups.toList)(slack.groupMembers).map(_.flatten.toSet)
+      members  <- ZIO.foreach(approve.groups.toList)(g => slack.groupMembers(g).map(g -> _)).map(_.toMap)
+      all       = members.values.flatten.toSet
       eligible <- ZIO.filter(message.reactions.filter(r => r.name == approveReaction || r.name == rejectReaction).flatMap(_.users).distinct): user =>
-                    if !members.contains(user) || author.contains(user) || user == self.userId then ZIO.succeed(false)
+                    if !all.contains(user) || author.contains(user) || user == self.userId then ZIO.succeed(false)
                     else slack.isBot(user).map(!_)
       approvers = message.reactions.filter(_.name == approveReaction).flatMap(_.users).filter(eligible.contains).toSet
       rejecter  = message.reactions.filter(_.name == rejectReaction).flatMap(_.users).find(eligible.contains)
+      enough    = approve.groups.nonEmpty && approve.groups.forall(g => approvers.count(members.getOrElse(g, Set.empty).contains) >= approve.count)
     yield rejecter match
-      case Some(user)                                  => ApprovalStatus.Rejected(user, message)
-      case None if approvers.size >= approve.count     => ApprovalStatus.Approved(approvers, message)
-      case None                                        => ApprovalStatus.Pending(message.ts)
+      case Some(user)  => ApprovalStatus.Rejected(user, message)
+      case None if enough => ApprovalStatus.Approved(approvers, message)
+      case None        => ApprovalStatus.Pending(message.ts)
 
   /** Once per request, after the reminder period: a thread reply that mentions the groups that can approve. */
   private def remind(message: SlackMessage, request: ApprovalRequest, approve: Decision.Approve, now: java.time.Instant): IO[AgentError, Unit] =

@@ -18,7 +18,9 @@ object PlanText:
   def describe(decision: Decision): String = decision match
     case Decision.Auto                   => "can go ahead"
     case Decision.Deny                   => "denied"
-    case Decision.Approve(count, groups) => s"needs $count approval(s) from ${groups.toList.sorted.map("@" + _.handle).mkString(", ")}"
+    case Decision.Approve(count, groups) =>
+      val names = groups.toList.sorted.map("@" + _.handle).mkString(", ")
+      if groups.size > 1 then s"needs $count approval(s) from each of $names" else s"needs $count approval(s) from $names"
 
   private def line(planned: PlannedChange): String =
     val target = s"${planned.address.kind} ${planned.address.id.value}"

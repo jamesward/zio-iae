@@ -198,6 +198,7 @@ object Scenario:
         (h, text) => text.startsWith("*Approval needed*") && text.contains(s"${Harness.app.value}/${env(h, 0)}") && text.contains("@platform-owners"),
       ),
       Step.React("U_BOB", "white_check_mark"),
+      Step.React("U_ALICE", "white_check_mark"),
       appliedIn(0, Some("U_BOB")),
     ),
   )
