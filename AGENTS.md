@@ -60,6 +60,9 @@ modules override it with `scalaNext`. Applications are `publish / skip`.
   `AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_ENDPOINT_URL=http://localhost:4566
   IAE_ENV=dev IAE_PROVISION=auto target/out/jvm/scala-3.10.0/photo-app/universal/stage/bin/photo-app`; add
   `--iae-manifest` to print the manifest instead.
+- The `iae` CLI (after `cli/stage`, at `target/out/jvm/scala-3.10.0/iae-cli/universal/stage/bin/iae`), with the same
+  AWS variables: `photo-app --iae-manifest | iae plan --env dev`, then `iae apply --env dev`. Without an LLM it
+  applies the default risk table (dev free, prod strict); exit code 2 means policy needs an approval.
 - Gated tests (none yet; planned in `SPEC.md` §4): real-AWS contract tests behind `IAE_AWS_CONTRACT_TESTS=1`,
   real-model policy evals, and the nightly sandbox smoke test. All are paid and stay out of the default
   validation.
