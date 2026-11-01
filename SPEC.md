@@ -124,7 +124,7 @@ Everything it does is explained in Slack and recorded as evidence.
 | `iae-core` | zio, zio-streams, zio-json (or zio-schema) | Resource/Capability/Infra model, `ResourceId`, `Spec`, `Change`, `Plan`, `Risk`, `Policy`, `Provider` SPI, `InfraApp`, manifest codecs, IAM policy model. **No AWS.** |
 | `iae-aws-client` | zio, zio-http | Thin ZIO-native AWS clients: SigV4 signing, credentials chain, retries, and the operations we need for S3, SQS, DynamoDB, Secrets Manager, IAM, STS, ECR, ECS, ELBv2, CloudWatch, CloudTrail, Audit Manager. Endpoint override for Floci. |
 | `iae-aws` | `iae-core`, `iae-aws-client` | AWS implementations: runtime capability layers (`Bucket` backed by S3, ...) and `Provider`s (observe/diff/apply) per resource kind, naming, tagging, IAM generation. |
-| `iae-testkit` | `iae-aws`, `testcontainers-floci` | `FlociLayer`, `AwsConfig` for Floci, in-memory fakes for services Floci doesn't emulate (Audit Manager), test helpers (`assertConverges`). |
+| `iae-testkit` | `iae-core`, `iae-aws-client`, `testcontainers-floci-aws` | `FlociLayer` (a Floci container and an `AwsConfig` for it), `InMemoryCloud` (in-memory capabilities for fast app tests), fakes for services Floci doesn't emulate (Audit Manager), test helpers (`assertConverges`). `iae-aws` uses it in its own tests. |
 
 Library modules use the Scala LTS (per the `zen-of-projects` compatibility rules). Package: `zio.iae` (see open
 question Q1).
@@ -135,15 +135,19 @@ ZIO environments are keyed by type, so two buckets need two types. Every resourc
 object that carries its logical id and spec:
 
 ```scala
-object Uploads extends Bucket.Id("uploads", BucketSpec(versioning = true))
-object Thumbs  extends Bucket.Id("thumbs",  BucketSpec(lifecycle = List(Expire(after = 30.days))))
-object Jobs    extends Queue.Id("jobs",     QueueSpec(visibilityTimeout = 30.seconds, dlq = Some(Dlq(maxReceives = 5))))
+object Uploads extends Bucket.Id(LogicalId("uploads"), BucketSpec(versioning = Versioning.Enabled))
+object Thumbs  extends Bucket.Id(LogicalId("thumbs"),  BucketSpec(lifecycle = List(Expire(after = 30.days))))
+object Jobs    extends Queue.Id(LogicalId("jobs"),     QueueSpec(visibilityTimeout = 30.seconds, dlq = Some(Dlq(maxReceives = 5))))
 ```
 
+`LogicalId("…")`, `AppName("…")` and `EnvName("…")` are opaque types whose literals are checked at compile time
+(lowercase letters, digits and single hyphens, starting with a letter, with a length limit), since they end up in
+physical resource names. Values known only at runtime go through `LogicalId.from`, which returns an `Either`.
+
 The capability types are parameterised by the id's singleton type: `Bucket[Uploads.type]`. A type alias keeps
-signatures readable (`type Uploads = Uploads.type`). It still has to be verified that `izumi-reflect` `Tag`s
-for singleton object types are stable across compilation units (see open question Q2). The fallback is user-declared
-marker traits.
+signatures readable (`type Uploads = Uploads.type`). M1 confirmed that `izumi-reflect` `Tag`s for singleton object
+types work across compilation units: the example app declares `Uploads` in one module and its tests provide
+`Bucket[Uploads.type]` from another.
 
 Logical ids are stable. Renaming an id is a replace (delete + create) and the plan shows it as such, unless the
 id declares `formerly = "old-id"`, which turns it into a move.
@@ -154,28 +158,27 @@ Each resource kind has a full trait and narrower capability traits. The engine d
 narrowest capability the app requests.
 
 ```scala
-trait BucketReader[Id]:
+trait BucketReader[I]:
   def get(key: ObjectKey): ZStream[Any, BucketError, Byte]
   def head(key: ObjectKey): IO[BucketError, Option[ObjectMeta]]
-  def list(prefix: ObjectKey = ObjectKey.root): ZStream[Any, BucketError, ObjectMeta]
-  def presignGet(key: ObjectKey, ttl: Duration): IO[BucketError, URL]
+  def list(prefix: Option[ObjectKey] = None): ZStream[Any, BucketError, ObjectMeta]
 
-trait BucketWriter[Id]:
-  def put(key: ObjectKey, body: ZStream[Any, Throwable, Byte], meta: PutMeta = PutMeta.default): IO[BucketError, Unit]
+trait BucketWriter[I]:
+  def put(key: ObjectKey, body: ZStream[Any, Throwable, Byte], contentType: Option[String] = None): IO[BucketError, Unit]
   def delete(key: ObjectKey): IO[BucketError, Unit]
-  def presignPut(key: ObjectKey, ttl: Duration): IO[BucketError, URL]
 
-trait Bucket[Id] extends BucketReader[Id], BucketWriter[Id]
+trait Bucket[I] extends BucketReader[I], BucketWriter[I]
 
 enum BucketError:
   case NotFound(key: ObjectKey)
   case AccessDenied(detail: String)
-  case PreconditionFailed(detail: String)
-  case Transport(cause: Throwable)   // retried by the client before surfacing
+  case BodyFailed(detail: String)    // the stream passed to `put` failed
+  case Unavailable(detail: String)   // anything else, after the client's retries
 ```
 
-Errors are typed and specific to the resource. Transport errors are retried with a `Schedule` inside the client
-and only surface when retries run out.
+Errors are typed and specific to the resource. Throttling, server errors and network failures are retried with a
+`Schedule` inside the client and only surface (as `Unavailable`) when retries run out. Pre-signed URLs
+(`presignGet`, `presignPut`) and multipart uploads for large bodies come later; `put` currently buffers the body.
 
 MVP resource kinds and capabilities:
 
@@ -217,42 +220,47 @@ Topic.publisher(Events).subscribe(Jobs)  // wiring is part of the declaration
 Resources that are only wired together (such as a DLQ, or a bucket notification to a queue) are declared without
 granting the app a capability on them.
 
-`Cloud` is the runtime context: env name, account, region, naming strategy, endpoint override (Floci), credentials.
-It is provided by `Cloud.fromEnvironment` in production and `FlociLayer.cloud` in tests.
+`Cloud` is the runtime binding: given a logical id and spec, it returns the capability. On AWS it's `AwsCloud`
+(app, env, provision mode, naming, S3 client), configured by `AwsCloud.fromEnvironment` from `IAE_ENV`,
+`IAE_PROVISION`, `IAE_NAME_SUFFIX` and the standard AWS variables (including `AWS_ENDPOINT_URL` for Floci). Tests
+use `AwsCloud.layer` against Floci or `InMemoryCloud` from `iae-testkit`.
 
-At runtime, `layer` **binds, it doesn't create**. It resolves the physical name and checks (cheaply, once at
-startup) that the resource exists with the expected `iae:spec-hash` tag. If not, it fails fast with
-`InfraError.NotProvisioned`, which means the engine hasn't converged this env yet. A `Cloud.autoProvision` mode
-for `dev` creates missing resources directly, so a local run against Floci needs no engine.
+At runtime, `layer` **binds, it doesn't create** (`ProvisionMode.BindOnly`, the default). It resolves the physical
+name and checks, once at startup, that the resource exists with the expected `iae:spec-hash` tag. If not, it fails
+fast with `InfraError.NotProvisioned` (the engine hasn't converged this env yet) or `InfraError.SpecMismatch` (the
+resource was provisioned from another spec or changed by hand). `ProvisionMode.AutoProvision`
+(`IAE_PROVISION=auto`) creates or converges resources directly through the providers, so a local run against Floci
+needs no engine.
 
 ### 3.5 `InfraApp`
 
 ```scala
-object PhotoApp extends InfraApp:
-  val infra = Bucket.readWrite(Uploads) ++ Bucket.readWrite(Thumbs) ++ Queue.sender(Jobs)
-
-  def run: ZIO[InfraEnv, Any, Any] =   // InfraEnv is inferred from infra's R
+object PhotoApp extends AwsInfraApp(AppName("photo-app"), Bucket.readWrite(Uploads) ++ Bucket.readWrite(Thumbs) ++ Queue.sender(Jobs)):
+  def program: ZIO[Bucket[Uploads.type] & Bucket[Thumbs.type] & QueueSender[Jobs.type], Any, Any] =
     for
-      _ <- ZIO.serviceWithZIO[Bucket[Uploads]](_.put(key, body))
-      _ <- ZIO.serviceWithZIO[QueueSender[Jobs]](_.send(Job.Resize(key)))
+      _ <- ZIO.serviceWithZIO[Bucket[Uploads.type]](_.put(key, body))
+      _ <- ZIO.serviceWithZIO[QueueSender[Jobs.type]](_.send(Job.Resize(key)))
     yield ()
 ```
 
-`InfraApp` derives `type InfraEnv` from `infra`, so `run` can't require a resource that isn't declared (a compile
-error). Its `main`:
+`InfraApp[R]` takes the infra as a constructor argument, so `R` is inferred from it and `program: ZIO[R, Any, Any]`
+can't require a resource that isn't declared (a compile error). `AwsInfraApp` is the AWS-bound subclass. Its
+`main`:
 
 - `--iae-manifest` writes the manifest JSON to stdout and exits without contacting AWS. The engine uses this to
   get the desired state at a commit.
-- Otherwise it builds `infra.layer` from `Cloud.fromEnvironment` and runs `run`.
+- Otherwise it builds `infra.layer` from `AwsCloud.fromEnvironment` and runs `program`. An `InfraError` (such as
+  `NotProvisioned`) is logged as one plain message and the process exits with status 1.
 
 Apps that aren't a single `main` (a library module of shared infra, or several services in one repo) extend
 `InfraModule` (just `val infra`), and the repo's `.iae/config.json` lists the entry points.
 
 ### 3.6 Naming, tagging, ownership
 
-- Physical name: `<app>-<env>-<id>`, plus a short stable hash suffix where AWS needs global uniqueness (S3).
-- Every managed resource is tagged `iae:app`, `iae:env`, `iae:id`, `iae:kind`, `iae:spec-hash`,
-  `iae:commit`.
+- Physical name: `<app>-<env>-<id>`, plus a suffix where AWS needs global uniqueness (S3), set by
+  `IAE_NAME_SUFFIX` for now (for example a short hash of the account id).
+- Every managed resource is tagged `iae:managed`, `iae:app`, `iae:env`, `iae:id`, `iae:kind`, `iae:spec-hash`,
+  and (from M2) `iae:commit`. Tags the user adds by hand are kept when the engine re-tags.
 - **Tags are the ownership record.** There is no state file, so nothing can drift from reality. The engine
   discovers what it owns through the Resource Groups Tagging API and per-service list calls. `iae:commit` is
   also the concurrency guard (§5.3).
@@ -306,7 +314,7 @@ Alternative: generated clients ([zio-aws](https://github.com/zio/zio-aws)) for t
 | Unit | `diff`, `risk`, verdict combination and the built-in floor, plan ordering, manifest codec round trip, IAM generation | pure, property-based (zio-test `Gen`) |
 | Client | Each AWS op | Floci |
 | Provider | create, then observe, then diff is empty; update; replace; delete; `apply` idempotency | Floci |
-| Capability | `Bucket[Id]` etc. used by a sample program | Floci with `Cloud.autoProvision` |
+| Capability | `Bucket[I]` etc. used by a sample program | `InMemoryCloud`, then Floci with `ProvisionMode.AutoProvision` |
 | Engine end-to-end | manifest, plan, apply, re-plan gives an empty plan (`assertConverges`); crash mid-apply then re-run converges; an older commit can't overwrite a newer one (commit guard) | Floci |
 | Agent | Inbox routing and coalescing, reconciler flow, approval verification, restart rehydration, job candidate detection | Floci + `FakeSlack` + `FakeGitHub` |
 | Scenarios | The `Scenario`s from the local harness (§4.1), run headlessly end to end | Floci + fakes + `ScriptedModel` |
@@ -319,10 +327,17 @@ Alternative: generated clients ([zio-aws](https://github.com/zio/zio-aws)) for t
 
 ```scala
 object FlociLayer:
-  val container: ZLayer[Any, Throwable, FlociContainer]   // ZLayer.scoped around io.floci:testcontainers-floci
-  val awsConfig: ZLayer[FlociContainer, Nothing, AwsConfig]
-  val cloud:     ZLayer[FlociContainer, Nothing, Cloud]    // env = "test", autoProvision on
+  val image: String                                        // pinned floci/floci tag
+  val container: ZLayer[Any, Throwable, FlociContainer]   // ZLayer.scoped around io.floci:testcontainers-floci-aws
+  val awsConfig: ZLayer[FlociContainer, Throwable, AwsConfig]
+  val live:      ZLayer[Any, Throwable, AwsConfig]         // container >>> awsConfig
+
+object InMemoryCloud:
+  def layer(app: AppName, env: EnvName): ULayer[Cloud]     // capabilities backed by a Ref, for fast app tests
 ```
+
+An app's tests can run the same suite at two layers of the test onion: against `InMemoryCloud`, then against Floci
+through `AwsCloud.layer(app, env, ProvisionMode.AutoProvision, naming)`. The example app does exactly that.
 
 One container per suite (`provideShared`). Each test gets a fresh `env` name so tests don't collide. Floci's
 emulated services include S3, SQS, SNS, DynamoDB, IAM, STS, KMS, Secrets Manager, ECS, ECR, ELBv2, CloudWatch,
@@ -959,8 +974,8 @@ and the "iae" GitHub App installed.
 
 | # | Deliverable | Done when |
 |---|---|---|
-| M0 | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
-| M1 | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
+| M0 ✅ | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
+| M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
 | M2 | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `Queue`, `Table`, `Secret`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
 | M3 | Agent process: webhook Lambda + SQS inbox, per-env reconcilers, CodeBuild builds, Slack Socket Mode, `EvaluatePolicy` with `POLICY.md` + policy examples, approval requests + verification, notices, rehydrate on restart; local harness (`AppTest`, `FakeSlack` + web UI, `FakeGitHub`, per-account Floci, clock control, first scenarios); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval. Then the same on a real staging account |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
@@ -975,7 +990,7 @@ and the "iae" GitHub App installed.
 | # | Question | Current leaning |
 |---|---|---|
 | Q1 | Package and artifact naming: `zio.iae` / `dev.zio`-style vs `com.jamesward` | `zio.iae` package, `com.jamesward` org, unless it moves under the ZIO org |
-| Q2 | Resource identity via singleton-type `Tag`s: verify izumi-reflect stability; fallback to marker traits | Spike in M1 |
+| Q2 | Resource identity via singleton-type `Tag`s: verify izumi-reflect stability; fallback to marker traits | Resolved in M1: works across modules (§3.2) |
 | Q3 | Hand-written `iae-aws-client` vs zio-aws vs Java SDK v2 | Hand-written for the ops we need (ZIO-native streams, Scala 3, small footprint); revisit if the surface grows |
 | Q4 | Manifest extraction: running `main --iae-manifest` via sbt per commit is slow | Do it in CodeBuild alongside the build; keep the result in memory for the commit; later an sbt task that only links the `infra` value |
 | Q5 | When to split out the executor (§5.11) | Before managing prod (M4) |
