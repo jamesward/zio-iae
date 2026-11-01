@@ -36,6 +36,7 @@ final case class EcsClient(json: AwsJsonClient):
   def service(cluster: String, name: String): IO[AwsError, Option[EcsService]] =
     call[ServicesRequest, Services]("DescribeServices", ServicesRequest(cluster, List(name)))
       .map(_.services.getOrElse(Nil).find(s => s.serviceName == name && !s.status.contains("INACTIVE")).map(serviceOf))
+      .catchSome { case e if e.errorCode.exists(_.endsWith("ServiceNotFoundException")) => ZIO.none } // Floci answers 404
 
   def createService(cluster: String, name: String, taskDefinition: String, count: Int, subnets: List[String], targetGroup: String, container: String, port: Int, tags: Map[String, String])
       : IO[AwsError, Unit] =

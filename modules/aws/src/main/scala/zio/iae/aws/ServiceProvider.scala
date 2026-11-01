@@ -165,7 +165,8 @@ final case class ServiceProvider(
                yield ()
              case None =>
                for
-                 _ <- ecs.updateService(cluster, ServiceNaming.ecsService(address, live), None, Some(0)).when(canary)
+                 old <- ecs.service(cluster, ServiceNaming.ecsService(address, live))
+                 _   <- ecs.updateService(cluster, ServiceNaming.ecsService(address, live), None, Some(0)).when(canary && old.isDefined)
                  _ <- elb.tag(current.loadBalancer.arn, ManagedTags.converged(current.tags, address, hash, ctx) ++ Map(ColorTag -> next.toString, ImageTag -> image))
                yield ()
     yield ()).mapError(e => ProviderError(address, "deploy", e.message))
