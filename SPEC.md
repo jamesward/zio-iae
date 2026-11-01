@@ -572,7 +572,8 @@ on the Converse backend with a Claude model on Bedrock (`BEDROCK_MODEL_ID`). Eac
 | `ReviewCost` | Cost job findings | workspace edit, `openPr` | A cost report, and PRs for changes worth making |
 | `ReviewSecurity` | Security auditor findings | workspace edit, `runBuild`, `openPr`, `ask` | A security report, fix PRs, or an escalation |
 
-- **System prompts** live in the repo (`agent/prompts/<task>.md`) so they're versioned and reviewed. Each task has
+- **System prompts** live in the repo (`modules/agent/src/main/resources/prompts/<task>.md`) so they're versioned
+  and reviewed. Each task has
   a turn limit, a token budget and a timeout; daily budgets per task kind are enforced from zio-bedrock's usage
   metrics.
 - **Read-only tools:** `observe`, `plan`, `policyExplain`, `status`, CloudWatch logs and metrics queries scoped to
@@ -663,20 +664,31 @@ The engine then combines and checks it deterministically:
   - in prod, `Critical` changes need at least `Approve(1, owners)`;
   - the agent's own policy proposals are never `Auto`.
   The policy can only add to the floor.
-- **Stable per plan.** The verdict is computed once per (policy text hash, change facts hash) and kept in memory,
+- **Stable per plan.** The verdict is computed once per (policy text hash, change facts hash, UTC date of the facts)
+  and kept in memory,
   so re-running a reconcile doesn't re-roll the dice. The executor (§5.11) evaluates independently; if the two
   differ, the more restrictive one wins.
 - **Visible.** The approval request quotes the clauses and the reasoning, so a human can see *why* approval is
   needed, and the verdict, clauses and transcript go into evidence (§6). `iae policy explain` runs the same
   evaluation against a plan without applying anything.
 
-**Testing the policy.** `.iae/policy-examples/*.json` holds example change facts with the expected decision.
-When `POLICY.md` changes, the agent runs `EvaluatePolicy` over every example and posts the results in the
-policy-change approval request, so the owners see how the new wording behaves before approving it. Examples
-whose result changed are highlighted.
+**Testing the policy.** `.iae/policy-examples/<name>.json` holds one example change, `{"facts": <ChangeFacts>,
+"expected": <Decision>}`. When a push changes `POLICY.md` or `.iae/config.json`, the agent decides every example
+under the deployed and the proposed policy (with the fail-safes and floor, as in a plan) and adds the results to
+the policy-change approval request, so the owners see how the new wording behaves before approving it. Examples
+that don't get their expected decision are listed first, and examples whose decision changed are marked.
 
 **Guarding the policy itself.** The policy used for an env is the text at the commit **currently deployed**
-there (read from the `iae:commit` tags, §5.3), not the one being deployed. A change can't loosen its own gate.
+there, not the one being deployed: the newest `iae:commit` tag among the env's managed resources (§5.3). The
+approval settings in `.iae/config.json` (owners, groups, production envs, identities) come from the same commit;
+only the apps to build and the channel come from the target. A change can't loosen its own gate:
+
+- When the target changes `POLICY.md` or `.iae/config.json`, every non-empty plan in that env carries a
+  `PolicyText` change, which the floor gives to the owners, and the request shows the policy examples.
+- The new policy takes effect once an approved plan has applied, because that moves the deployed commit. A push
+  that changes only the policy has nothing to apply, so it takes effect with the next change it gates, which then
+  needs the owners.
+- Before an env's first apply there is no deployed commit, and the target's policy governs (bootstrap).
 
 A typed policy DSL (`.iae/Policy.scala`) can replace or complement the text later. Since both produce the same
 `ChangeVerdict`s, nothing downstream changes (open question Q16).
@@ -1005,7 +1017,7 @@ and the "iae" GitHub App installed.
 | M0 ✅ | Project bootstrap via start.jamesward.com (`AGENTS.md`, sbt 2, CI, sbta) | CI green on an empty module set |
 | M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
-| M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests from each app's command ✅ (CodeBuild builds to follow), Slack approval requests + verification and notices ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` + policy examples; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, Floci; clock control, per-account Floci and scenario steps to follow); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
+| M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests from each app's command ✅ (CodeBuild builds to follow), Slack approval requests + verification and notices ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, Floci, real model when configured; clock control, per-account Floci and scenario steps to follow); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
