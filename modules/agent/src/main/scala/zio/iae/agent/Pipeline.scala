@@ -17,10 +17,37 @@ enum Outcome derives CanEqual:
   case WaitingForPreviousEnv(previous: EnvName)
   case WaitingForApproval(app: AppName, requestTs: String)
   case Stopped(app: AppName, reason: String)
+  /** Handed to the executor, which applies it if its own checks pass. */
+  case Submitted(app: AppName, plan: String)
 
 /** The policy a reconcile is judged by (the deployed one), and the policy change the target proposes, if any. */
 final case class Governance(config: RepoConfig, text: String, proposed: Option[(RepoConfig, String)], deployed: Option[CommitSha] = None):
   def policy: PolicyConfig = config.policy(text)
+
+  /** The facts a plan is judged on: its changes, plus a policy change when the target proposes one. */
+  def facts(plan: Plan, author: Option[String], now: java.time.Instant): List[ChangeFacts] =
+    val policyFact = Option.when(proposed.isDefined && !plan.isEmpty):
+      ChangeFacts(ChangeId("policy"), plan.env, Subject.PolicyText, Risk.High, Set.empty, Origin.Human, author, now)
+    ChangeFacts.of(plan, Origin.Human, author, now) ++ policyFact
+
+object Governance:
+  /** A change can't loosen its own gate: the policy and the approval settings (owners, groups, production envs,
+    * identities) come from the commit deployed in the env, which its resources' `iae:commit` tags say. The apps and
+    * channel come from the target. Before the first apply the target's own policy governs. When the target changes
+    * the policy or the config, its plans carry a policy change, which the floor gives to the owners.
+    */
+  def of(runtime: EnvRuntime, apps: List[Manifest], commit: CommitSha, target: RepoConfig, newText: String)
+      : IO[AgentError, Governance] =
+    for
+      deployed <- runtime.engine.deployed(apps.map(_.app), runtime.env).mapError(AgentError.Engine(_))
+      governance <- deployed.filterNot(_ == commit) match
+                      case None => ZIO.succeed(Governance(target, newText, None, deployed))
+                      case Some(sha) =>
+                        RepoConfig.loadAt(runtime.workspace, sha).map: (old, oldText) =>
+                          val changed = RepoConfig.encode(old.copy(apps = target.apps)) != RepoConfig.encode(target) || oldText.trim != newText.trim
+                          Governance(old.copy(apps = target.apps, slack = old.slack.copy(channel = target.slack.channel)), oldText, Option.when(changed)((target, newText)), deployed)
+    yield governance
+
 
 /** Reconciles one env to the head of the branch: expand, then contract, each through the user's policy. Level-
   * triggered and idempotent: running it again after a crash or a dropped event just does what is left.
@@ -33,6 +60,7 @@ final case class Pipeline(
     approvalExpiry: Duration,
     explainer: Option[PlanExplainer] = None,
     diagnoser: Option[FailureDiagnoser] = None,
+    executor: Option[ApplyQueue] = None,
 ):
   def reconcile(envs: List[EnvRuntime], index: Int): IO[AgentError, Outcome] =
     attempt(envs, index).tapError(failed(envs(index), _))
@@ -68,7 +96,7 @@ final case class Pipeline(
       commit           <- runtime.workspace.sync
       (target, newText) <- RepoConfig.load(runtime.workspace.dir)
       apps             <- manifests.manifests(runtime.workspace.dir, target, commit)
-      governance       <- governance(runtime, apps, commit, target, newText)
+      governance       <- Governance.of(runtime, apps, commit, target, newText)
       authorEmail      <- runtime.workspace.author
       author            = Author(authorEmail, governance.config.identities.get(authorEmail))
       gate             <- ZIO.foreach(Option.when(index > 0)(envs(index - 1)))(previous => converged(previous, apps, commit).map(previous -> _))
@@ -77,23 +105,6 @@ final case class Pipeline(
                    case _                       => applyAll(runtime, governance, author, apps, commit)
       _ <- ZIO.logInfo(s"reconciled ${runtime.env.value} at ${commit.short}: $outcome")
     yield outcome
-
-  /** A change can't loosen its own gate: the policy and the approval settings (owners, groups, production envs,
-    * identities) come from the commit deployed in the env, which its resources' `iae:commit` tags say. The apps and
-    * channel come from the target. Before the first apply the target's own policy governs. When the target changes
-    * the policy or the config, its plans carry a policy change, which the floor gives to the owners.
-    */
-  private def governance(runtime: EnvRuntime, apps: List[Manifest], commit: CommitSha, target: RepoConfig, newText: String)
-      : IO[AgentError, Governance] =
-    for
-      deployed <- runtime.engine.deployed(apps.map(_.app), runtime.env).mapError(AgentError.Engine(_))
-      governance <- deployed.filterNot(_ == commit) match
-                      case None => ZIO.succeed(Governance(target, newText, None, deployed))
-                      case Some(sha) =>
-                        RepoConfig.loadAt(runtime.workspace, sha).map: (old, oldText) =>
-                          val changed = RepoConfig.encode(old.copy(apps = target.apps)) != RepoConfig.encode(target) || oldText.trim != newText.trim
-                          Governance(old.copy(apps = target.apps, slack = old.slack.copy(channel = target.slack.channel)), oldText, Option.when(changed)((target, newText)), deployed)
-    yield governance
 
   /** The previous env is done with this commit when neither phase has anything left to do there. */
   private def converged(previous: EnvRuntime, apps: List[Manifest], commit: CommitSha): IO[AgentError, Boolean] =
@@ -121,8 +132,8 @@ final case class Pipeline(
     val config = governance.config
     for
       plan     <- runtime.engine.plan(manifest, runtime.env, Some(commit), phase).mapError(AgentError.Engine(_))
-      decision <- decide(governance.policy, plan, governance.proposed.isDefined, author.slack)
-      done      = applied(runtime, governance, author, plan, decision, commit)
+      decision <- decide(governance, plan, author.slack)
+      done      = applied(runtime, governance, author, plan, decision, commit, approvals)
       outcome <- (plan.isEmpty, decision.decision) match
                    case (true, _)                => ZIO.succeed(Outcome.Converged(commit))
                    case (_, Decision.Auto)       => done("the policy lets it go ahead", None)
@@ -130,18 +141,16 @@ final case class Pipeline(
                    case (_, approve: Decision.Approve) =>
                      approvals.status(plan, decision, approve, author.slack, examples(runtime, governance), explain(config, plan, decision)).flatMap:
                        case ApprovalStatus.Approved(by, request) =>
-                         val approval = ApprovalEvidence(config.slack.channel, request.ts, by.toList.sorted)
-                         done(s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", Some(approval)) <* approvals.applied(request)
+                         done(s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", Some(request -> by))
                        case ApprovalStatus.Rejected(by, _) => stopped(config, plan, decision, s"<@$by> rejected it")
                        case ApprovalStatus.Pending(ts)   => ZIO.succeed(Outcome.WaitingForApproval(plan.app, ts))
     yield outcome
 
-  private def decide(policy: PolicyConfig, plan: Plan, policyChange: Boolean, author: Option[String]): UIO[PlanDecision] =
+  private def decide(governance: Governance, plan: Plan, author: Option[String]): UIO[PlanDecision] =
+    val policy = governance.policy
     for
       now      <- Clock.instant
-      policyFact = Option.when(policyChange && !plan.isEmpty):
-                     ChangeFacts(ChangeId("policy"), plan.env, Subject.PolicyText, Risk.High, Set.empty, Origin.Human, author, now)
-      facts     = ChangeFacts.of(plan, Origin.Human, author, now) ++ policyFact
+      facts     = governance.facts(plan, author, now)
       verdicts <- evaluator.evaluate(policy, facts).catchAll(e => ZIO.logWarning(s"policy evaluation failed, asking the owners: $e").as(Nil))
     yield Verdicts.decide(facts, verdicts, policy)
 
@@ -162,33 +171,20 @@ final case class Pipeline(
         .flatMap(PolicyExamples.run(evaluator, governance.policy, config.policy(text), _))
         .map(PolicyExamples.report)
 
-  private def applied(runtime: EnvRuntime, governance: Governance, author: Author, plan: Plan, decision: PlanDecision, commit: CommitSha)(
+  /** In process, or through the executor when there is one: the agent then only asks, and the executor checks
+    * everything again before applying.
+    */
+  private def applied(runtime: EnvRuntime, governance: Governance, author: Author, plan: Plan, decision: PlanDecision, commit: CommitSha, approvals: Approvals)(
       why: String,
-      approval: Option[ApprovalEvidence],
+      approval: Option[(SlackMessage, Set[String])],
   ): IO[AgentError, Outcome] =
-    val config = governance.config
-    for
-      report <- runtime.engine.apply(plan).mapError(AgentError.Engine(_))
-      _      <- notice(config, s"Applied ${report.applied.size} change(s) to ${plan.app.value}/${plan.env.value} at `${commit.short}` ($why)\n```\n${PlanText.render(plan)}\n```")
-      now    <- Clock.instant
-      change  = ChangeEvidence(
-                  plan.app.value,
-                  plan.env.value,
-                  commit.value,
-                  author.email,
-                  author.slack,
-                  governance.deployed.map(_.value),
-                  plan.hash.value,
-                  plan.phase.toString,
-                  PlanText.render(plan).linesIterator.drop(1).map(_.trim).toList,
-                  PlanText.describe(decision.decision),
-                  decision.changes.flatMap(c => c.reasons.map(r => s"${c.change.value}: $r")),
-                  approval,
-                  report.applied.map(_.show),
-                  now,
-                )
-      _ <- ZIO.foreachDiscard(runtime.evidence)(_.record(change).catchAll(e => ZIO.logError(s"evidence for ${plan.app.value}/${plan.env.value} plan ${plan.hash.short}: $e")))
-    yield Outcome.Converged(commit)
+    executor match
+      case Some(queue) =>
+        queue
+          .submit(ApplyRequest(runtime.env.value, plan.app.value, commit.value, plan.phase.toString, plan.hash.value, approval.map(_._1.ts), author.email))
+          .as(Outcome.Submitted(plan.app, plan.hash.short))
+      case None =>
+        Applying.run(slack, runtime, governance, author, plan, decision, commit, why, approval, approvals).as(Outcome.Converged(commit))
 
   /** Stopping is announced once per plan, not on every reconcile. */
   private def stopped(config: RepoConfig, plan: Plan, decision: PlanDecision, why: String): IO[AgentError, Outcome] =

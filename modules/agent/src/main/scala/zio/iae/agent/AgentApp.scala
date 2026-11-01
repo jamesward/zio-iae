@@ -14,21 +14,22 @@ import zio.iae.engine.policy.RiskTableEvaluator
   * `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` (and `IAE_BEDROCK_ENDPOINT` for a Converse-compatible origin); without
   * them the default risk table applies. The AWS credentials are the agent's own (the tooling account, where the inbox
   * is); envs with an account in `.iae/config.json` are reached through its roles. A change to the envs or accounts
-  * takes a restart.
+  * takes a restart. With `IAE_EXECUTOR_QUEUE_URL` the agent never applies: it plans with the env accounts' planner
+  * roles only and sends what it would apply to the executor (`ExecutorApp`).
   */
 object AgentApp extends ZIOAppDefault:
-  private def env(name: String): IO[AgentError, Option[String]] =
+  def env(name: String): IO[AgentError, Option[String]] =
     System.env(name).orElseFail(AgentError.Config(s"cannot read $name")).map(_.filter(_.nonEmpty))
 
-  private def required(name: String): IO[AgentError, String] = env(name).someOrFail(AgentError.Config(s"$name is not set"))
+  def required(name: String): IO[AgentError, String] = env(name).someOrFail(AgentError.Config(s"$name is not set"))
 
-  private def number(name: String, default: Int): IO[AgentError, Int] =
+  def number(name: String, default: Int): IO[AgentError, Int] =
     env(name).flatMap(v => ZIO.fromOption(v.map(_.toIntOption)).orElseSucceed(Some(default)).someOrFail(AgentError.Config(s"$name must be a number")))
 
   /** CodeBuild with `IAE_BUILD_BUCKET` and `IAE_BUILD_ROLE` (the builds' service role), and optionally
     * `IAE_BUILD_IMAGE`; without them, builds run in the agent, which is only for development.
     */
-  private def buildsFrom(base: AwsConfig, http: Client): IO[AgentError, ManifestSource] =
+  def buildsFrom(base: AwsConfig, http: Client): IO[AgentError, ManifestSource] =
     env("IAE_BUILD_BUCKET").flatMap:
       case None =>
         ZIO.logWarning("IAE_BUILD_BUCKET is not set: builds run inside the agent, with its credentials (development only)").as(CommandManifests())
@@ -80,9 +81,11 @@ object AgentApp extends ZIOAppDefault:
         _         <- bootstrap.sync
         (config, _) <- RepoConfig.load(bootstrap.dir)
         base        <- ZIO.service[AwsConfig]
+        executorUrl <- env("IAE_EXECUTOR_QUEUE_URL")
         envs <- ZIO.foreach(config.envs): name =>
                   val workspace = GitWorkspace(workdir.resolve(name.value).nn, repo, branch)
-                  EnvRuntimes.make(name, config.accounts.get(name.value), base, BucketNaming(suffix), workspace)
+                  EnvRuntimes.make(name, config.accounts.get(name.value), base, BucketNaming(suffix), workspace, canApply = executorUrl.isEmpty)
+        sqs         <- ZIO.service[SqsClient]
         http        <- ZIO.service[Client]
         slack        = SlackWebApi(http, SlackToken(token), slackBase)
         self        <- slack.identity
@@ -94,10 +97,9 @@ object AgentApp extends ZIOAppDefault:
         prs         <- pullRequests(repo, http)
         diagnoser   <- ZIO.foreach(model)(DiagnoseFailure.make(_, prs))
         manifests   <- buildsFrom(base, http)
-        pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours, explainer, diagnoser)
+        pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours, explainer, diagnoser, executorUrl.map(u => SqsApplyQueue(sqs, QueueUrl(u))))
         reconcilers <- Reconcilers.make(pipeline, envs)
         talk        <- ZIO.foreach(model)(m => Converse.make(slack, self, m, envs, manifests).flatMap(Conversations.make))
-        sqs         <- ZIO.service[SqsClient]
         _           <- ZIO.logInfo(s"agent started for $repo ($branch): envs ${config.envs.map(_.value).mkString(", ")}")
         _           <- Agent(reconcilers, InboxConsumer(sqs, QueueUrl(inboxUrl), branch, reconcilers, talk), every.minutes).run
       yield ()

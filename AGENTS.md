@@ -44,6 +44,7 @@ and deployments. The design is in [`SPEC.md`](SPEC.md); read it before working.
 | `engine` (`iae-engine`) | `modules/engine` | published library | LTS |
 | `cli` (`iae-cli`) | `modules/cli` | application (`JavaAppPackaging`) | Next |
 | `agent` (`iae-agent`) | `modules/agent` | server (`JavaAppPackaging`) | Next |
+| `executor` (`iae-executor`) | `modules/executor` | server (`JavaAppPackaging`): the only principal that applies | Next |
 | `webhook` (`iae-webhook`) | `modules/webhook` | HTTP server (`JavaAppPackaging`; Lambda Web Adapter) | Next |
 | `photoApp` (`photo-app`) | `examples/photo-app` | example `InfraApp` (`JavaAppPackaging`) | Next |
 
@@ -66,11 +67,12 @@ modules override it with `scalaNext`. Applications are `publish / skip`.
 - Local harness: `./sbta agent/Test/run` (Docker needed) serves http://localhost:8088 (`IAE_HARNESS_PORT`): a
   fake Slack channel you can act in as different people, a GitHub panel that edits the seeded repo and pushes, the
   agent's clock (60x by default, with +1h/+1d jumps) and scenario buttons. Pushes and reactions go through the real
-  webhook and an SQS inbox on Floci to the real agent; staging and prod each get their own Floci (account), reached
+  webhook and an SQS inbox on Floci to the real agent, which hands applies to the real executor; staging and prod each get their own Floci (account), reached
   through assumed roles. With `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` set, a real model evaluates
   `POLICY.md`. `HarnessSpec` drives the loop in tests and `ScenarioSpec` runs every scenario headlessly.
-- The agent (`agent`, main `AgentApp`) and the webhook (`webhook`, main `WebhookServer`) are configured by
-  environment variables documented on those objects.
+- The agent (`agent`, main `AgentApp`), the executor (`executor`, main `ExecutorApp`) and the webhook (`webhook`,
+  main `WebhookServer`) are configured by environment variables documented on those objects. The executor's logic
+  (`ExecutorService`) lives in `agent`, so the harness runs it in-process.
 - Gated tests (none yet; planned in `SPEC.md` §4): real-AWS contract tests behind `IAE_AWS_CONTRACT_TESTS=1`,
   real-model policy evals, and the nightly sandbox smoke test. All are paid and stay out of the default
   validation.

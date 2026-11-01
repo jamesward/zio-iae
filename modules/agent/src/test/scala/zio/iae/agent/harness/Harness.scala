@@ -11,7 +11,7 @@ import zio.iae.engine.policy.{RiskTableEvaluator, SlackGroup}
 import zio.iae.testkit.{AuditManagerFake, FlociLayer}
 import zio.iae.webhook.*
 
-/** The local harness: the real agent and webhook, with GitHub and Slack emulated and AWS on Floci. Only the LLM is
+/** The local harness: the real agent, executor and webhook, with GitHub and Slack emulated and AWS on Floci. Only the LLM is
   * real: with `AWS_BEARER_TOKEN_BEDROCK` and `BEDROCK_MODEL_ID` set, `POLICY.md` is evaluated by that model, otherwise
   * by the default risk table.
   */
@@ -112,18 +112,23 @@ object Harness:
       self     <- client.identity.mapError(_.message)
       tooling  <- ZIO.service[AwsConfig]
       audit    <- AuditManagerFake.make.mapError(_.getMessage)
-      envs <- ZIO.foreach(envNames): env =>
-                val base = accounts.getOrElse(env, tooling)
-                for
-                  account <- ZIO.foreach(accounts.get(env))(bootstrapAccount(env, _))
-                  runtime <- EnvRuntimes.make(env, account, base, BucketNaming(None), repo.workspace(env), Endpoint.parse(audit.url.encode).toOption).mapError(_.message)
-                yield runtime
+      bootstrapped <- ZIO.foreach(envNames)(env => ZIO.foreach(accounts.get(env))(bootstrapAccount(env, _)).map(env -> _))
+      auditAt   = Endpoint.parse(audit.url.encode).toOption
+      // The agent plans with the planner roles only; the executor, with its own checkouts, applies as the deployer.
+      envs <- ZIO.foreach(bootstrapped): (env, account) =>
+                EnvRuntimes.make(env, account, accounts.getOrElse(env, tooling), BucketNaming(None), repo.workspace(env), auditAt, canApply = false).mapError(_.message)
+      executorEnvs <- ZIO.foreach(bootstrapped): (env, account) =>
+                        val workspace = GitWorkspace(repo.root.resolve("executor").nn.resolve(env.value).nn, repo.remote.toString, "main")
+                        EnvRuntimes.make(env, account, accounts.getOrElse(env, tooling), BucketNaming(None), workspace, auditAt).mapError(_.message)
+      executorUrl <- sqs.createQueue(s"iae-harness-executor-${envNames.map(_.value).mkString("-")}", Map.empty, Map.empty).mapError(_.message)
       // Builds run in the tooling account's CodeBuild (Floci runs them as containers).
       buildsAt  = BucketName.from(s"iae-builds-${envNames.head.value}").toOption.get
       builds   <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, tooling)), S3Client(http, tooling), buildsAt, "arn:aws:iam::000000000000:role/iae-build", "alpine:3.20")
                     .mapError(_.message)
       pulls    <- LocalPullRequests.make(repo.remote.toString)
       scope    <- ZIO.scope
+      executor  = ExecutorService(SlackWebApi(http, SlackToken("xoxb-executor"), base), self, executorEnvs, builds, SqsInbox(sqs, inboxUrl), 24.hours)
+      _        <- ZIO.withClock(clock)(executor.consume(sqs, executorUrl)).forkIn(scope)
       httpEnv  <- ZIO.environment[Client]
       start = (for
                 model     <- Model.fromEnvironment.provideEnvironment(httpEnv).mapError(_.message)
@@ -132,7 +137,7 @@ object Harness:
                                  .as(RiskTableEvaluator(SlackGroup.from("infra-approvers").toOption.get))
                 explainer <- ZIO.foreach(model)(ExplainPlan.make).mapError(_.message)
                 diagnoser <- ZIO.foreach(model)(DiagnoseFailure.make(_, Some(pulls))).mapError(_.message)
-                pipeline     = Pipeline(builds, evaluator, client, self, 24.hours, explainer, diagnoser)
+                pipeline     = Pipeline(builds, evaluator, client, self, 24.hours, explainer, diagnoser, Some(SqsApplyQueue(sqs, executorUrl)))
                 reconcilers <- Reconcilers.make(pipeline, envs)
                 talk        <- ZIO.foreach(model)(m => Converse.make(client, self, m, envs, builds).flatMap(Conversations.make)).mapError(_.message)
                 fiber       <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers, talk), 15.minutes).run).forkIn(scope)

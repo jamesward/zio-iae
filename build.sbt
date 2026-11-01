@@ -103,6 +103,16 @@ lazy val agent = (project in file("modules/agent"))
     Test / mainClass := Some("zio.iae.agent.harness.AppTest"),
   )
 
+lazy val executor = (project in file("modules/executor"))
+  .dependsOn(agent)
+  .enablePlugins(JavaAppPackaging)
+  .settings(
+    name := "iae-executor",
+    scalaVersion := scalaNext,
+    publish / skip := true,
+    Compile / mainClass := Some("zio.iae.executor.ExecutorApp"),
+  )
+
 lazy val webhook = (project in file("modules/webhook"))
   .dependsOn(engine, testkit % Test)
   .enablePlugins(JavaAppPackaging)
@@ -125,7 +135,7 @@ lazy val photoApp = (project in file("examples/photo-app"))
   )
 
 lazy val root = (project in file("."))
-  .aggregate(core, awsClient, aws, testkit, engine, cli, agent, webhook, photoApp)
+  .aggregate(core, awsClient, aws, testkit, engine, cli, agent, executor, webhook, photoApp)
   .settings(name := "zio-iae", publish / skip := true)
 
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`

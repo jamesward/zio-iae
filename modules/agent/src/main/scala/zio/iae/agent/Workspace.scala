@@ -21,6 +21,17 @@ final case class GitWorkspace(dir: Path, remote: String, branch: String):
   /** The email of the head commit's author. */
   def author: IO[AgentError, String] = git("log", "-1", "--format=%ae")
 
+  /** The email of a commit's author. */
+  def authorOf(commit: CommitSha): IO[AgentError, String] = git("log", "-1", "--format=%ae", commit.value)
+
+  /** Whether `commit` is on the branch: the head or one of its ancestors. */
+  def contains(commit: CommitSha, head: CommitSha): IO[AgentError, Boolean] =
+    git("merge-base", "--is-ancestor", commit.value, head.value).as(true).catchSome:
+      case AgentError.Git(detail) if detail.contains("exited 1") => ZIO.succeed(false)
+
+  /** Checks out a commit (detached), e.g. to work on what an older reconcile planned. */
+  def checkout(commit: CommitSha): IO[AgentError, Unit] = git("checkout", "--quiet", "--force", "--detach", commit.value).unit
+
   /** A file's content at a commit, or None if the file doesn't exist there. */
   def show(commit: CommitSha, path: String): IO[AgentError, Option[String]] =
     git("ls-tree", "--name-only", commit.value, "--", path).flatMap: listed =>
