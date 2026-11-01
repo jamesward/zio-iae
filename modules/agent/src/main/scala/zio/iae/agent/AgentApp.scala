@@ -40,6 +40,29 @@ object AgentApp extends ZIOAppDefault:
           builds <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, base)), S3Client(http, base), bucket, role, image)
         yield builds
 
+  /** The GitHub App the agent opens pull requests as: `IAE_GITHUB_APP_ID`, `IAE_GITHUB_INSTALLATION_ID` and the private
+    * key in `IAE_GITHUB_APP_KEY` (PEM) or `IAE_GITHUB_APP_KEY_FILE`; `IAE_GITHUB_API` for GitHub Enterprise. Without
+    * them the agent diagnoses failures but doesn't propose fixes.
+    */
+  private def pullRequests(repoUrl: String, http: Client): IO[AgentError, Option[PullRequests]] =
+    for
+      appId        <- env("IAE_GITHUB_APP_ID")
+      installation <- env("IAE_GITHUB_INSTALLATION_ID")
+      keyText      <- env("IAE_GITHUB_APP_KEY")
+      keyFile      <- env("IAE_GITHUB_APP_KEY_FILE")
+      key          <- ZIO.foreach(keyText.map(Right(_)).orElse(keyFile.map(Left(_)))):
+                        case Right(k)   => ZIO.succeed(k)
+                        case Left(file) => ZIO.attemptBlocking(java.nio.file.Files.readString(Paths.get(file)).nn).mapError(e => AgentError.Config(s"reading $file: ${e.getMessage}"))
+      api          <- env("IAE_GITHUB_API").map(_.getOrElse("https://api.github.com")).flatMap(a => ZIO.fromEither(URL.decode(a)).orElseFail(AgentError.Config(s"IAE_GITHUB_API is not a URL: $a")))
+      prs <- (appId, installation, key) match
+               case (Some(id), Some(inst), Some(pem)) =>
+                 for
+                   repo <- ZIO.fromEither(GitHubRepo.fromUrl(repoUrl)).mapError(AgentError.Config(_))
+                   app  <- GitHubApp.make(http, api, id, pem, inst).mapError(AgentError.Config(_))
+                 yield Some(GitHubPullRequests(app, repo))
+               case _ => ZIO.logWarning("no GitHub App configured: failures are diagnosed but no fixes are proposed").as(None)
+    yield prs
+
   def run: ZIO[Any, Any, Any] =
     val program =
       for
@@ -68,7 +91,8 @@ object AgentApp extends ZIOAppDefault:
                          ZIO.logWarning("no Bedrock model configured: using the default risk table instead of POLICY.md")
                            .as(RiskTableEvaluator(config.slack.groups.headOption.getOrElse(config.slack.owners)))
         explainer   <- ZIO.foreach(model)(ExplainPlan.make)
-        diagnoser   <- ZIO.foreach(model)(DiagnoseFailure.make)
+        prs         <- pullRequests(repo, http)
+        diagnoser   <- ZIO.foreach(model)(DiagnoseFailure.make(_, prs))
         manifests   <- buildsFrom(base, http)
         pipeline     = Pipeline(manifests, evaluator, slack, self, expiry.hours, explainer, diagnoser)
         reconcilers <- Reconcilers.make(pipeline, envs)

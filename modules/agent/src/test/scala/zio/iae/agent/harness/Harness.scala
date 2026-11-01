@@ -25,6 +25,7 @@ final case class Harness(
     agent: AgentProcess,
     s3: List[S3Client],
     audit: AuditManagerFake,
+    pulls: LocalPullRequests,
 )
 
 /** The agent as a process the harness can stop and start; a restart loses everything in memory, like a new
@@ -121,6 +122,7 @@ object Harness:
       buildsAt  = BucketName.from(s"iae-builds-${envNames.head.value}").toOption.get
       builds   <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, tooling)), S3Client(http, tooling), buildsAt, "arn:aws:iam::000000000000:role/iae-build", "alpine:3.20")
                     .mapError(_.message)
+      pulls    <- LocalPullRequests.make(repo.remote.toString)
       scope    <- ZIO.scope
       httpEnv  <- ZIO.environment[Client]
       start = (for
@@ -129,7 +131,7 @@ object Harness:
                                ZIO.logInfo("no Bedrock model configured: the harness uses the default risk table instead of POLICY.md")
                                  .as(RiskTableEvaluator(SlackGroup.from("infra-approvers").toOption.get))
                 explainer <- ZIO.foreach(model)(ExplainPlan.make).mapError(_.message)
-                diagnoser <- ZIO.foreach(model)(DiagnoseFailure.make).mapError(_.message)
+                diagnoser <- ZIO.foreach(model)(DiagnoseFailure.make(_, Some(pulls))).mapError(_.message)
                 pipeline     = Pipeline(builds, evaluator, client, self, 24.hours, explainer, diagnoser)
                 reconcilers <- Reconcilers.make(pipeline, envs)
                 talk        <- ZIO.foreach(model)(m => Converse.make(client, self, m, envs, builds).flatMap(Conversations.make)).mapError(_.message)
@@ -137,7 +139,7 @@ object Harness:
               yield (fiber, reconcilers))
       agent    <- AgentProcess.make(start)
       s3        = envNames.map(env => S3Client(http, accounts.getOrElse(env, tooling)))
-      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3, audit)
+      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3, audit, pulls)
       _        <- started.succeed(harness)
     yield harness
 
