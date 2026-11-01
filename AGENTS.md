@@ -44,7 +44,7 @@ and deployments. The design is in [`SPEC.md`](SPEC.md); read it before working.
 | `engine` (`iae-engine`) | `modules/engine` | published library | LTS |
 | `cli` (`iae-cli`) | `modules/cli` | application (`JavaAppPackaging`) | Next |
 | `agent` (`iae-agent`) | `modules/agent` | server (`JavaAppPackaging`) | Next |
-| `webhook` (`iae-webhook`) | `modules/webhook` | Lambda | Next |
+| `webhook` (`iae-webhook`) | `modules/webhook` | HTTP server (`JavaAppPackaging`; Lambda Web Adapter) | Next |
 | `photoApp` (`photo-app`) | `examples/photo-app` | example `InfraApp` (`JavaAppPackaging`) | Next |
 
 The library modules set `scalaVersion` to the Scala LTS (bare setting in `build.sbt`); the application
@@ -63,6 +63,12 @@ modules override it with `scalaNext`. Applications are `publish / skip`.
 - The `iae` CLI (after `cli/stage`, at `target/out/jvm/scala-3.10.0/iae-cli/universal/stage/bin/iae`), with the same
   AWS variables: `photo-app --iae-manifest | iae plan --env dev`, then `iae apply --env dev`. Without an LLM it
   applies the default risk table (dev free, prod strict); exit code 2 means policy needs an approval.
+- Local harness: `./sbta agent/Test/run` (Docker needed) serves http://localhost:8088 (`IAE_HARNESS_PORT`): a
+  fake Slack channel you can act in as different people, and a GitHub panel that edits the seeded repo and pushes.
+  Pushes and reactions go through the real webhook and an SQS inbox on Floci to the real agent. `HarnessSpec`
+  drives the same loop in tests.
+- The agent (`agent`, main `AgentApp`) and the webhook (`webhook`, main `WebhookServer`) are configured by
+  environment variables documented on those objects.
 - Gated tests (none yet; planned in `SPEC.md` §4): real-AWS contract tests behind `IAE_AWS_CONTRACT_TESTS=1`,
   real-model policy evals, and the nightly sandbox smoke test. All are paid and stay out of the default
   validation.

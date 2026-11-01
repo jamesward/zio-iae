@@ -94,12 +94,25 @@ lazy val cli = (project in file("modules/cli"))
 lazy val agent = (project in file("modules/agent"))
   .dependsOn(engine, webhook, testkit % Test)
   .enablePlugins(JavaAppPackaging)
-  .settings(name := "iae-agent", scalaVersion := scalaNext, publish / skip := true, libraryDependencies ++= zioTest)
+  .settings(
+    name := "iae-agent",
+    scalaVersion := scalaNext,
+    publish / skip := true,
+    libraryDependencies ++= zioTest,
+    Compile / mainClass := Some("zio.iae.agent.AgentApp"),
+    Test / mainClass := Some("zio.iae.agent.harness.AppTest"),
+  )
 
 lazy val webhook = (project in file("modules/webhook"))
   .dependsOn(engine, testkit % Test)
   .enablePlugins(JavaAppPackaging)
-  .settings(name := "iae-webhook", scalaVersion := scalaNext, publish / skip := true, libraryDependencies ++= zioTest)
+  .settings(
+    name := "iae-webhook",
+    scalaVersion := scalaNext,
+    publish / skip := true,
+    libraryDependencies ++= zioTest,
+    Compile / mainClass := Some("zio.iae.webhook.WebhookServer"),
+  )
 
 lazy val photoApp = (project in file("examples/photo-app"))
   .dependsOn(aws, testkit % Test)

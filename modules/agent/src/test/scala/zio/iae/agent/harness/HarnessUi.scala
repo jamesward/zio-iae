@@ -1,0 +1,58 @@
+package zio.iae.agent.harness
+
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
+import zio.*
+import zio.http.*
+import zio.iae.agent.TestRepo
+import zio.iae.webhook.{Signatures, Webhook, WebhookSecret}
+import zio.schema.{Schema, derived}
+import zio.schema.codec.JsonCodec
+
+final case class ReactAction(ts: String, user: String, reaction: String) derives Schema
+final case class ReplyAction(thread: String, user: String, text: String) derives Schema
+final case class PushAction(files: Map[String, String], message: String) derives Schema
+final case class HarnessState(users: List[FakeUser], channel: String, messages: List[FakeMessage], files: Map[String, String], commits: List[String])
+    derives Schema
+
+/** The harness's web UI: the Slack channel (as anyone), and a GitHub panel that edits files and pushes. A push sends
+  * a signed GitHub push event through the real webhook, like GitHub would.
+  */
+final case class HarnessUi(slack: FakeSlack, repo: TestRepo, webhook: Webhook, githubSecret: WebhookSecret, editable: List[String]):
+  val routes: Routes[Any, Nothing] = Routes(
+    Method.GET / ""         -> handler(Response(body = Body.fromString(HarnessPage.html), headers = Headers(Header.ContentType(MediaType.text.html)))),
+    Method.GET / "ui" / "state" -> handler(state.map(s => Response.json(JsonCodec.jsonEncoder(Schema[HarnessState]).encodeJson(s, None).toString)).orElseSucceed(Response.status(Status.InternalServerError))),
+    Method.POST / "ui" / "react" -> handler((req: Request) => act[ReactAction](req)(a => slack.react(a.ts, a.user, a.reaction))),
+    Method.POST / "ui" / "reply" -> handler((req: Request) => act[ReplyAction](req)(a => slack.reply(a.thread, a.user, a.text))),
+    Method.POST / "ui" / "push"  -> handler((req: Request) => act[PushAction](req)(a => push(a.files, a.message))),
+  )
+
+  def push(files: Map[String, String], message: String): IO[String, Unit] =
+    for
+      sha     <- repo.commit(files, message)
+      body     = s"""{"ref":"refs/heads/main","after":"${sha.value}","repository":{"full_name":"local/harness"}}"""
+      request  = Request.post(URL.root / "github", Body.fromString(body)).addHeaders(
+                   Headers(
+                     Header.Custom("x-github-event", "push"),
+                     Header.Custom("x-github-delivery", sha.short),
+                     Header.Custom("x-hub-signature-256", Signatures.github(githubSecret, body.getBytes(UTF_8))),
+                   )
+                 )
+      response <- webhook.github(request)
+      _        <- ZIO.fail(s"webhook answered ${response.status.code}").unless(response.status.isSuccess)
+    yield ()
+
+  private def state: IO[String, HarnessState] =
+    for
+      messages <- slack.messages.get
+      files <- ZIO.foreach(editable)(f => ZIO.attemptBlocking(f -> Files.readString(repo.authorClone.resolve(f), UTF_8).nn).mapError(_.getMessage))
+      log   <- zio.iae.agent.Process.run(repo.authorClone, Seq("git", "log", "--format=%h %s", "-n", "20"), 30.seconds)
+    yield HarnessState(slack.bot :: slack.users, slack.channel, messages.toList, files.toMap, log.linesIterator.toList)
+
+  private def act[A: Schema](req: Request)(f: A => IO[String, Unit]): UIO[Response] =
+    req.body.asString
+      .mapError(_.getMessage)
+      .flatMap(body => ZIO.fromEither(JsonCodec.jsonDecoder(Schema[A]).decodeJson(body)))
+      .flatMap(f)
+      .as(Response.ok)
+      .catchAll(e => ZIO.logWarning(s"harness action failed: $e").as(Response.text(e).status(Status.BadRequest)))
