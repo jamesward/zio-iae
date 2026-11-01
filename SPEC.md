@@ -572,6 +572,18 @@ on the Converse backend with a Claude model on Bedrock (`BEDROCK_MODEL_ID`). Eac
 | `ReviewCost` | Cost job findings | workspace edit, `openPr` | A cost report, and PRs for changes worth making |
 | `ReviewSecurity` | Security auditor findings | workspace edit, `runBuild`, `openPr`, `ask` | A security report, fix PRs, or an escalation |
 
+**Built so far** (each needs a model configured; without one the agent runs without them):
+
+- `ExplainPlan` replies in a new approval request's thread, in the background; a failure is only logged.
+- `DiagnoseFailure` runs when a reconcile fails. The failure is posted once per env, commit and kind of failure,
+  and the diagnosis goes in that post's thread. Its read-only tools (`listFiles`, `readFile`, `search`) read the
+  failing commit from git's objects, so no checkout moves. With a GitHub App configured it also has `writeFile`,
+  which edits a scratch clone of the failing commit, and `openPullRequest`, which pushes one `iae/fix-<sha>-<n>`
+  branch and opens one pull request per failure. The push URL's token is redacted from any error text.
+- `Converse` answers in the agent's threads and when it's mentioned. It answers only the latest message, only from
+  members of the policy's groups, and handles conversations one at a time so no thread is answered twice. Its tools
+  are read-only (`status`, `plan`, `policy`); `ask`, `notify`, `openPr` and `requestReconcile` are still to come.
+
 - **System prompts** live in the repo (`modules/agent/src/main/resources/prompts/<task>.md`) so they're versioned
   and reviewed. Each task has
   a turn limit, a token budget and a timeout; daily budgets per task kind are enforced from zio-bedrock's usage
@@ -932,7 +944,9 @@ The agent runs in its own **tooling account** on ECS Fargate with a task role. T
 
 Other credentials, in Secrets Manager in the tooling account:
 
-- **GitHub App** "iae": private key and webhook secret. Installation tokens for cloning, branches, PRs, statuses,
+- **GitHub App** "iae" (`IAE_GITHUB_APP_ID`, `IAE_GITHUB_INSTALLATION_ID`, and `IAE_GITHUB_APP_KEY` or
+  `IAE_GITHUB_APP_KEY_FILE`): private key and webhook secret. The agent signs app JWTs (RS256) with the key, and
+  keeps installation tokens until five minutes before they expire. Installation tokens for cloning, branches, PRs, statuses,
   deployments, and reading reviews for evidence. Branch protection lets the app push only `iae/` branches.
 - **Slack**: bot token and Socket Mode app token.
 - **Bedrock**: zio-bedrock authenticates with a Bedrock API key (bearer token), not SigV4. The agent mints
@@ -969,6 +983,12 @@ Other credentials, in Secrets Manager in the tooling account:
 - An assessment over that framework scoped to the env account, plus optionally a standard framework (such as SOC 2)
   so CloudTrail/Config automated evidence about the same resources sits next to ours.
 - An evidence bucket `iae-evidence-<env>` with Object Lock (compliance mode) and versioning.
+
+`.iae/config.json` points each env at its evidence: `accounts.<env>.audit` with the bucket, the assessment, the
+control set and the id of each IAE control. Evidence is written with the env's deployer role to
+`iae/evidence/<env>/<app>/<sha>/<plan>-<phase>/<control>.json`. A failure to record evidence is reported, and the
+apply it describes stands. So far the agent records `IAE-CM-1` and `IAE-CM-3` for every apply; `IAE-CM-2`,
+`IAE-CM-4` and `IAE-CM-5` come with builds' tests, deploys and break-glass.
 
 For each reconcile of an env, the engine writes one JSON evidence document per control to the evidence bucket
 (commit, PR + reviewers, test summary, plan hash + changes, approval refs, per-change apply results, CloudTrail event IDs,
@@ -1041,7 +1061,7 @@ and the "iae" GitHub App installed.
 | M1 ✅ | `iae-core` model; `iae-aws-client` SigV4 + S3; `Bucket` capability + provider; `FlociLayer`; manifest | Example app reads and writes a bucket on Floci; provider convergence tests pass |
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
-| M4 | zio-bedrock tasks: `ExplainPlan`, `DiagnoseFailure`, `Converse`; agent-authored PRs; `ScriptedModel` tests; Audit Manager evidence; executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
+| M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 | `Service` + ECR + ALB canary + auto-rollback; harness traffic generator and fault controls | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
