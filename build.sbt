@@ -81,9 +81,15 @@ lazy val engine = (project in file("modules/engine"))
 // Applications (Scala Next, not published)
 
 lazy val cli = (project in file("modules/cli"))
-  .dependsOn(engine)
+  .dependsOn(engine, testkit % Test)
   .enablePlugins(JavaAppPackaging)
-  .settings(name := "iae-cli", scalaVersion := scalaNext, publish / skip := true)
+  .settings(
+    name := "iae-cli",
+    scalaVersion := scalaNext,
+    publish / skip := true,
+    executableScriptName := "iae",
+    libraryDependencies ++= zioTest,
+  )
 
 lazy val agent = (project in file("modules/agent"))
   .dependsOn(engine)
