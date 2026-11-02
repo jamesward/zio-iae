@@ -58,6 +58,20 @@ object Service:
     val publishes = Chunk.fromIterable(Option.when(id.spec.canary.alarms.nonEmpty)(Grant(id.logicalId, ResourceKind.Service, Capability.MetricsPublish)))
     Infra(resources = Chunk(ResourceDecl(id.logicalId, ResourceSpec.Service(id.spec))), grants = publishes, layer = ZLayer.empty)
 
+  /** Whether Fargate offers a task of this CPU (units) and memory (MiB). */
+  def fargate(cpu: Int, memory: Int): Boolean =
+    val gib = 1024
+    val sizes: Map[Int, Seq[Int]] = Map(
+      256   -> Seq(512, 1024, 2048),
+      512   -> (1 to 4).map(_ * gib),
+      1024  -> (2 to 8).map(_ * gib),
+      2048  -> (4 to 16).map(_ * gib),
+      4096  -> (8 to 30).map(_ * gib),
+      8192  -> (16 to 60 by 4).map(_ * gib),
+      16384 -> (32 to 120 by 8).map(_ * gib),
+    )
+    sizes.get(cpu).exists(_.contains(memory))
+
   /** The namespace an app's own metrics go to. */
   def metricsNamespace(app: AppName): String = s"iae/${app.value}"
 
@@ -69,4 +83,5 @@ object Service:
     names.find(n => !alarmName.matches(n)).map(n => s"alarm name '$n' must be lowercase letters, digits and dashes (at most 32)")
       .orElse(Option.when(names.distinct.size != names.size)(s"alarm names must be distinct: ${names.mkString(", ")}"))
       .orElse(Option.when(spec.canary.maxErrors < 1)("maxErrors must be at least 1"))
+      .orElse(Option.unless(fargate(spec.cpu, spec.memory))(s"Fargate has no task size of ${spec.cpu} CPU units with ${spec.memory} MiB of memory"))
       .orElse(spec.canary.latency.filter(_.millis < 1).map(_ => "the latency gate must be at least 1 ms"))

@@ -82,7 +82,12 @@ final case class Engine(
     attribution: Attribution = Attribution.none,
     pricing: Pricing = Pricing.none,
     access: Access = Access.none,
+    recommendations: Recommendations = Recommendations.none,
 ):
+  /** Right-sizing recommendations for the app's live services. */
+  def rightSizing(app: AppName, env: EnvName): IO[EngineError, List[RightSizing]] =
+    recommendations.services(app, env).mapError(EngineError.Provider(_))
+
   /** The app's runtime role's permissions not used since a time. */
   def unusedPermissions(app: AppName, env: EnvName, since: java.time.Instant): IO[EngineError, List[UnusedPermission]] =
     access.unused(app, env, since).mapError(EngineError.Provider(_))

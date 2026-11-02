@@ -84,3 +84,16 @@ trait Access:
 
 object Access:
   val none: Access = (_, _, _) => zio.ZIO.succeed(Nil)
+
+/** A right-sizing recommendation for a live service: from its size now (CPU units, memory MiB) to the recommended
+  * one, and what that saves a month (USD; negative when it needs more).
+  */
+final case class RightSizing(address: Address, finding: String, cpu: Int, memory: Int, toCpu: Int, toMemory: Int, monthlySavings: Double)
+    derives CanEqual
+
+/** What the cloud recommends for an app's resources (Compute Optimizer). */
+trait Recommendations:
+  def services(app: AppName, env: EnvName): IO[ProviderError, List[RightSizing]]
+
+object Recommendations:
+  val none: Recommendations = (_, _) => zio.ZIO.succeed(Nil)

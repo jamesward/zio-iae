@@ -50,10 +50,10 @@ final case class InboxConsumer(sqs: SqsClient, url: QueueUrl, branch: String, re
   * periodic tick, which also covers events that were dropped. The monitor watches the live services meanwhile.
   */
 final case class Agent(reconcilers: Reconcilers, inbox: InboxConsumer, every: Duration, monitor: Option[Monitor] = None, cleanup: Option[CleanupJob] = None,
-    security: Option[SecurityJob] = None):
+    security: Option[SecurityJob] = None, cost: Option[CostJob] = None):
   def run: UIO[Nothing] =
     reconcilers.signalAll *>
-      (reconcilers.run <&> inbox.run <&> ZIO.foreachDiscard(inbox.conversations)(_.run) <&> ZIO.foreachDiscard(monitor)(_.run) <&> ZIO.foreachDiscard(cleanup)(_.run) <&> ZIO.foreachDiscard(security)(_.run) <&>
+      (reconcilers.run <&> inbox.run <&> ZIO.foreachDiscard(inbox.conversations)(_.run) <&> ZIO.foreachDiscard(monitor)(_.run) <&> ZIO.foreachDiscard(cleanup)(_.run) <&> ZIO.foreachDiscard(security)(_.run) <&> ZIO.foreachDiscard(cost)(_.run) <&>
         reconcilers.signalAll.repeat(Schedule.spaced(every)).forever)
         .as(())
         .forever

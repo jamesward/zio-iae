@@ -63,16 +63,24 @@ object AwsEngine:
     // The pipeline's own calls come from the deployer role bootstrap creates in each env account.
     val attribution = CloudTrailAttribution(planner.get[DeployClients].cloudtrail, naming, Some("iae-deployer"))
     val pricing = AwsPricing(PriceBook.usEast1, deploy.cloudwatch, deploy.elb, naming)
-    Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution, pricing, IamAccess(planner.get[IamClient]))
+    Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution, pricing, IamAccess(planner.get[IamClient]),
+      ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, PriceBook.usEast1))
 
   /** The clients for one account's config. */
   def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =
     (ZLayer.succeed(config) ++ ZLayer.environment[Client] >>> clients).build
 
 /** The clients a service's deploys use: ECS, the load balancer, its alarms, and the default network. */
-final case class DeployClients(ecs: EcsClient, elb: Elbv2Client, cloudwatch: CloudWatchClient, ec2: Ec2Client, cloudtrail: CloudTrailClient)
+final case class DeployClients(
+    ecs: EcsClient,
+    elb: Elbv2Client,
+    cloudwatch: CloudWatchClient,
+    ec2: Ec2Client,
+    cloudtrail: CloudTrailClient,
+    optimizer: ComputeOptimizerClient,
+)
 
 object DeployClients:
   val layer: ZLayer[AwsJsonClient & AwsQueryClient, Nothing, DeployClients] =
     ZLayer.fromFunction((json: AwsJsonClient, query: AwsQueryClient) =>
-      DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query), CloudTrailClient(json)))
+      DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query), CloudTrailClient(json), ComputeOptimizerClient(json)))

@@ -15,6 +15,7 @@ object InfraSpec extends ZIOSpecDefault:
   object Thumbnailer extends MessageQueue.Id[Resize](LogicalId("thumbnailer"))
   object Watched extends Service.Id(LogicalId("web"), ServiceSpec(8080, canary = CanarySpec(alarms = List(AppAlarm("uploads", "UploadFailures", 1)))))
   object Unwatched extends Service.Id(LogicalId("web"), ServiceSpec(8080))
+  object OddSize extends Service.Id(LogicalId("web"), ServiceSpec(8080, cpu = 1024, memory = 512))
   object BadAlarm extends Service.Id(LogicalId("web"), ServiceSpec(8080, canary = CanarySpec(alarms = List(AppAlarm("Upload Failures", "UploadFailures", 1)))))
   object Indexer     extends MessageQueue.Id[Resize](LogicalId("indexer"))
   object PhotoEvents extends Topic.Id[Resize](LogicalId("photo-events"), List(Topic.to(Thumbnailer), Topic.to(Indexer)))
@@ -24,6 +25,15 @@ object InfraSpec extends ZIOSpecDefault:
       val watched   = Service.run(Watched).manifest(app).map(_.grants)
       val unwatched = Service.run(Unwatched).manifest(app).map(_.grants)
       assertTrue(watched == Right(List(Grant(LogicalId("web"), ResourceKind.Service, Capability.MetricsPublish))), unwatched == Right(Nil))
+    ,
+    test("a task size Fargate doesn't offer is refused"):
+      assertTrue(
+        Service.fargate(256, 512),
+        Service.fargate(1024, 2048),
+        !Service.fargate(1024, 512),
+        !Service.fargate(300, 512),
+        Service.run(OddSize).manifest(app).left.exists(_.toString.contains("no task size of 1024 CPU units with 512 MiB")),
+      )
     ,
     test("an alarm name that can't be part of an alarm's name is refused"):
       assertTrue(Service.run(BadAlarm).manifest(app).left.exists(_.toString.contains("Upload Failures")))
