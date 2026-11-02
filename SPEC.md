@@ -1000,6 +1000,19 @@ full reconcile.
 depth, throttles) and the alarms the app declares in `Infra`. Alarms open a `Triage` task (§7). The monitor also
 does a periodic health sweep and posts a notice when an env degrades without an alarm firing.
 
+*As built (M6):*
+- **Sweep:** every minute (on the agent's clock), the monitor reads the alarms watching each app's live services in
+  each env (`Engine.alarms`). These are the live color's canary gates (§5.9), which keep watching a version after
+  its canary.
+- **Alert:** an alarm going off raises a message in the channel: "*Alert* `app/env`: the web service's 5xx alarm
+  (`<alarm>`) went off, running `<image>` from `<commit>`", mentioning the owners.
+- **Triage:** the task runs in the alert's thread, away from the sweep.
+- **Resolution:** when the alarm clears, the thread says so ("Cleared … after N minutes") and the message becomes
+  "*Resolved*".
+- **No memory needed:** open alerts are the agent's own alert messages in the channel, found again by the alarm
+  they name, so a restart neither repeats nor loses one.
+- **Not yet:** the health sweep without an alarm, and alarms on other kinds (queue age, DLQ depth, throttles).
+
 **Drift.** AWS Config and CloudTrail events on `iae:managed` resources from a principal other than the deployer
 role mean someone changed infra by hand. The agent posts what changed and who did it, then plans a revert to the
 manifest. The revert is a normal plan, gated by policy (`origin = Drift`), with the drift described in the
@@ -1142,7 +1155,20 @@ daily limit), and contract tests run against a real account when gated on.
      opens a PR linking the alert. It goes through review and the normal pipeline, with canary.
   3. **Infra tuning** (queue visibility, concurrency, capacity): a PR changing the `Infra` declaration.
   4. **Unknown:** the agent posts its triage notes as an escalation and asks for guidance.
-- The agent keeps the alert thread open until the alarm clears, then posts a summary. It never mutates prod
+- The agent keeps the alert thread open until the alarm clears, then posts a summary.
+
+*As built (M6):*
+- **Tools:** `Triage` is a zio-bedrock task with read-only tools:
+  - `alarms`: every alarm on the app's live services in the env, and whether it fires;
+  - `deployment`: the live image and commit, and the branch's last 15 commits with times and authors;
+  - the repository at the live commit (`listFiles`, `readFile`, `search`);
+  - with a GitHub App, `writeFile` and `openPullRequest`, for a fix PR as in `DiagnoseFailure`.
+- **Findings:** it writes what's happening, the likely cause with evidence, a recommendation (rollback, code fix,
+  `Infra` change, or a person's investigation) and how sure it is.
+- **Without a model:** the alert still mentions the owners, but no triage runs.
+- **Rollback:** the `rollback` tool and its policy gate are next.
+- **Harness:** fault controls also target the live version, and the `incident` scenario raises and resolves an
+  alert in prod. It never mutates prod
   outside the pipeline; rollback is the only fast path, and it's policy-gated.
 
 ---
@@ -1193,7 +1219,7 @@ and the "iae" GitHub App installed.
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
-| M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
+| M6 (in progress) | Monitor ✅ + drift jobs; `Triage` task ✅ (rollback to follow) | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
