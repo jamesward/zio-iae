@@ -19,7 +19,9 @@ object ScenarioSpec extends ZIOSpecDefault:
       seed     = Bucket.readWrite(Harness.Uploads).manifest(Harness.app).toOption.get
       _       <- HarnessSpec.until("the seed in prod")(HarnessSpec.converged(harness.envs(1), seed))
       _       <- Scenario.run(harness, scenario, _ => ZIO.unit)
-    yield assertCompletes
+      posted  <- harness.slack.messages.get
+    // No scenario degrades a service without an alarm: a health alert would be a false one (a version starting up).
+    yield assertTrue(!posted.exists(_.text.contains("degraded without an alarm")))
 
   def spec = suite("Scenarios")(
     Scenario.all.map(s => test(s.name)(ZIO.scoped(run(s))))*

@@ -363,11 +363,13 @@ final case class ServiceWatch(provider: ServiceProvider, discovery: Discovery) e
 
   /** The live version's health, as an alarm of its own (`<prefix>health`) so the monitor raises and resolves it like
     * the others: it goes off with fewer tasks running than wanted, or with targets the load balancer finds unhealthy.
-    * None before the service runs a version.
+    * None until a version has been deployed (the image tag records it): while the first one starts, its tasks
+    * aren't running yet, and that isn't degraded.
     */
   private def healthOf(address: Address, current: ObservedService, prefix: String, image: Option[String], commit: Option[CommitSha])
       : IO[AwsError, Option[WatchedAlarm]] =
-    provider.ecs.service(ServiceNaming.cluster(address), ServiceNaming.ecsService(address, current.active)).flatMap:
+    if image.forall(_.isEmpty) then ZIO.none
+    else provider.ecs.service(ServiceNaming.cluster(address), ServiceNaming.ecsService(address, current.active)).flatMap:
       case None => ZIO.none
       case Some(service) =>
         ZIO.foreach(current.group(current.active))(g => provider.elb.health(g.arn)).map(_.getOrElse(Nil)).map: targets =>
