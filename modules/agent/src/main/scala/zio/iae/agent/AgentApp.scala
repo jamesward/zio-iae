@@ -111,7 +111,8 @@ object AgentApp extends ZIOAppDefault:
         monitor     <- Monitor.make(envs, config.apps.map(_.name), slack, self, config.slack.channel, config.slack.owners, triage, rollbacks = Some(pipeline.rollback))
         _           <- ZIO.logInfo(s"agent started for $repo ($branch): envs ${config.envs.map(_.value).mkString(", ")}")
         _           <- Agent(reconcilers, InboxConsumer(sqs, QueueUrl(inboxUrl), branch, reconcilers, talk), every.minutes, Some(monitor), Some(CleanupJob(envs, config.apps.map(_.name), pipeline.cleanup, idle = Some(idle), images = pruner)),
-                        Some(SecurityJob(envs, config.apps.map(_.name), slack, self, config.slack.channel, security)),
+                        Some(SecurityJob(envs, config.apps.map(_.name), slack, self, config.slack.channel, security, owners = Some(config.slack.owners),
+                          images = Option.when(pushing.nonEmpty)(ImageScans(InspectorClient(AwsRestJsonClient(http, base)), pushing.toSet)))),
                         Some(CostJob(envs, config.apps.map(_.name), slack, self, config.slack.channel, costReview))).run
       yield ()
     ZIO

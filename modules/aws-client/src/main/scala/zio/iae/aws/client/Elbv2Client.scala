@@ -5,7 +5,7 @@ import zio.*
 
 final case class LoadBalancer(arn: String, name: String, dnsName: String, created: Option[java.time.Instant] = None)
 final case class TargetGroup(arn: String, name: String, port: Int)
-final case class Listener(arn: String, port: Int, weights: Map[String, Int])
+final case class Listener(arn: String, port: Int, weights: Map[String, Int], protocol: String = "HTTP")
 final case class TargetHealth(id: String, port: Int, state: String)
 
 /** Application load balancers: the load balancer, its target groups, and a listener whose weighted forward action
@@ -83,7 +83,8 @@ object Elbv2Client:
     val actions = m \ "DefaultActions" \ "member"
     val weighted = (actions \ "ForwardConfig" \ "TargetGroups" \ "member").toList.map(t => text(t \ "TargetGroupArn") -> text(t \ "Weight").toIntOption.getOrElse(1))
     val single   = (actions \ "TargetGroupArn").toList.map(t => t.text.trim -> 100)
-    Listener(text(m \ "ListenerArn"), text(m \ "Port").toIntOption.getOrElse(0), (if weighted.nonEmpty then weighted else single).toMap)
+    Listener(text(m \ "ListenerArn"), text(m \ "Port").toIntOption.getOrElse(0), (if weighted.nonEmpty then weighted else single).toMap,
+      Option(text(m \ "Protocol")).filter(_.nonEmpty).getOrElse("HTTP"))
 
   private def members(name: String, values: List[String]): List[(String, String)] =
     values.zipWithIndex.map((v, i) => s"$name.member.${i + 1}" -> v)

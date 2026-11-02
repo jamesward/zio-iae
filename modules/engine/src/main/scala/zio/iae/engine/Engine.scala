@@ -96,7 +96,12 @@ final case class Engine(
     recommendations: Recommendations = Recommendations.none,
     activity: Activity = Activity.none,
     bills: Bills = Bills.none,
+    findings: Findings = Findings.none,
 ):
+  /** What the security services and the engine's own checks find about the app's resources in the env. */
+  def securityFindings(app: AppName, env: EnvName): IO[EngineError, List[SecurityFinding]] =
+    findings.security(app, env).mapError(EngineError.Provider(_))
+
   /** What the app actually cost in the env from `from` (inclusive) to `to` (exclusive), from the bill. */
   def spend(app: AppName, env: EnvName, from: java.time.LocalDate, to: java.time.LocalDate): IO[EngineError, Option[Spend]] =
     bills.spend(app, env, from, to).mapError(EngineError.Provider(_))

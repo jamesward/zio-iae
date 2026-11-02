@@ -75,6 +75,13 @@ final case class S3Client(http: Client, config: AwsConfig):
     .catchSome:
       case S3Error.Service(_, Some("NoSuchLifecycleConfiguration"), _) => ZIO.succeed(S3Lifecycle(None, None, None, others = false))
 
+  /** Whether S3 Block Public Access is fully on for the bucket (all four settings); false without a configuration. */
+  def publicAccessBlocked(bucket: BucketName): IO[S3Error, Boolean] =
+    executeXml(Call(Method.GET, bucket, query = List("publicAccessBlock" -> ""))): elem =>
+      Right(List("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets").forall(k => Xml.child(elem, k).exists(_.trim == "true")))
+    .catchSome:
+      case S3Error.Service(_, Some("NoSuchPublicAccessBlockConfiguration"), _) => ZIO.succeed(false)
+
   /** Replaces the bucket's lifecycle rules with iae's; with none, removes the configuration. */
   def putBucketLifecycle(bucket: BucketName, tiering: Option[Int], expire: Option[Int], noncurrent: Option[Int]): IO[S3Error, Unit] =
     def rule(id: String, action: String) = s"<Rule><ID>$id</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>$action</Rule>"

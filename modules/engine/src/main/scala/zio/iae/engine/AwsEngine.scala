@@ -67,7 +67,9 @@ object AwsEngine:
     Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution, pricing, IamAccess(planner.get[IamClient]),
       AwsRecommendations(ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, prices),
         StorageAdvice(planner.get[S3Client], deploy.cloudwatch, found, naming, prices)), AwsActivity(deploy.cloudwatch, deploy.elb, planner.get[SqsClient], planner.get[DynamoClient], naming),
-      CostExplorerBills(deploy.costs))
+      CostExplorerBills(deploy.costs),
+      AwsFindings(found, naming, ConfigChecks(planner.get[S3Client], planner.get[SqsClient], deploy.elb, naming),
+        SecurityHubClient(deploy.rest), GuardDutyClient(deploy.rest), AccessAnalyzerClient(deploy.rest)))
 
   /** The clients for one account's config. */
   def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =
@@ -83,9 +85,10 @@ final case class DeployClients(
     optimizer: ComputeOptimizerClient,
     costs: CostExplorerClient,
     prices: PriceListClient,
+    rest: AwsRestJsonClient,
 )
 
 object DeployClients:
   val layer: ZLayer[AwsJsonClient & AwsQueryClient, Nothing, DeployClients] =
     ZLayer.fromFunction((json: AwsJsonClient, query: AwsQueryClient) =>
-      DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query), CloudTrailClient(json), ComputeOptimizerClient(json), CostExplorerClient(json), PriceListClient(json)))
+      DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query), CloudTrailClient(json), ComputeOptimizerClient(json), CostExplorerClient(json), PriceListClient(json), AwsRestJsonClient(json.http, json.config)))

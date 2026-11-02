@@ -152,3 +152,28 @@ object Bills:
   val none: Bills = new Bills:
     def spend(app: AppName, env: EnvName, from: LocalDate, to: LocalDate) = zio.ZIO.none
     def anomalies(env: EnvName, since: LocalDate)                         = zio.ZIO.succeed(Nil)
+
+enum Severity derives CanEqual:
+  case Low, Medium, High, Critical
+
+  def atLeast(other: Severity): Boolean = ordinal >= other.ordinal
+
+object Severity:
+  given Ordering[Severity] = Ordering.by(_.ordinal)
+
+  /** From AWS's labels (`LOW` … `CRITICAL`); informational and untriaged ones are none. */
+  def fromLabel(label: String): Option[Severity] = values.find(_.toString.equalsIgnoreCase(label))
+
+/** A security finding about an app's resources in an env: whose it is (`iae`'s own checks, Security Hub, GuardDuty,
+  * Inspector, Access Analyzer), a stable id, how severe, what, the managed resource it's about when known, and
+  * whether it's an active threat (compromised credentials, say), which is escalated, not proposed as a code change.
+  */
+final case class SecurityFinding(source: String, id: String, severity: Severity, title: String, resource: Option[Address], detail: String, threat: Boolean)
+    derives CanEqual
+
+/** What the security services, and the engine's own checks, find wrong with the managed resources. */
+trait Findings:
+  def security(app: AppName, env: EnvName): IO[ProviderError, List[SecurityFinding]]
+
+object Findings:
+  val none: Findings = (_, _) => zio.ZIO.succeed(Nil)

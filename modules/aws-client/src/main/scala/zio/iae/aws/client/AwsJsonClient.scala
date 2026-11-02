@@ -48,7 +48,7 @@ object AwsJsonClient:
   private final case class ErrorBody(@fieldName("__type") tpe: Option[String], message: Option[String], @fieldName("Message") upperMessage: Option[String])
       derives Schema
 
-  private def errorOf(service: String, status: Int, header: Option[String], text: String): AwsError =
+  private[client] def errorOf(service: String, status: Int, header: Option[String], text: String): AwsError =
     val parsed = JsonCodec.jsonDecoder(Schema[ErrorBody]).decodeJson(text).toOption
     val code   = header.orElse(parsed.flatMap(_.tpe)).map(_.split('#').last.split(':').head)
     AwsError.Service(service, status, code, parsed.flatMap(p => p.message.orElse(p.upperMessage)).orElse(Option.when(text.nonEmpty)(text.take(300))))
