@@ -9,8 +9,8 @@ import zio.iae.aws.client.*
 /** Steady requests to every task of the app's services, in every env, standing in for users. A real ALB publishes
   * each target group's 5xx count and response time; Floci doesn't, so this publishes them the same way
   * (`AWS/ApplicationELB`, `HTTPCode_Target_5XX_Count` and `TargetResponseTime` by load balancer and target group), and
-  * a canary's alarms go off on real responses. The env's faults are added to the version in canary (the color that
-  * isn't live), including the app's own failure metric.
+  * a canary's alarms go off on real responses. The env's faults are added to the version they target (in canary: the
+  * color that isn't live; live: the one that is), including the app's own failure metric.
   */
 final case class TrafficGenerator(http: Client, app: AppName, service: LogicalId, envs: List[(EnvName, AwsConfig)], faults: Faults):
   def run: UIO[Nothing] =
@@ -30,8 +30,9 @@ final case class TrafficGenerator(http: Client, app: AppName, service: LogicalId
         for
           tags   <- elb.tags(lb.arn).mapError(_.message)
           live    = tags.get(ServiceProvider.ColorTag).flatMap(Color.from)
-          active <- faults.in(env)
-          _      <- ZIO.foreachDiscard(Color.values.toList)(color => observe(env, address, lb, color, if live.contains(color) then Set.empty else active, elb, cw))
+          canary <- faults.in(env, Target.Canary)
+          onLive <- faults.in(env, Target.Live)
+          _      <- ZIO.foreachDiscard(Color.values.toList)(color => observe(env, address, lb, color, if live.contains(color) then onLive else canary, elb, cw))
         yield ()
 
   private def observe(env: EnvName, address: Address, lb: LoadBalancer, color: Color, faults: Set[Fault], elb: Elbv2Client, cw: CloudWatchClient)

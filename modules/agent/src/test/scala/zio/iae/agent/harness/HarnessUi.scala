@@ -16,7 +16,7 @@ final case class SpeedAction(speed: Double) derives Schema
 final case class ScenarioAction(name: String) derives Schema
 final case class ScenarioInfo(name: String, description: String, steps: List[String]) derives Schema
 final case class AdvanceAction(minutes: Long) derives Schema
-final case class FaultAction(env: String, fault: Fault, on: Boolean) derives Schema
+final case class FaultAction(env: String, fault: Fault, target: Target, on: Boolean) derives Schema
 final case class HarnessState(
     users: List[FakeUser],
     channel: String,
@@ -52,7 +52,7 @@ final case class HarnessUi(
     Method.POST / "ui" / "clock" / "speed"   -> handler((req: Request) => act[SpeedAction](req)(a => clock.setSpeed(a.speed))),
     Method.POST / "ui" / "clock" / "advance" -> handler((req: Request) => act[AdvanceAction](req)(a => advance(a.minutes.minutes))),
     Method.POST / "ui" / "scenario" -> handler((req: Request) => act[ScenarioAction](req)(a => start(a.name))),
-    Method.POST / "ui" / "fault"    -> handler((req: Request) => act[FaultAction](req)(a => ZIO.fromEither(zio.iae.EnvName.from(a.env)).mapError(_.toString).flatMap(env => harness.flatMap(_.faults.set(env, a.fault, a.on))))),
+    Method.POST / "ui" / "fault"    -> handler((req: Request) => act[FaultAction](req)(a => ZIO.fromEither(zio.iae.EnvName.from(a.env)).mapError(_.toString).flatMap(env => harness.flatMap(_.faults.set(env, a.fault, a.target, a.on))))),
   )
 
   /** Jumps the clock and wakes the reconcilers, since a jump doesn't end their sleep. */

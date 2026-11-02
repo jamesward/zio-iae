@@ -147,7 +147,10 @@ object Harness:
                 pipeline     = Pipeline(builds, evaluator, client, self, 24.hours, explainer, diagnoser, Some(SqsApplyQueue(sqs, executorUrl)))
                 reconcilers <- Reconcilers.make(pipeline, envs)
                 talk        <- ZIO.foreach(model)(m => Converse.make(client, self, m, envs, builds).flatMap(Conversations.make)).mapError(_.message)
-                fiber       <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers, talk), 15.minutes).run).forkIn(scope)
+                triage      <- ZIO.foreach(model)(Triage.make(_, Some(pulls))).mapError(_.message)
+                owners       = SlackGroup.from("platform-owners").toOption.get
+                monitor     <- Monitor.make(envs, List(app), client, self, channel, owners, triage)
+                fiber       <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers, talk), 15.minutes, Some(monitor)).run).forkIn(scope)
               yield (fiber, reconcilers))
       agent    <- AgentProcess.make(start)
       s3        = envNames.map(env => S3Client(http, accounts.getOrElse(env, tooling)))

@@ -56,7 +56,10 @@ final case class Executor(drivers: Drivers, commits: CommitOrder):
           commits.isAncestor(t, last).flatMap(newer => ZIO.fail(EngineError.Guarded(address, last, t)).when(newer))
         case _ => ZIO.unit
 
-final case class Engine(planner: Planner, executor: Executor):
+final case class Engine(planner: Planner, executor: Executor, watch: Watch = Watch.none):
+  /** The alarms watching the app's live services in the env. */
+  def alarms(app: AppName, env: EnvName): IO[EngineError, List[ServiceAlarm]] = watch.alarms(app, env).mapError(EngineError.Provider(_))
+
   def plan(manifest: Manifest, env: EnvName, target: Option[CommitSha], phase: Phase): IO[EngineError, Plan] =
     planner.plan(manifest, env, target, phase)
 
@@ -80,5 +83,5 @@ final case class Engine(planner: Planner, executor: Executor):
     ZIO.foreach(List(Phase.Expand, Phase.Contract))(phase => plan(manifest, env, target, phase).flatMap(apply))
 
 object Engine:
-  def make(drivers: Drivers, discovery: Discovery, commits: CommitOrder): Engine =
-    Engine(Planner(drivers, discovery), Executor(drivers, commits))
+  def make(drivers: Drivers, discovery: Discovery, commits: CommitOrder, watch: Watch = Watch.none): Engine =
+    Engine(Planner(drivers, discovery), Executor(drivers, commits), watch)

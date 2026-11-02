@@ -18,4 +18,6 @@ object FlociRegistry:
              val docker = DockerClientFactory.instance().nn.client().nn
              docker.tagImageCmd(local, target, tag).nn.exec()
              docker.pushImageCmd(target).nn.withTag(tag).nn.exec(ResultCallback.Adapter[PushResponseItem]()).nn.awaitCompletion()
+             // The image stays on the daemon under its own name; only the push's tag goes.
+             docker.removeImageCmd(s"$target:$tag").nn.withNoPrune(true).nn.exec()
     yield ()

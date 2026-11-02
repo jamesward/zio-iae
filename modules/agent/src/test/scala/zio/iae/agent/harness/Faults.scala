@@ -4,7 +4,7 @@ import zio.*
 import zio.iae.EnvName
 import zio.schema.{Schema, derived}
 
-/** What can go wrong with a new version, injected by the harness while it's in canary. */
+/** What can go wrong with a version, injected by the harness. */
 @zio.schema.annotation.simpleEnum
 enum Fault derives Schema, CanEqual:
   /** It answers 5xx, as the load balancer counts them. */
@@ -19,13 +19,22 @@ enum Fault derives Schema, CanEqual:
     case Slow          => "answers slowly"
     case FailingMetric => "reports failing uploads"
 
-final case class ActiveFault(env: String, fault: Fault) derives Schema
+/** Which version a fault hits: the one in canary (a bad deploy), or the one with the traffic (an incident). */
+@zio.schema.annotation.simpleEnum
+enum Target derives Schema, CanEqual:
+  case Canary, Live
 
-/** The faults switched on per env; they apply to whichever version is in canary there. */
-final case class Faults(active: Ref[Set[(EnvName, Fault)]]):
-  def set(env: EnvName, fault: Fault, on: Boolean): UIO[Unit] = active.update(a => if on then a + (env -> fault) else a - (env -> fault))
-  def in(env: EnvName): UIO[Set[Fault]]                       = active.get.map(_.collect { case (`env`, f) => f })
-  def list: UIO[List[ActiveFault]]                             = active.get.map(_.toList.map((e, f) => ActiveFault(e.value, f)).sortBy(a => (a.env, a.fault.ordinal)))
+final case class ActiveFault(env: String, fault: Fault, target: Target) derives Schema
+
+/** The faults switched on per env and target. */
+final case class Faults(active: Ref[Set[(EnvName, Fault, Target)]]):
+  def set(env: EnvName, fault: Fault, target: Target, on: Boolean): UIO[Unit] =
+    active.update(a => if on then a + ((env, fault, target)) else a - ((env, fault, target)))
+
+  def in(env: EnvName, target: Target): UIO[Set[Fault]] = active.get.map(_.collect { case (`env`, f, `target`) => f })
+
+  def list: UIO[List[ActiveFault]] =
+    active.get.map(_.toList.map((e, f, t) => ActiveFault(e.value, f, t)).sortBy(a => (a.env, a.target.ordinal, a.fault.ordinal)))
 
 object Faults:
-  def make: UIO[Faults] = Ref.make(Set.empty[(EnvName, Fault)]).map(Faults(_))
+  def make: UIO[Faults] = Ref.make(Set.empty[(EnvName, Fault, Target)]).map(Faults(_))

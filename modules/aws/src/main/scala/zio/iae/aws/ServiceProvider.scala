@@ -273,6 +273,27 @@ object ServiceProvider:
     val resource = arn.split(':').lastOption.getOrElse(arn)
     if after.isEmpty then resource else resource.stripPrefix(after)
 
+/** The alarms of each managed service's live color, found through discovery. */
+final case class ServiceWatch(provider: ServiceProvider, discovery: Discovery) extends Watch:
+  def alarms(app: AppName, env: EnvName): IO[ProviderError, List[ServiceAlarm]] =
+    discovery.managed(app, env).flatMap: found =>
+      ZIO.foreach(found.filter(_.address.kind == ResourceKind.Service))(d => live(d.address, d.commit)).map(_.flatten)
+
+  private def live(address: Address, commit: Option[CommitSha]): IO[ProviderError, List[ServiceAlarm]] =
+    provider.observe(address).flatMap:
+      case None => ZIO.succeed(Nil)
+      case Some(current) =>
+        val prefix = ServiceNaming.alarmPrefix(address, current.active)
+        (for
+          names  <- provider.cloudwatch.alarmNames(prefix)
+          states <- provider.cloudwatch.states(names)
+        yield names.sorted.map: name =>
+          val gate = name.stripPrefix(prefix) match
+            case s if s.startsWith("app-") => s.stripPrefix("app-")
+            case s                         => s
+          ServiceAlarm(address, name, gate, states.get(name).contains(AlarmState.Alarm), current.tags.get(ServiceProvider.ImageTag), commit)
+        ).mapError(e => ProviderError(address, "watch", e.message))
+
 final case class ServiceDriver(provider: ServiceProvider) extends ResourceDriver:
   val kind: ResourceKind = ResourceKind.Service
 

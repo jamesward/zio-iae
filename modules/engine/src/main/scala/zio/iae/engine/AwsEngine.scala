@@ -54,7 +54,13 @@ object AwsEngine:
   def make(naming: BucketNaming, planner: ZEnvironment[Clients], deployer: ZEnvironment[Clients], commits: CommitOrder): Engine =
     def driversOf(c: ZEnvironment[Clients]) =
       drivers(c.get[S3Client], c.get[SqsClient], c.get[SecretsClient], c.get[DynamoClient], c.get[SnsClient], c.get[IamClient], c.get[DeployClients], naming, c.get[AwsContext])
-    Engine(Planner(driversOf(planner), discovery(planner.get[TaggingClient], planner.get[IamClient])), zio.iae.engine.Executor(driversOf(deployer), commits))
+    val found = discovery(planner.get[TaggingClient], planner.get[IamClient])
+    val deploy = planner.get[DeployClients]
+    val watch = ServiceWatch(
+      ServiceProvider(deploy.ecs, deploy.elb, deploy.cloudwatch, deploy.ec2.defaultNetwork.mapError(_.message).either, planner.get[AwsContext]),
+      found,
+    )
+    Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch)
 
   /** The clients for one account's config. */
   def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =

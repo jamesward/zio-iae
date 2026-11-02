@@ -21,8 +21,10 @@ enum Step:
   case RestartAgent
   /** A change made outside the agent, e.g. by hand in the console. */
   case Drift(description: String, change: Harness => IO[String, Unit])
-  /** Switches a fault on or off for the version in canary in an env (by index). */
-  case InjectFault(env: Int, fault: Fault, on: Boolean)
+  /** Switches a fault on or off for a version in an env (by index): the one in canary, or the live one. */
+  case InjectFault(env: Int, fault: Fault, on: Boolean, target: Target = Target.Canary)
+  /** A reply in the thread of a message, both matching. */
+  case WaitForReply(description: String, root: (Harness, String) => Boolean, reply: String => Boolean)
 
   def describe: String = this match
     case Push(d, _, _)               => s"push: $d"
@@ -32,7 +34,9 @@ enum Step:
     case Advance(by)                 => s"advance the clock by ${by.render}"
     case RestartAgent                => "restart the agent"
     case Drift(d, _)                 => s"drift: $d"
-    case InjectFault(env, fault, on) => s"${if on then "make" else "stop making"} the canary in env ${env + 1} ${fault.describe}"
+    case InjectFault(env, fault, on, target) =>
+      s"${if on then "make" else "stop making"} the ${if target == Target.Live then "live version" else "canary"} in env ${env + 1} ${fault.describe}"
+    case WaitForReply(d, _, _) => s"wait for $d"
 
 final case class Scenario(name: String, description: String, steps: List[Step])
 
@@ -79,8 +83,16 @@ object Scenario:
       case Step.Advance(by)       => harness.ui.advance(by)
       case Step.RestartAgent      => harness.agent.restart
       case Step.Drift(_, change)  => change(harness)
-      case Step.InjectFault(env, fault, on) =>
-        ZIO.fromOption(harness.envs.lift(env)).orElseFail(s"no env ${env + 1}").flatMap(r => harness.faults.set(r.env, fault, on))
+      case Step.InjectFault(env, fault, on, target) =>
+        ZIO.fromOption(harness.envs.lift(env)).orElseFail(s"no env ${env + 1}").flatMap(r => harness.faults.set(r.env, fault, target, on))
+      case Step.WaitForReply(description, root, reply) =>
+        harness.slack.messages.get
+          .map(_.exists(m => root(harness, m.text) && m.replies.exists(r => reply(r.text))))
+          .repeat(Schedule.spaced(250.millis) && Schedule.recurUntil[Boolean](identity))
+          .withClock(Clock.ClockLive)
+          .timeoutFail(s"$description didn't happen within ${timeout.render}")(timeout)
+          .withClock(Clock.ClockLive)
+          .unit
 
   // The built-in scenarios, for the UI's buttons and the headless tests.
 
@@ -279,7 +291,22 @@ object Scenario:
     ),
   )
 
+  val incident = Scenario(
+    "incident",
+    "The live web service in prod starts answering 5xx: the monitor raises an alert (triaged in its thread when a model is configured), and resolves it once the errors stop.",
+    webGoesLive ++ List(
+      Step.InjectFault(1, Fault.Errors, on = true, Target.Live),
+      Step.WaitFor("an alert for env 2", (h, text) => text.startsWith("*Alert*") && text.contains(s"${Harness.app.value}/${env(h, 1)}") && text.contains("5xx alarm")),
+      Step.InjectFault(1, Fault.Errors, on = false, Target.Live),
+      Step.WaitForReply(
+        "the alert to be resolved",
+        (h, text) => text.startsWith("*Resolved*") && text.contains(s"${Harness.app.value}/${env(h, 1)}"),
+        _.startsWith("Cleared"),
+      ),
+    ),
+  )
+
   val slowDeploy    = faultyDeploy("slow-deploy", Fault.Slow, "latency")
   val failingMetric = faultyDeploy("failing-metric", Fault.FailingMetric, "uploads")
 
-  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric)
+  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric, incident)

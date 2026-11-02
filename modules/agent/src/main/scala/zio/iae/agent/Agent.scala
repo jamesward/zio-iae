@@ -47,11 +47,12 @@ final case class InboxConsumer(sqs: SqsClient, url: QueueUrl, branch: String, re
       case Right(event) => ZIO.logDebug(s"inbox: $event") *> reconcilers.signalAll
 
 /** The always-on agent: reconcile everything at start (that is all a restart needs), then react to the inbox and a
-  * periodic tick, which also covers events that were dropped.
+  * periodic tick, which also covers events that were dropped. The monitor watches the live services meanwhile.
   */
-final case class Agent(reconcilers: Reconcilers, inbox: InboxConsumer, every: Duration):
+final case class Agent(reconcilers: Reconcilers, inbox: InboxConsumer, every: Duration, monitor: Option[Monitor] = None):
   def run: UIO[Nothing] =
     reconcilers.signalAll *>
-      (reconcilers.run <&> inbox.run <&> ZIO.foreachDiscard(inbox.conversations)(_.run) <&> reconcilers.signalAll.repeat(Schedule.spaced(every)).forever)
+      (reconcilers.run <&> inbox.run <&> ZIO.foreachDiscard(inbox.conversations)(_.run) <&> ZIO.foreachDiscard(monitor)(_.run) <&>
+        reconcilers.signalAll.repeat(Schedule.spaced(every)).forever)
         .as(())
         .forever
