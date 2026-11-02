@@ -55,8 +55,13 @@ Between pushes it keeps working:
 
 - It watches the live services' alarms and health, triages alerts with an LLM, and can propose a rollback.
 - It reports drift along with who made the change (from CloudTrail), and reverts it where the policy allows.
-- It proposes cleanup of orphaned resources once they pass the retention period.
-- It reports right-sizing savings (from Compute Optimizer) and permissions the app never uses.
+- It cleans up: deleting orphaned resources once they pass the retention period, pruning old task definitions and
+  images that nothing runs or rolls back to, and orphaning apps the repo no longer declares. It reports idle
+  resources.
+- It watches cost: right-sizing (from Compute Optimizer) and storage savings, the bill from Cost Explorer beside its
+  own projections, and spending anomalies.
+- It audits security: permissions the app never uses, its own configuration checks, and findings from Security
+  Hub, GuardDuty, Inspector and Access Analyzer. Active threats go straight to the owners.
 
 People are in the loop through Slack: they approve, reject, ask questions and give guidance in the run's thread.
 
@@ -86,7 +91,8 @@ differs in two ways.
 | **Delivery** | A pipeline someone builds and maintains; a failed build waits for a human | Build, plan, canary and rollback are built in; a failed build or deploy gets a diagnosis and a proposed fix |
 | **Incidents** | Someone is paged and works out the cause by hand | Alerts are triaged against recent deploys and metrics in the alert's thread; a rollback is proposed and goes through the policy |
 | **Drift** | Found at the next `plan`, often weeks later, and overwritten | Reported when it's found, with who changed what, and reverted or kept as the policy says |
-| **Cleanup and cost** | Orphans pile up; sizes stay until someone reads the bill | Orphans proposed for deletion after a retention period; right-sizing reported with the expected savings |
+| **Cleanup and cost** | Orphans pile up; sizes stay until someone reads the bill | Orphans and old versions cleaned up through the policy; right-sizing and storage savings reported, and the bill compared with each plan's projected cost |
+| **Security** | Periodic reviews, or a scanner whose findings land in a backlog | Unused permissions, misconfigurations and Security Hub, GuardDuty, Inspector and Access Analyzer findings reported with a proposed fix; threats escalated at once |
 | **Compliance evidence** | Assembled by hand before an audit | Recorded on every change (commit, plan, verdict, approvers, result) and filed in AWS Audit Manager |
 
 None of this gives the LLM unchecked power. It only gets tools, never raw AWS or shell access. Every change it
