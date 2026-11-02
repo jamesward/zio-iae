@@ -10,7 +10,8 @@ declared once and used for three things:
 2. **At deploy time** it is the desired-state description that an engine reconciles against AWS.
 3. **For security** it generates the app's least-privilege IAM policy from the capabilities the program uses.
 
-An always-on, stateful agent process runs the pipeline. It receives git pushes through its own GitHub webhook,
+An always-on, stateful agent process runs the pipeline. It receives git pushes through its own GitHub webhook
+(or, with the repo in AWS CodeCommit, through EventBridge with no webhook at all; §5.2.1),
 plans and applies infrastructure changes (including changes it authors itself), deploys the app with canaries, and
 records evidence in AWS Audit Manager. The same process runs monitors, drift detection, security audits, resource cleanup and cost
 optimisation. Deterministic code makes the decisions that can be made by code; an LLM loop built on
@@ -380,6 +381,7 @@ branches. Wherever possible the **real clients** are pointed at emulated endpoin
 | AWS services Floci lacks | In-process fakes over HTTP from `iae-testkit`: `AuditManagerFake`, `CostExplorerFake`, `ComputeOptimizerFake`, `CostAnomalyFake` | The real `iae-aws-client` calls them through per-service endpoint overrides |
 | Slack (Web API + Socket Mode) | `FakeSlack`: the subset the agent uses (`chat.postMessage`, `chat.update`, `conversations.history`/`replies`, `reactions.get`, `usergroups.users.list`, `users.info`, `users.lookupByEmail`, `apps.connections.open` + the Socket Mode websocket) | State in memory; the web UI is its client |
 | GitHub (repo, App API, webhooks) | A local bare git repo as the remote, plus `FakeGitHub`: the App API subset (installation tokens, PRs, reviews, merges, statuses, deployments) and a webhook sender that signs `push` and `pull_request` events with the configured secret | Pushing to the local repo, from the UI or a real `git push`, sends the webhook |
+| CodeCommit (alternative git host, §5.2.1) | The same local bare repo, plus pushes published as `CodeCommit Repository State Change` events to Floci's EventBridge, whose rule targets the inbox; `CodeCommitFake` for pull requests | The trigger path is the production rule, not a shortcut into the inbox |
 | `iae-webhook` Lambda | The same handler code, run in-process behind a local HTTP endpoint | Enqueues to the tooling account's SQS in Floci, as in production |
 | Bedrock | **Not emulated** | Real model; token usage shows in the UI |
 
@@ -450,6 +452,7 @@ optimizer) are fibers in the same process.
 
 ```
  GitHub, Slack ──signed webhooks──▶ iae-webhook (verifies signatures) ──▶ SQS inbox ─┐
+ CodeCommit (alternative to GitHub) ──EventBridge rule──▶ SQS inbox ──────────────────┤
  CloudWatch alarms / Config / CloudTrail / Cost Anomaly ──EventBridge──▶ SQS ─────────┤
  Slack ◀──Web API (posts, history, reactions, groups)─────────────────────────────┐   │
                                                                                   ▼   ▼
@@ -489,7 +492,8 @@ Code, but the agent doesn't need it.
 | Input | Mechanism | Handled by |
 |---|---|---|
 | **Push to `main`** | GitHub App webhook (`push`), received by `iae-webhook`, a small Lambda with a Function URL that verifies `X-Hub-Signature-256` and enqueues to the SQS inbox (dedupe by `X-GitHub-Delivery`) | Reconciler for every env of the affected apps |
-| Pull requests | Same webhook (`pull_request`) | Plan preview + policy status check `iae/policy` on the PR; agent-authored PR flow (§5.5) |
+| Push to `main` (CodeCommit) | `CodeCommit Repository State Change` event through an EventBridge rule straight to the SQS inbox (§5.2.1) | Same |
+| Pull requests | Same webhook (`pull_request`), or `CodeCommit Pull Request State Change` events through EventBridge | Plan preview + policy status check `iae/policy` on the PR; agent-authored PR flow (§5.5) |
 | Slack | Slack's Events API to the same webhook (`/slack`, signature and a 5-minute replay window checked), reduced to `SlackReaction`/`SlackReply` inbox events | Approvals (§5.6), conversations (§5.7) |
 | Alarms | CloudWatch alarm state changes through EventBridge to the inbox | Monitor job (§5.10) |
 | Drift | AWS Config / CloudTrail events on `iae:managed` resources by a principal other than the deployer role, through EventBridge | Drift job (§5.10) |
@@ -504,6 +508,44 @@ periodic reconcile covers anything that's lost anyway. (Socket Mode was the firs
 turned out simpler.) Inbox events carry only identifiers: the agent re-reads git, the cloud and Slack, so a forged
 or replayed event can at most cause an extra reconcile. The webhook is an HTTP server (`WebhookServer`), run on
 Lambda behind the Lambda Web Adapter or anywhere else.
+
+### 5.2.1 Git host: GitHub or CodeCommit
+
+The repo can live on GitHub (built first) or in [AWS CodeCommit](https://aws.amazon.com/codecommit/), which
+returned to general availability for new customers in November 2025. Everything after "a commit landed on `main`"
+is the same: the agent fetches the branch, builds in CodeBuild, plans, asks and applies. Only four things depend on
+the host: how a push reaches the inbox, how the agent and executor authenticate to git, how pull requests work, and
+who the pusher was.
+
+| | GitHub | CodeCommit |
+|---|---|---|
+| Push trigger | App webhook to `iae-webhook`, signature checked | `CodeCommit Repository State Change` event (`referenceCreated`/`referenceUpdated` on `refs/heads/main`) matched by an EventBridge rule whose target is the SQS inbox. An input transformer turns it into the same `Pushed` inbox event. No public endpoint and no shared secret; the queue policy admits only that rule |
+| Git auth | Installation tokens from the GitHub App | IAM: the agent's and the executor's task roles, with a SigV4 git credential helper (as `git-remote-codecommit` does). Nothing to store or rotate |
+| Who may push where | GitHub rulesets | IAM. The agent's role has `codecommit:GitPull` and `codecommit:GitPush` with a `codecommit:References` condition limited to `refs/heads/iae/*`, so it can't push to `main` whatever the model asks. The executor's role only pulls |
+| Pull requests | GitHub PRs; plan preview as a status check and comment | `CreatePullRequest`; plan preview as a PR comment (`PostCommentForPullRequest`); `CodeCommit Pull Request State Change` events through EventBridge. Approval rule templates take the place of required reviews; the agent merges its own PR (§5.5) only where they allow |
+| Pusher identity | The commit author's email (GitHub doesn't vouch for it) | The commit author's email, plus the IAM principal that pushed (`callerUserArn` in the event), recorded in the `IAE-CM-1` evidence |
+
+What CodeCommit gives up:
+- a familiar review UI and the GitHub ecosystem (Actions, apps, Copilot review);
+- Git LFS, which is on AWS's roadmap;
+- regions it isn't offered in.
+
+What it gains:
+- everything stays inside the AWS account and IAM, with CloudTrail recording every push;
+- one less secret (the GitHub App key) and one less inbound path;
+- `iae-webhook` then only serves Slack, or goes away with Slack's Socket Mode.
+
+Configuration: the agent and executor tell the host from `IAE_REPO_URL`. A `codecommit::<region>://<repo>` URL or
+`https://git-codecommit.<region>.amazonaws.com/v1/repos/<repo>` means CodeCommit. The repository should be in the
+tooling account, so the EventBridge rule and the inbox are in the same account. A repository elsewhere forwards its
+events to the tooling account's event bus. `iae bootstrap` creates the rule, the queue policy and the roles'
+CodeCommit permissions.
+
+Testing: Floci doesn't emulate CodeCommit, but it does emulate EventBridge.
+- The harness keeps its local bare repo as the remote. In CodeCommit mode its push panel publishes the
+  CodeCommit-shaped event with `PutEvents` to Floci's EventBridge, where the real rule (pattern and input
+  transformer) routes it to the inbox. That tests the trigger path end to end.
+- The pull request API subset gets a `CodeCommitFake` in `iae-testkit`, like `AuditManagerFake`.
 
 ### 5.3 State
 
@@ -1155,6 +1197,7 @@ and the "iae" GitHub App installed.
 | Q17 | Consistency of LLM verdicts across model versions | Pin the model per policy evaluation; re-run `.iae/policy-examples` on a model change and treat differences like a policy change |
 | Q18 | One Floci container per simulated account vs. one shared container (does Floci separate accounts by credentials?) | Per account to start: simplest isolation; revisit if startup time hurts |
 | Q19 | Floci CodeBuild for local builds (real Docker, slow) vs. a local build runner | Floci CodeBuild, so the build path matches production; add a local runner behind the same service only if it's too slow |
+| Q20 | Which git hosts to support (§5.2.1) | GitHub first (built); CodeCommit as the second host, behind the same inbox event and a `PullRequests` implementation per host, once the GitHub path runs on real accounts |
 
 ---
 
