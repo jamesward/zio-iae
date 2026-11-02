@@ -13,8 +13,9 @@ import zio.test.*
 object ServiceDeploySpec extends ZIOSpecDefault:
   val app = AppName("svc-app")
 
-  def manifest(port: Int, command: List[String], image: String = "hashicorp/http-echo:1.0"): Manifest =
-    val spec = ServiceSpec(5678, healthPath = "/", listenerPort = port, canary = CanarySpec(List(50, 100), 6, alarmPeriodSeconds = 10), command = command, image = Some(image))
+  /** A bake that expects an alarm should outlast Floci's evaluation of it, which can take more than a 10s period. */
+  def manifest(port: Int, command: List[String], image: String = "hashicorp/http-echo:1.0", alarms: List[AppAlarm] = Nil, bake: Int = 6): Manifest =
+    val spec = ServiceSpec(5678, healthPath = "/", listenerPort = port, canary = CanarySpec(List(50, 100), bake, alarmPeriodSeconds = 10, alarms = alarms), command = command, image = Some(image))
     Manifest(app, List(ResourceDecl(LogicalId("web"), ResourceSpec.Service(spec))), Nil)
 
   object AnyOrder extends CommitOrder:
@@ -41,6 +42,31 @@ object ServiceDeploySpec extends ZIOSpecDefault:
         _        <- engine.converge(manifest(port, List("-text=from-ecr"), s"$uri:c1"), env, None)
         served   <- get(http, ipOf(floci), port).repeat(Schedule.spaced(1.second) && Schedule.recurUntil[(Int, String)](_._2 == "from-ecr") && Schedule.recurs(60)).map(_._2)
       yield assertTrue(served == (200, "from-ecr")),
+    test("a version whose own alarm goes off is rolled back, and the rollback names the alarm"):
+      for
+        floci    <- ZIO.service[FlociContainer]
+        http     <- ZIO.service[Client]
+        clients  <- ZIO.environment[AwsEngine.Clients]
+        engine    = AwsEngine.make(BucketNaming(None), clients, clients, AnyOrder)
+        env      <- EngineSpec.uniqueEnv
+        port     <- Random.nextIntBounded(1000).map(17000 + _)
+        uploads   = List(AppAlarm("uploads", "UploadFailures", 3))
+        _        <- engine.converge(manifest(port, List("-text=v1"), alarms = uploads), env, None)
+        _        <- get(http, ipOf(floci), port).repeat(Schedule.spaced(1.second) && Schedule.recurUntil[(Int, String)](_._2 == "v1") && Schedule.recurs(60))
+        cw        = clients.get[DeployClients].cloudwatch
+        // What v2's containers publish while their uploads fail: v1 went to blue, so v2 is green.
+        failures  = cw.putMetric("iae/svc-app", "UploadFailures", 5, Map("Service" -> "web", "Color" -> "green"))
+        tripper  <- failures.repeat(Schedule.spaced(300.millis)).fork
+        bad      <- engine.converge(manifest(port, List("-text=v2"), alarms = uploads, bake = 15), env, None).either
+        _        <- tripper.interrupt
+        after    <- get(http, ipOf(floci), port)
+        names    <- cw.alarmNames(s"iae-svc-app-${env.value}-web-")
+      yield assertTrue(
+        bad.left.exists(_.message.contains("its uploads alarm went off at 50%")),
+        after == (200, "v1"),
+        names.toSet == Set(s"iae-svc-app-${env.value}-web-green-5xx", s"iae-svc-app-${env.value}-web-green-app-uploads",
+          s"iae-svc-app-${env.value}-web-blue-5xx", s"iae-svc-app-${env.value}-web-blue-app-uploads"),
+      ),
     test("a service is created and live, deployed again by canary, and a bad version is rolled back and not retried"):
       for
         floci    <- ZIO.service[FlociContainer]
@@ -62,7 +88,7 @@ object ServiceDeploySpec extends ZIOSpecDefault:
         cw        = clients.get[DeployClients].cloudwatch
         tags1    <- elb.loadBalancer(ServiceNaming.loadBalancer(address)).someOrFail("no lb").flatMap(lb => elb.tags(lb.arn))
         // The bad version: its alarm goes off once it has traffic.
-        v3        = manifest(port, List("-text=v3", "-status-code=500"))
+        v3        = manifest(port, List("-text=v3", "-status-code=500"), bake = 15)
         lb       <- elb.loadBalancer(ServiceNaming.loadBalancer(address)).someOrFail("no lb")
         blue     <- elb.targetGroup(ServiceNaming.targetGroup(address, Color.Blue)).someOrFail("no blue")
         // What a real ALB publishes for the new color while it answers 500s.

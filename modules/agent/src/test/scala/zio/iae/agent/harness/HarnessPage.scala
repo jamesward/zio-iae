@@ -33,6 +33,7 @@ object HarnessPage:
       |    <input id="commitMessage" placeholder="commit message" value="change infra">
       |    <p><button id="push">Commit and push</button></p>
       |    <h2>Commits</h2><pre id="commits"></pre>
+      |    <h2>Faults</h2><p>Injected into whichever version is in canary in the env.</p><div id="faults"></div>
       |    <h2>Scenarios</h2><div id="run"></div><div id="scenarios"></div></section>
       |</main>
       |<script>
@@ -70,12 +71,18 @@ object HarnessPage:
       |  if (document.activeElement !== speed) speed.value = s.clock.speed;
       |  const r = s.run;
       |  document.getElementById('run').innerHTML = r ? `<p><strong>${esc(r.name)}</strong>: ${r.status} — step ${Math.min(r.step, r.total)}/${r.total}: ${esc(r.current)}${r.error ? '<br>' + esc(r.error) : ''}</p>` : '';
+      |  const faults = [['Errors','answers 5xx'],['Slow','answers slowly'],['FailingMetric','reports failing uploads']];
+      |  document.getElementById('faults').innerHTML = s.envs.map(env => `<p><strong>${esc(env)}</strong> ` + faults.map(([f, label]) => {
+      |      const on = s.faults.some(a => a.env === env && a.fault === f);
+      |      return `<button class="${on ? 'reacted' : ''}" onclick="fault('${env}','${f}',${!on})">${on ? '⚠ ' : ''}${label}</button>`;
+      |    }).join(' ') + '</p>').join('');
       |  if (!scenariosShown) {
       |    document.getElementById('scenarios').innerHTML = s.scenarios.map(sc =>
       |      `<p><button onclick="runScenario('${sc.name}')">Run ${esc(sc.name)}</button> ${esc(sc.description)}</p>`).join('');
       |    scenariosShown = true;
       |  }
       |}
+      |function fault(env, fault, on) { post('/ui/fault', {env, fault, on}).then(refresh); }
       |function runScenario(name) { post('/ui/scenario', {name}).then(refresh); }
       |function advance(minutes) { post('/ui/clock/advance', {minutes}).then(refresh); }
       |document.getElementById('speed').onchange = e => post('/ui/clock/speed', {speed: Number(e.target.value)}).then(refresh);

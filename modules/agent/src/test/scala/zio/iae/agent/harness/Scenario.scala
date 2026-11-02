@@ -21,6 +21,8 @@ enum Step:
   case RestartAgent
   /** A change made outside the agent, e.g. by hand in the console. */
   case Drift(description: String, change: Harness => IO[String, Unit])
+  /** Switches a fault on or off for the version in canary in an env (by index). */
+  case InjectFault(env: Int, fault: Fault, on: Boolean)
 
   def describe: String = this match
     case Push(d, _, _)               => s"push: $d"
@@ -30,6 +32,7 @@ enum Step:
     case Advance(by)                 => s"advance the clock by ${by.render}"
     case RestartAgent                => "restart the agent"
     case Drift(d, _)                 => s"drift: $d"
+    case InjectFault(env, fault, on) => s"${if on then "make" else "stop making"} the canary in env ${env + 1} ${fault.describe}"
 
 final case class Scenario(name: String, description: String, steps: List[Step])
 
@@ -76,6 +79,8 @@ object Scenario:
       case Step.Advance(by)       => harness.ui.advance(by)
       case Step.RestartAgent      => harness.agent.restart
       case Step.Drift(_, change)  => change(harness)
+      case Step.InjectFault(env, fault, on) =>
+        ZIO.fromOption(harness.envs.lift(env)).orElseFail(s"no env ${env + 1}").flatMap(r => harness.faults.set(r.env, fault, on))
 
   // The built-in scenarios, for the UI's buttons and the headless tests.
 
@@ -212,18 +217,27 @@ object Scenario:
     ),
   )
 
-  /** The example's web service: http-echo, whose answer and status code are its arguments. */
+  /** The example's web service: http-echo, whose answer and status code are its arguments. Its canary is also gated on
+    * response time (Average, which Floci evaluates; p99 on AWS) and on the app's failing uploads.
+    */
   private def web(text: String, status: Int): ServiceSpec =
     ServiceSpec(
       5678,
       healthPath = "/",
-      canary = CanarySpec(List(50, 100), bakeSeconds = 1200, alarmPeriodSeconds = 10),
+      canary = CanarySpec(
+        List(50, 100),
+        bakeSeconds = 1200,
+        alarmPeriodSeconds = 10,
+        latency = Some(LatencyGate(1000, "Average")),
+        alarms = List(AppAlarm("uploads", "UploadFailures", 1)),
+      ),
       command = List(s"-text=$text", s"-status-code=$status"),
       image = Some("hashicorp/http-echo:1.0"),
     )
 
   object Web    extends Service.Id(LogicalId("web"), web("v1", 200))
   object WebBad extends Service.Id(LogicalId("web"), web("v2", 500))
+  object WebV2  extends Service.Id(LogicalId("web"), web("v2", 200))
 
   private def withService(id: Service.Id & Singleton): Map[String, String] =
     Map(Harness.manifest -> (Bucket.readWrite(Harness.Uploads) ++ Service.run(id)).manifest(Harness.app).toOption.get.toJson)
@@ -239,4 +253,24 @@ object Scenario:
     ),
   )
 
-  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy)
+  /** A healthy v2 whose canary in env 1 suffers the fault: rolled back there, with the alarm named, and kept from env 2. */
+  private def faultyDeploy(name: String, fault: Fault, alarm: String) = Scenario(
+    name,
+    s"A web service goes live everywhere; then v2's canary in staging ${fault.describe}, and its $alarm alarm rolls it back.",
+    List(
+      Step.Push("add the web service (v1)", "add the web service", _ => ZIO.succeed(withService(Web))),
+      appliedIn(1),
+      Step.InjectFault(0, fault, on = true),
+      Step.Push("deploy v2", "deploy v2", _ => ZIO.succeed(withService(WebV2))),
+      Step.WaitFor(
+        s"the canary in env 1 to roll back on its $alarm alarm",
+        (h, text) => text.contains("rolled back") && text.contains(s"its $alarm") && text.contains(s"${Harness.app.value}/${env(h, 0)}"),
+      ),
+      Step.InjectFault(0, fault, on = false),
+    ),
+  )
+
+  val slowDeploy    = faultyDeploy("slow-deploy", Fault.Slow, "latency")
+  val failingMetric = faultyDeploy("failing-metric", Fault.FailingMetric, "uploads")
+
+  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric)

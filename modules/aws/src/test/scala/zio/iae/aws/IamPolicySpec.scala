@@ -12,6 +12,16 @@ object IamPolicySpec extends ZIOSpecDefault:
   def grant(id: String, capability: Capability) = Grant(LogicalId.from(id).toOption.get, ResourceKind.Bucket, capability)
 
   def spec = suite("IamPolicy")(
+    test("a service with alarms of its own may publish metrics to its app's namespace only"):
+      val publish = Grant(LogicalId("web"), ResourceKind.Service, Capability.MetricsPublish)
+      val doc     = IamPolicy.permissions(app, env, RoleSpec(List(publish, grant("uploads", Capability.BucketRead)), Nil), naming, context)
+      val json    = doc.map(_.toJson).getOrElse("")
+      assertTrue(
+        doc.map(_.statements.head.condition) == Right(Some(Map("StringEquals" -> Map("cloudwatch:namespace" -> "iae/photo-app")))),
+        json.contains(""""Condition":{"StringEquals":{"cloudwatch:namespace":"iae/photo-app"}}"""),
+        json.split("\"Condition\"").length == 2, // the bucket's statement has none, not a null one
+      )
+    ,
     test("a reader may get and list one bucket, nothing else"):
       val doc = IamPolicy.permissions(app, env, RoleSpec(List(grant("uploads", Capability.BucketRead)), Nil), naming, context)
       assertTrue(

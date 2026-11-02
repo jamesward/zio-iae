@@ -21,7 +21,11 @@ final case class Infra[+R](
       case ResourceDecl(topic, ResourceSpec.Topic(spec)) if spec.subscribers.exists(s => !queues.contains(s.queue)) =>
         val missing = spec.subscribers.map(_.queue).filterNot(queues.contains).map(_.value).mkString(", ")
         InfraError.InvalidConfig(s"topic '${topic.value}' delivers to queues the app doesn't declare: $missing (declare them, e.g. with MessageQueue.wired)")
+    val invalidService = resources.collectFirst(Function.unlift:
+      case ResourceDecl(id, ResourceSpec.Service(spec)) => Service.invalid(spec).map(why => InfraError.InvalidConfig(s"service '${id.value}': $why"))
+      case _                                            => None
+    )
     val sortedGrants = grants.toList.sortBy(g => (g.id, g.capability.ordinal))
     val role = Option.when(sortedGrants.nonEmpty):
       ResourceDecl(Manifest.runtimeRole, ResourceSpec.Role(RoleSpec(sortedGrants, List(TrustedService.EcsTasks))))
-    conflict.orElse(unknownSubscriber).toLeft(Manifest(app = app, resources = byId.flatMap(_._2.headOption) ++ role.toList, grants = sortedGrants))
+    conflict.orElse(unknownSubscriber).orElse(invalidService).toLeft(Manifest(app = app, resources = byId.flatMap(_._2.headOption) ++ role.toList, grants = sortedGrants))

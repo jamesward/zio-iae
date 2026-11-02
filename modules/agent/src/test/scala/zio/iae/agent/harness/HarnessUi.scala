@@ -16,6 +16,7 @@ final case class SpeedAction(speed: Double) derives Schema
 final case class ScenarioAction(name: String) derives Schema
 final case class ScenarioInfo(name: String, description: String, steps: List[String]) derives Schema
 final case class AdvanceAction(minutes: Long) derives Schema
+final case class FaultAction(env: String, fault: Fault, on: Boolean) derives Schema
 final case class HarnessState(
     users: List[FakeUser],
     channel: String,
@@ -25,6 +26,8 @@ final case class HarnessState(
     clock: ClockState,
     scenarios: List[ScenarioInfo],
     run: Option[ScenarioRun],
+    envs: List[String],
+    faults: List[ActiveFault],
 ) derives Schema
 
 /** The harness's web UI: the Slack channel (as anyone), and a GitHub panel that edits files and pushes. A push sends
@@ -49,6 +52,7 @@ final case class HarnessUi(
     Method.POST / "ui" / "clock" / "speed"   -> handler((req: Request) => act[SpeedAction](req)(a => clock.setSpeed(a.speed))),
     Method.POST / "ui" / "clock" / "advance" -> handler((req: Request) => act[AdvanceAction](req)(a => advance(a.minutes.minutes))),
     Method.POST / "ui" / "scenario" -> handler((req: Request) => act[ScenarioAction](req)(a => start(a.name))),
+    Method.POST / "ui" / "fault"    -> handler((req: Request) => act[FaultAction](req)(a => ZIO.fromEither(zio.iae.EnvName.from(a.env)).mapError(_.toString).flatMap(env => harness.flatMap(_.faults.set(env, a.fault, a.on))))),
   )
 
   /** Jumps the clock and wakes the reconcilers, since a jump doesn't end their sleep. */
@@ -87,7 +91,9 @@ final case class HarnessUi(
       time  <- clock.state
       now   <- run.get
       infos  = Scenario.all.map(s => ScenarioInfo(s.name, s.description, s.steps.map(_.describe)))
-    yield HarnessState(slack.bot :: slack.users, slack.channel, messages.toList, files.toMap, log.linesIterator.toList, time, infos, now)
+      h     <- harness
+      active <- h.faults.list
+    yield HarnessState(slack.bot :: slack.users, slack.channel, messages.toList, files.toMap, log.linesIterator.toList, time, infos, now, h.envs.map(_.env.value), active)
 
   private def act[A: Schema](req: Request)(f: A => IO[String, Unit]): UIO[Response] =
     req.body.asString

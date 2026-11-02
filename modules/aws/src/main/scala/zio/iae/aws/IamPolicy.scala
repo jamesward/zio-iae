@@ -10,6 +10,7 @@ final case class Statement(
     @fieldName("Effect") effect: String,
     @fieldName("Action") actions: List[String],
     @fieldName("Resource") resources: List[String],
+    @fieldName("Condition") condition: Option[Map[String, Map[String, String]]] = None,
 ) derives Schema, CanEqual
 
 final case class PolicyDocument(@fieldName("Version") version: String, @fieldName("Statement") statements: List[Statement])
@@ -70,7 +71,12 @@ object IamPolicy:
         case ResourceKind.Topic =>
           Right(Statement(sid, "Allow", List("sns:Publish"), List(TopicNaming.arn(context, Address(app, env, ResourceKind.Topic, grant.id)))))
         case ResourceKind.Role    => Left(InfraError.InvalidConfig(s"a role can't be granted to an app: ${grant.id.value}"))
-        case ResourceKind.Service => Left(InfraError.InvalidConfig(s"a service can't be granted to an app: ${grant.id.value}"))
+        case ResourceKind.Service =>
+          grant.capability match
+            // PutMetricData has no resource to scope to; the condition keeps the app to its own namespace.
+            case Capability.MetricsPublish =>
+              Right(Statement(sid, "Allow", List("cloudwatch:PutMetricData"), List("*"), Some(Map("StringEquals" -> Map("cloudwatch:namespace" -> Service.metricsNamespace(app))))))
+            case other => Left(InfraError.InvalidConfig(s"a service can't be granted as $other: ${grant.id.value}"))
     statements.partitionMap(identity) match
       case (Nil, all)     => Right(PolicyDocument(version, all))
       case (error :: _, _) => Left(error)

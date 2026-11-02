@@ -26,6 +26,7 @@ final case class Harness(
     s3: List[S3Client],
     audit: AuditManagerFake,
     pulls: LocalPullRequests,
+    faults: Faults,
 )
 
 /** The agent as a process the harness can stop and start; a restart loses everything in memory, like a new
@@ -133,7 +134,8 @@ object Harness:
       scope    <- ZIO.scope
       executor  = ExecutorService(SlackWebApi(http, SlackToken("xoxb-executor"), base), self, executorEnvs, builds, SqsInbox(sqs, inboxUrl), 24.hours)
       _        <- ZIO.withClock(clock)(executor.consume(sqs, executorUrl)).forkIn(scope)
-      _        <- TrafficGenerator(http, app, Scenario.Web.logicalId, envNames.map(e => e -> accounts.getOrElse(e, tooling))).run.forkIn(scope)
+      faults   <- Faults.make
+      _        <- TrafficGenerator(http, app, Scenario.Web.logicalId, envNames.map(e => e -> accounts.getOrElse(e, tooling)), faults).run.forkIn(scope)
       httpEnv  <- ZIO.environment[Client]
       start = (for
                 model     <- Model.fromEnvironment.provideEnvironment(httpEnv).mapError(_.message)
@@ -149,7 +151,7 @@ object Harness:
               yield (fiber, reconcilers))
       agent    <- AgentProcess.make(start)
       s3        = envNames.map(env => S3Client(http, accounts.getOrElse(env, tooling)))
-      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3, audit, pulls)
+      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3, audit, pulls, faults)
       _        <- started.succeed(harness)
     yield harness
 

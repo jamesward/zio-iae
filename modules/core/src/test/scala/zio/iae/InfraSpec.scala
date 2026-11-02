@@ -13,10 +13,21 @@ object InfraSpec extends ZIOSpecDefault:
   final case class Resize(photo: String) derives zio.schema.Schema
   final case class Other(n: Int) derives zio.schema.Schema
   object Thumbnailer extends MessageQueue.Id[Resize](LogicalId("thumbnailer"))
+  object Watched extends Service.Id(LogicalId("web"), ServiceSpec(8080, canary = CanarySpec(alarms = List(AppAlarm("uploads", "UploadFailures", 1)))))
+  object Unwatched extends Service.Id(LogicalId("web"), ServiceSpec(8080))
+  object BadAlarm extends Service.Id(LogicalId("web"), ServiceSpec(8080, canary = CanarySpec(alarms = List(AppAlarm("Upload Failures", "UploadFailures", 1)))))
   object Indexer     extends MessageQueue.Id[Resize](LogicalId("indexer"))
   object PhotoEvents extends Topic.Id[Resize](LogicalId("photo-events"), List(Topic.to(Thumbnailer), Topic.to(Indexer)))
 
   def spec = suite("Infra")(
+    test("a service with alarms of its own may publish their metrics; one without may not"):
+      val watched   = Service.run(Watched).manifest(app).map(_.grants)
+      val unwatched = Service.run(Unwatched).manifest(app).map(_.grants)
+      assertTrue(watched == Right(List(Grant(LogicalId("web"), ResourceKind.Service, Capability.MetricsPublish))), unwatched == Right(Nil))
+    ,
+    test("an alarm name that can't be part of an alarm's name is refused"):
+      assertTrue(Service.run(BadAlarm).manifest(app).left.exists(_.toString.contains("Upload Failures")))
+    ,
     test("combining declarations merges resources and grants"):
       val infra = Bucket.readWrite(Uploads) ++ Bucket.reader(Thumbs) ++ Bucket.reader(Uploads)
       val manifest = infra.manifest(app)

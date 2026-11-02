@@ -14,7 +14,9 @@ enum AlarmState derives CanEqual:
 object AlarmState:
   def from(value: String): Option[AlarmState] = values.find(_.value == value)
 
-/** A metric alarm: a threshold on a statistic of a metric over evaluation periods. */
+/** A metric alarm: a threshold on a statistic of a metric over evaluation periods. A percentile statistic (`p99`,
+  * `p99.9`) is sent as CloudWatch's extended statistic.
+  */
 final case class MetricAlarm(
     name: String,
     namespace: String,
@@ -41,7 +43,8 @@ final case class CloudWatchClient(query: AwsQueryClient):
     call(
       "PutMetricAlarm",
       List(
-        "AlarmName" -> alarm.name, "Namespace" -> alarm.namespace, "MetricName" -> alarm.metric, "Statistic" -> alarm.statistic,
+        "AlarmName" -> alarm.name, "Namespace" -> alarm.namespace, "MetricName" -> alarm.metric,
+        (if CloudWatchClient.percentile(alarm.statistic) then "ExtendedStatistic" else "Statistic") -> alarm.statistic,
         "Period" -> alarm.periodSeconds.toString, "EvaluationPeriods" -> alarm.evaluationPeriods.toString,
         "Threshold" -> alarm.threshold.toString, "ComparisonOperator" -> alarm.comparison, "TreatMissingData" -> "notBreaching",
       ) ++ dims,
@@ -56,12 +59,18 @@ final case class CloudWatchClient(query: AwsQueryClient):
   def setState(name: String, state: AlarmState, reason: String): IO[AwsError, Unit] =
     call("SetAlarmState", List("AlarmName" -> name, "StateValue" -> state.value, "StateReason" -> reason)).unit
 
+  /** The names of the alarms whose names start with the prefix. */
+  def alarmNames(prefix: String): IO[AwsError, List[String]] =
+    call("DescribeAlarms", List("AlarmNamePrefix" -> prefix, "MaxRecords" -> "100")).map(e => (e \\ "MetricAlarms" \ "member").toList.map(m => (m \ "AlarmName").text.trim))
+
   def deleteAlarms(names: List[String]): IO[AwsError, Unit] =
     call("DeleteAlarms", names.zipWithIndex.map((n, i) => s"AlarmNames.member.${i + 1}" -> n)).unit.when(names.nonEmpty).unit
 
   private def call(action: String, params: List[(String, String)]): IO[AwsError, Elem] = query.call(protocol, action, params)
 
 object CloudWatchClient:
+  def percentile(statistic: String): Boolean = statistic.matches("p\\d+(\\.\\d+)?")
+
   val layer: ZLayer[AwsQueryClient, Nothing, CloudWatchClient] = ZLayer.fromFunction(CloudWatchClient.apply)
 
   private val protocol = AwsQueryProtocol(AwsService("monitoring", "monitoring"), "2010-08-01")
