@@ -676,7 +676,7 @@ Approvers are the @infra-approvers Slack group. Owners are @platform-owners.
 `EvaluatePolicy`: env; resource kind and id; change type (`Create`, `Update(fields)`, `Replace`, `Delete`, `Move`,
 `Deploy`, `Rollback`, `Cleanup`); risk; derived flags (`iamWidening`, `publicAccess`, `encryptionChange`,
 `dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert`,
-`Drift`, `Cleanup`, `Cost` and `Security` for changes the background jobs propose, §5.10); the projected monthly cost
+`Drift`, `Cleanup`, `Cost` and `Security` for changes the background jobs propose, §5.10, and `Incident` for failovers and restores, §8); the projected monthly cost
 change (§5.5.1); author; current date and time. PR
 descriptions, commit messages, Slack text and logs are not included, so they can't argue for a weaker verdict.
 
@@ -1375,9 +1375,187 @@ daily limit), and contract tests run against a real account when gated on.
   alert in prod. It never mutates prod
   outside the pipeline; rollback is the only fast path, and it's policy-gated.
 
+## 8. Resilience and disaster recovery
+
+Because infra is code and its state lives in the cloud, rebuilding it somewhere else is just a plan. Data is the
+exception: it isn't in git, so protecting it has to be declared. This section covers three things:
+
+1. **An Availability Zone failing** costs nothing: no human, no lost requests beyond the ones in flight.
+2. **A region failing, or data being lost** (a bad deploy, a hand delete, a compromised account), is recovered
+   through the same pipeline and policy. It's planned, approved, measured against declared RPO and RTO targets,
+   and rehearsed.
+3. **The agent keeps working, or stops safely,** when its own dependencies (AWS's APIs, GitHub, Slack, Bedrock) have
+   an incident.
+
+Today an env is one account and one region (§2). Services run in the default VPC across its subnets, but with
+`count = 1` by default, so a service is effectively in one AZ. Nothing is backed up beyond what the services
+themselves keep, and the agent is one task in one region.
+
+### 8.1 What can fail
+
+| Failure | Example | What it takes down | Response |
+|---|---|---|---|
+| AZ impairment | One AZ's power or network | Tasks and load balancer nodes in that AZ | Automatic: tasks spread over AZs, traffic shifted away from the AZ (§8.3) |
+| Regional service event | ECS or ELB APIs failing in a region, data plane fine | Deploys, scaling, the agent's plans | Freeze changes to the env, keep what runs, report it (§8.6) |
+| Region outage | Most services in a region down | The whole env | Fail over to the standby region, policy-gated (§8.4) |
+| Data loss or corruption | A bad release deletes items; someone empties a bucket | One resource's data | Restore to a point in time, policy-gated (§8.5) |
+| Account compromise | Leaked admin credentials | Possibly everything in the account | Escalate; rebuild in a clean account from git and the backup account (§8.5) |
+| Capacity or quota | No Fargate capacity in an AZ; a service quota reached | New tasks | Report with the quota or AZ, try the other AZs (§8.6) |
+| Dependency outage | GitHub, Slack, Bedrock, the agent's own region | The agent's inputs or judgement | Degrade safely (§8.6) |
+
+### 8.2 Declaring resilience
+
+How resilient an env must be differs per env, not per app version, so it goes in `.iae/config.json`, not in the
+`Infra` code:
+
+```json
+"resilience": {
+  "prod":    { "tier": "pilot-light", "standbyRegion": "us-west-2", "rpoMinutes": 15, "rtoMinutes": 60 },
+  "staging": { "tier": "multi-az" }
+}
+```
+
+Tiers, from cheapest:
+
+| Tier | What it adds | Typical RPO / RTO |
+|---|---|---|
+| `multi-az` (the default for every env) | Services spread over at least two AZs with at least two tasks in production envs; zonal shift on their load balancers; point-in-time recovery on tables | AZ failure: none / none |
+| `backup-restore` | Backups copied to the standby region (AWS Backup); recovery rebuilds the env there from git and restores the data | Hours / hours |
+| `pilot-light` | Data replicated continuously to the standby region; the standby's stateless resources exist but its services run no tasks | Minutes / tens of minutes |
+| `warm-standby` | Pilot light, with the standby's services running at reduced count | Minutes / minutes |
+| `active-active` (later) | Both regions serve traffic; needs global routing and multi-writer data throughout | Seconds / seconds |
+
+What each tier means per kind:
+
+| Kind | `multi-az` | Standby region (`backup-restore` and up) |
+|---|---|---|
+| Service | At least 2 tasks in production envs, spread over subnets in at least 2 AZs; zonal shift and autoshift on the load balancer | `pilot-light`: the service at count 0; `warm-standby`: reduced count; the image replicated to the region's ECR |
+| Bucket | (S3 is multi-AZ) | Versioning on, and Cross-Region Replication to a replica bucket; `backup-restore`: AWS Backup copies |
+| Table | Point-in-time recovery (35 days) | A global-table replica; `backup-restore`: AWS Backup copies |
+| Queue | (SQS is multi-AZ) | An empty queue of the same spec. Messages aren't replicated: those in the failed region are lost or drained later, which the failover plan says |
+| Topic | (multi-AZ) | The topic and its subscriptions |
+| Secret | (multi-AZ) | A replica secret |
+| Role | (IAM is global) | Nothing |
+
+- **The engine applies the tier** as part of planning the env: the same manifest, adjusted per tier and region, so
+  replication and backups are ordinary planned changes with their risk and approvals. For example, `count 1 → 2
+  (multi-AZ in prod)` is visible in the plan rather than silently changed.
+- **The facts carry the tier and targets** (§5.5), so the policy can reason about them.
+- **The security auditor reports a gap** (§5.10) when what's declared can't meet the RPO or RTO: a 15-minute RPO with
+  daily backups, or a standby region without a replica of a table.
+
+### 8.3 Availability Zones
+
+- **Spread:** services get subnets in at least two AZs (the load balancer needs that anyway), and ECS spreads
+  Fargate tasks over them. In production envs the engine runs at least two tasks, whatever the spec's `count`.
+- **Shifting traffic:** iae turns on Route 53 ARC zonal shift and zonal autoshift for production load balancers,
+  where the load balancer supports it (to be confirmed for ALBs with cross-zone load balancing on).
+  - AWS then moves traffic out of an impaired AZ by itself.
+  - Autoshift's practice runs use the service's canary alarms as their blocking alarms, so a practice run stops if
+    the service suffers.
+- **The monitor's health check** reports unhealthy targets and missing tasks by AZ. An alert that lines up with an
+  AWS Health event for the AZ says so ("AZ use1-az2 is impaired (AWS Health); ECS is replacing the tasks there"),
+  and triage doesn't propose a rollback for it.
+- **Data:** DynamoDB, S3, SQS, SNS and Secrets Manager are regional and spread over AZs by AWS; there's nothing to
+  do.
+
+### 8.4 Region failover
+
+- **The standby is a second location of the env.**
+  - Each env region gets its own `EnvRuntime` (engine, clients, discovery) and an `iae:region` tag.
+  - The reconciler plans both regions from the same manifest, adjusted by the tier.
+  - Global names (buckets) carry the region.
+- **Traffic needs a stable name.**
+  - A service gets a DNS name (a `domain` in the env config, in a hosted zone the platform module owns, Q7).
+  - Failover moves that name to the standby region, through Route 53 failover records with health checks.
+  - Alternatively, ARC routing controls: a highly available data plane, at a cost of its own (Q24).
+- **Failover is a plan.** `Engine.failover(env, to)` plans, as `Failover` changes:
+  1. **Freeze** the env: no reconcile changes the failed region until failback.
+  2. **Promote the data:**
+     - global tables are already writable;
+     - apps in the standby region bind to its replica buckets and secrets.
+  3. **Scale** the standby's services to their declared counts.
+  4. **Move the traffic:** the failover record, or the routing control.
+  5. **Report** the RPO it achieved (the replication lag metrics: S3 `ReplicationLatency`, DynamoDB
+     `ReplicationLatency`) and the time it took, against the declared targets.
+- **The policy decides who approves.**
+  - A failover is `Critical`, with `origin = Incident`.
+  - By default, the floor needs an owner.
+  - `POLICY.md` may allow it without one, e.g. "fail prod over without asking when AWS Health confirms a regional
+    event and the standby is healthy" (Q23).
+- **What triggers it:**
+  - The monitor sees an env's services degraded in the region together.
+  - It reads AWS Health: `aws.health` events through EventBridge, and `DescribeEvents` and
+    `DescribeAffectedEntities` for the account.
+  - It opens an incident thread with the triage (which services, which region, what AWS says) and the failover plan
+    to approve.
+- **Static stability:** the failover never depends on the failed region.
+  - The agent and executor call the standby region's endpoints directly, and use regional STS endpoints there, not
+    the global one.
+  - They assume the standby's deployer role.
+  - Moving traffic uses the Route 53 or ARC data plane where it can.
+- **Failback** is a planned change at a chosen time, not automatic:
+  - the failed region catches up (global tables do that by themselves; bucket replication is reversed for the
+    duration);
+  - then the same pipeline moves traffic back and unfreezes the env.
+
+### 8.5 Data recovery
+
+- **Backups by tier:**
+  - point-in-time recovery on every table in production envs;
+  - versioning, with old versions kept by the bucket's lifecycle, on every bucket in production envs;
+  - AWS Backup plans for cross-region copies.
+- **Against account compromise:** copies go to a separate backup account, whose vault is locked (WORM), so leaked
+  credentials in the env account can't delete them (Q26).
+- **A restore is a plan.**
+  - `Engine.restore(address, at)` restores into a new resource (DynamoDB `RestoreTableToPointInTime`; for a bucket,
+    the object versions as of `at`).
+  - The logical id then binds to the restored resource by its tags (`iae:restored-from`).
+  - The damaged one is orphaned, not deleted, so nothing more is lost.
+  - It's `Critical` with `origin = Incident`; owners approve by default.
+- **Rebuilding an account:**
+  - Everything but the data is in git, so a clean account is a bootstrap and a reconcile.
+  - The data comes from the backup account.
+  - This is a break-glass runbook (`iae dr rebuild`), run by people, recorded as evidence.
+
+### 8.6 Incidents in the agent's dependencies
+
+| Dependency down | What still works | What iae does |
+|---|---|---|
+| An AWS API in the env's region (control plane) | Running services (data plane) | Plans and applies fail and are retried with backoff (applies are idempotent, so a half-done one is just the next plan). The env is frozen for deploys while AWS Health reports the event, with one notice naming it |
+| STS's global endpoint | Everything, with regional endpoints | Use regional STS endpoints everywhere; cached credentials last up to an hour |
+| ECR in the agent's region | Running tasks | New deploys can't pull: ECR replication rules copy images to each env region, so tasks pull locally |
+| CodeBuild | Everything but builds | Builds wait; one notice |
+| GitHub | Everything | No pushes arrive. Reconciles, rollbacks, cleanup and failover work from the last fetched commit: a failed fetch isn't fatal on those paths |
+| Slack | Changes the policy lets go ahead | Nothing that needs an approval can happen (it can't be verified), which is the safe failure. Notices wait and are retried. An owner can use `iae apply --break-glass` from the CLI, which is recorded as evidence and posted once Slack is back |
+| Bedrock | Everything deterministic | The risk table replaces `POLICY.md` (owners for anything doubtful, as now); no triage, explanations or reviews |
+| The agent's own region | The envs' services | A cold standby (agent, executor, inbox and webhook) bootstrapped in a second region at desired count 0, with the webhook behind a Route 53 failover record. An owner starts it (`iae dr activate-agent`); having no state, it rehydrates from git, AWS and Slack (§5.3) |
+| Capacity or quotas | Running tasks | The failure names the AZ or quota; ECS retries in the other AZs; a quota is reported with the request to raise it |
+
+### 8.7 Drills
+
+A recovery that's never rehearsed doesn't count.
+
+- **Harness:**
+  - "AZ down" stops the tasks in one subnet's containers.
+  - "Region down" runs a second Floci per region and stops the primary's container. The failover scenario then
+    runs end to end through the policy.
+  - Floci probably doesn't emulate replication (to be confirmed). If it doesn't, the harness copies data between
+    its Floci instances as replication would, and the real behaviour is covered by the gated real-AWS contract
+    tests (§4).
+- **Restore tests (`DrillJob`, weekly in staging):**
+  - restore the latest point in time of each table to a temporary table, compare its item count, delete it;
+  - the same for a bucket's versions;
+  - the result is evidence that the backups restore (a new Audit Manager control, IAE-CM-5).
+- **Game days (real accounts, gated and paid):**
+  - AWS Fault Injection Service experiments: AZ power interruption, task stops, network disruption;
+  - ARC practice runs;
+  - a quarterly region failover of staging, with the measured RPO and RTO reported against the declared targets,
+    then failback.
+
 ---
 
-## 8. Repository layout
+## 9. Repository layout
 
 ```
 zio-iae/
@@ -1413,7 +1591,7 @@ and the "iae" GitHub App installed.
 
 ---
 
-## 9. Milestones
+## 10. Milestones
 
 | # | Deliverable | Done when |
 |---|---|---|
@@ -1425,10 +1603,11 @@ and the "iae" GitHub App installed.
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 ✅ (locally) | Monitor ✅ (service gates, queue and table default alarms, health without an alarm) + drift reporting with CloudTrail attribution and policy-gated revert ✅; `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 ✅ (locally) | Cleanup job (orphans past retention, old task definitions, abandoned apps, old images, idle resources + `ReviewCleanup`) ✅; cost optimizer (right-sizing, storage, the bill beside projections, anomalies + `ReviewCost`) ✅; security auditor (unused permissions, own checks, Security Hub, GuardDuty, Inspector, Access Analyzer, threats escalated + `ReviewSecurity`) ✅; cost projection on plans with Price List prices and a plan-level limit (§5.5.1) ✅ | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
+| M8 | Resilience (§8): `multi-az` defaults (spread, two tasks in production, zonal shift, point-in-time recovery); AWS Health in the monitor and triage; freezing on regional events; standby regions with replication and `Engine.failover`; `Engine.restore`; degraded operation without GitHub, Slack or Bedrock; cold standby agent; harness AZ and region faults; `DrillJob` restore tests | In the harness: an AZ fault costs no requests beyond those in flight; a region fault fails prod over to its standby after an owner approves, reporting RPO and RTO; a weekly restore test passes |
 
 ---
 
-## 10. Open questions
+## 11. Open questions
 
 | # | Question | Current leaning |
 |---|---|---|
@@ -1439,7 +1618,7 @@ and the "iae" GitHub App installed.
 | Q5 | When to split out the executor (§5.11) | Before managing prod (M4) |
 | Q6 | Does the agent need durable memory beyond what it can rehydrate (learned facts about a system, runbooks)? | If so, as markdown in the repo (`.iae/agent/notes/`) written through PRs, so it's reviewed and versioned rather than a hidden store |
 | Q7 | Multi-app repos and shared infra (VPC, ALB, DNS zone) owned by a platform `InfraModule` | Platform module with its own Slack channel and policy; apps reference it by id |
-| Q8 | Multi-region / multi-account per env | Out of scope until M5 |
+| Q8 | Multi-region / multi-account per env | Multi-account per env built (§5.11); multi-region as a standby location of an env (§8.4, M8) |
 | Q9 | High availability: one agent task vs. leader election | One task; SQS buffers during restarts and the commit guard covers overlap. Revisit if restart gaps hurt |
 | Q10 | Commit guard read-then-write race during agent redeploys | Accept; stop-before-start makes the overlap rare and the next reconcile converges |
 | Q11 | Slack retention and audit: approvals and questions must stay readable at least until they expire; long-term proof is the S3 evidence copy | Require channel retention ≥ 30 days; checked at bootstrap |
@@ -1453,10 +1632,15 @@ and the "iae" GitHub App installed.
 | Q19 | Floci CodeBuild for local builds (real Docker, slow) vs. a local build runner | Floci CodeBuild, so the build path matches production; add a local runner behind the same service only if it's too slow |
 | Q20 | Which git hosts to support (§5.2.1) | GitHub first (built); CodeCommit as the second host, behind the same inbox event and a `PullRequests` implementation per host, once the GitHub path runs on real accounts |
 | Q21 | Price source for cost projection (§5.5.1): the Price List API, a bundled table, or both | Both: the Price List API cached daily, with a bundled table for when it's unreachable and for tests; usage from 30 days of CloudWatch metrics |
+| Q22 | Default resilience tier for production envs (§8.2) | `multi-az` everywhere by default; a standby tier only when the config asks, since it roughly doubles the stateful cost |
+| Q23 | Can a region failover ever go ahead without an owner? | The floor asks an owner by default; `POLICY.md` may allow it when AWS Health confirms a regional event and the standby is healthy |
+| Q24 | The traffic switch for failover: Route 53 failover records with health checks, or ARC routing controls | Failover records (cheap, health checks are data plane); ARC routing controls for teams that need its availability and accept its cost |
+| Q25 | The agent in a region outage: a cold standby started by an owner, or an active agent in two regions | Cold standby: no leader election, and the agent has no state to replicate |
+| Q26 | A separate backup account with a locked vault, for recovering from a compromised account | Yes for production envs, set up by `iae bootstrap` |
 
 ---
 
-## 11. Next step
+## 12. Next step
 
 Bootstrap the repository with the instructions at <https://start.jamesward.com> (the `zen-of-projects` Skill):
-sbt 2, `AGENTS.md`, CI, sbta. Then lay out the modules in §8 and start M1.
+sbt 2, `AGENTS.md`, CI, sbta. Then lay out the modules in §9 and start M1.
