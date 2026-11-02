@@ -53,8 +53,20 @@ final case class Monitor(
     ZIO.foreachDiscard(envs): runtime =>
       ZIO.foreachDiscard(apps): app =>
         runtime.engine.alarms(app, runtime.env).mapError(e => AgentError.Config(e.message)).flatMap: alarms =>
-          ZIO.foreachDiscard(alarms)(a => observe(Alert(runtime.env, app, a), runtime))
+          ZIO.foreachDiscard(alarms)(a => observe(Alert(runtime.env, app, a), runtime)) *>
+            retired(runtime.env, app, alarms.map(_.alarm).toSet)
     *> followUp
+
+  /** An open alert whose alarm no longer watches a live version (a rollback or a deploy moved the traffic away) is
+    * over for this env: resolved, saying so.
+    */
+  private def retired(env: EnvName, app: AppName, watched: Set[String]): IO[AgentError, Unit] =
+    val prefix = s"iae-${app.value}-${env.value}-"
+    open.updateZIO: known =>
+      known.fold(rehydrate)(ZIO.succeed(_)).flatMap: current =>
+        val gone = current.filter((alarm, _) => alarm.startsWith(prefix) && !watched.contains(alarm))
+        ZIO.foreachDiscard(gone.values)(resolve(_, "its version no longer has the traffic"))
+          .as(Some(current -- gone.keys))
 
   /** A rollback asked for in an alert's thread; while it waits on approvers it is asked again on each sweep. */
   def rollback(alert: Alert, runtime: EnvRuntime, thread: String): IO[String, String] =
@@ -79,7 +91,7 @@ final case class Monitor(
       known.fold(rehydrate)(ZIO.succeed(_)).flatMap: current =>
         (current.get(alert.alarm.alarm), alert.alarm.firing) match
           case (None, true)         => raise(alert, runtime).map(o => Some(current + (alert.alarm.alarm -> o)))
-          case (Some(o), false)     => resolve(o) *> pending.update(_ - ((alert.env, alert.app, alert.alarm.address.id))).as(Some(current - alert.alarm.alarm))
+          case (Some(o), false)     => resolve(o, "the alarm is quiet again") *> pending.update(_ - ((alert.env, alert.app, alert.alarm.address.id))).as(Some(current - alert.alarm.alarm))
           case _                    => ZIO.succeed(Some(current))
 
   private def raise(alert: Alert, runtime: EnvRuntime): IO[AgentError, Opened] =
@@ -92,11 +104,11 @@ final case class Monitor(
       _       <- ZIO.logWarning(s"alert in ${alert.where}: ${alert.alarm.alarm}")
     yield Opened(ts, text, now)
 
-  private def resolve(opened: Opened): IO[AgentError, Unit] =
+  private def resolve(opened: Opened, why: String): IO[AgentError, Unit] =
     for
       now <- Clock.instant
       took = java.time.Duration.between(opened.since, now).nn
-      _   <- slack.post(channel, s"Cleared: the alarm is quiet again${if took.isNegative then "" else s" after ${minutes(took)}"}.", Some(opened.ts), None)
+      _   <- slack.post(channel, s"Cleared: $why${if took.isNegative then "" else s" after ${minutes(took)}"}.", Some(opened.ts), None)
       _   <- slack.update(channel, opened.ts, opened.text.replaceFirst(java.util.regex.Pattern.quote(AlertLabel), ResolvedLabel), None)
     yield ()
 

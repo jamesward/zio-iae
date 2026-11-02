@@ -115,6 +115,21 @@ object MonitorSpec extends ZIOSpecDefault:
           thread.last == "Rollback: handed to the executor (plan rollback-web), which checks it again and rolls back.",
           again == 2,
         ),
+    test("an alert whose version loses the traffic (a rollback) is resolved, saying so"):
+      ZIO.scoped:
+        for
+          repo    <- TestRepo.make
+          ws       = repo.workspace(env)
+          alarms  <- Ref.make(List(alarm(firing = true)))
+          slack   <- InMemorySlack.make(Map("platform-owners" -> Set("U_BOB")))
+          monitor <- Monitor.make(List(runtime(alarms, ws)), List(app), slack, slack.self, channel, owners, None)
+          _       <- monitor.sweep.mapError(_.message)
+          // Rolled back: blue is live, and its alarms are quiet.
+          _       <- alarms.set(List(alarm(firing = false).copy(alarm = "iae-photo-app-prod-web-blue-5xx")))
+          _       <- monitor.sweep.mapError(_.message)
+          after   <- slack.posted(channel)
+          thread  <- slack.threadTexts(channel, after.head.ts)
+        yield assertTrue(after.size == 1, after.head.text.startsWith("*Resolved*"), thread.last.startsWith("Cleared: its version no longer has the traffic")),
     test("after a restart, an open alert is found in the channel: not raised again, and resolved when it clears"):
       ZIO.scoped:
         for
