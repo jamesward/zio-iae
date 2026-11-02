@@ -79,6 +79,9 @@ object Harness:
                 val name = RoleName.from(role).toOption.get
                 iam.getRole(name).flatMap(r => iam.createRole(name, "/", trust, Map.empty).when(r.isEmpty)).mapError(_.message)
                   .as(s"arn:aws:iam::${account.value}:role/$role")
+      ecsTrust = """{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}"""
+      execution = RoleName.from("iae-task-execution").toOption.get
+      _       <- iam.getRole(execution).flatMap(r => iam.createRole(execution, "/iae/", ecsTrust, Map.empty).when(r.isEmpty)).mapError(_.message)
       bucket   = BucketName.from(s"iae-evidence-${env.value}").toOption.get
       s3       = S3Client(http, config)
       exists  <- s3.bucketExists(bucket).mapError(_.toString)
@@ -123,7 +126,8 @@ object Harness:
       executorUrl <- sqs.createQueue(s"iae-harness-executor-${envNames.map(_.value).mkString("-")}", Map.empty, Map.empty).mapError(_.message)
       // Builds run in the tooling account's CodeBuild (Floci runs them as containers).
       buildsAt  = BucketName.from(s"iae-builds-${envNames.head.value}").toOption.get
-      builds   <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, tooling)), S3Client(http, tooling), buildsAt, "arn:aws:iam::000000000000:role/iae-build", "alpine:3.20")
+      builds   <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, tooling)), S3Client(http, tooling), buildsAt, "arn:aws:iam::000000000000:role/iae-build", "alpine:3.20",
+                    Some(EcrClient(AwsJsonClient(http, tooling))))
                     .mapError(_.message)
       pulls    <- LocalPullRequests.make(repo.remote.toString)
       scope    <- ZIO.scope

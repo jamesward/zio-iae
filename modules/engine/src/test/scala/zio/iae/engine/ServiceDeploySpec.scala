@@ -6,21 +6,41 @@ import zio.http.{Client, Request, URL}
 import zio.iae.*
 import zio.iae.aws.*
 import zio.iae.aws.client.*
-import zio.iae.testkit.FlociLayer
+import zio.iae.testkit.{FlociLayer, FlociRegistry}
 import zio.test.*
 
 /** Services on Floci: created and deployed, then deployed again by canary, and a bad version rolled back. */
 object ServiceDeploySpec extends ZIOSpecDefault:
   val app = AppName("svc-app")
 
-  def manifest(port: Int, command: List[String]): Manifest =
-    val spec = ServiceSpec(5678, healthPath = "/", listenerPort = port, canary = CanarySpec(List(50, 100), 6, alarmPeriodSeconds = 10), command = command, image = Some("hashicorp/http-echo:1.0"))
+  def manifest(port: Int, command: List[String], image: String = "hashicorp/http-echo:1.0"): Manifest =
+    val spec = ServiceSpec(5678, healthPath = "/", listenerPort = port, canary = CanarySpec(List(50, 100), 6, alarmPeriodSeconds = 10), command = command, image = Some(image))
     Manifest(app, List(ResourceDecl(LogicalId("web"), ResourceSpec.Service(spec))), Nil)
 
   object AnyOrder extends CommitOrder:
     def isAncestor(ancestor: CommitSha, descendant: CommitSha): IO[EngineError, Boolean] = ZIO.succeed(true)
 
+  def get(http: Client, ip: String, port: Int) =
+    http.batched(Request.get(URL.decode(s"http://$ip:$port/").toOption.get)).flatMap(r => r.body.asString.map(b => (r.status.code, b.trim)))
+
+  def ipOf(floci: FlociContainer): String =
+    floci.getContainerInfo.nn.getNetworkSettings.nn.getNetworks.nn.values.nn.iterator.nn.next.nn.getIpAddress.nn
+
   def spec = suite("Services on Floci")(
+    test("a service runs an image pushed to ECR, as a build pushes it"):
+      for
+        floci    <- ZIO.service[FlociContainer]
+        http     <- ZIO.service[Client]
+        aws      <- ZIO.service[AwsConfig]
+        clients  <- ZIO.environment[AwsEngine.Clients]
+        engine    = AwsEngine.make(BucketNaming(None), clients, clients, AnyOrder)
+        env      <- EngineSpec.uniqueEnv
+        port     <- Random.nextIntBounded(1000).map(18000 + _)
+        uri      <- EcrClient(AwsJsonClient(http, aws)).ensureRepository(s"iae/svc-app-${env.value}", Map.empty)
+        _        <- FlociRegistry.push(aws, "000000000000", "hashicorp/http-echo:1.0", s"iae/svc-app-${env.value}", "c1")
+        _        <- engine.converge(manifest(port, List("-text=from-ecr"), s"$uri:c1"), env, None)
+        served   <- get(http, ipOf(floci), port).repeat(Schedule.spaced(1.second) && Schedule.recurUntil[(Int, String)](_._2 == "from-ecr") && Schedule.recurs(60)).map(_._2)
+      yield assertTrue(served == (200, "from-ecr")),
     test("a service is created and live, deployed again by canary, and a bad version is rolled back and not retried"):
       for
         floci    <- ZIO.service[FlociContainer]
@@ -29,9 +49,7 @@ object ServiceDeploySpec extends ZIOSpecDefault:
         engine    = AwsEngine.make(BucketNaming(None), clients, clients, AnyOrder)
         env      <- EngineSpec.uniqueEnv
         port     <- Random.nextIntBounded(1000).map(19000 + _)
-        ip        = floci.getContainerInfo.nn.getNetworkSettings.nn.getNetworks.nn.values.nn.iterator.nn.next.nn.getIpAddress.nn
-        get       = http.batched(Request.get(URL.decode(s"http://$ip:$port/").toOption.get)).flatMap(r => r.body.asString.map(b => (r.status.code, b.trim)))
-        serving   = (text: String) => get.repeat(Schedule.spaced(1.second) && Schedule.recurUntil[(Int, String)](_._2 == text) && Schedule.recurs(60)).map(_._2)
+        serving   = (text: String) => get(http, ipOf(floci), port).repeat(Schedule.spaced(1.second) && Schedule.recurUntil[(Int, String)](_._2 == text) && Schedule.recurs(60)).map(_._2)
         v1        = manifest(port, List("-text=v1"))
         _        <- engine.converge(v1, env, None)
         first    <- serving("v1")

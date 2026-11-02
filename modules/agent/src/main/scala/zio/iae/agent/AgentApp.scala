@@ -27,7 +27,8 @@ object AgentApp extends ZIOAppDefault:
     env(name).flatMap(v => ZIO.fromOption(v.map(_.toIntOption)).orElseSucceed(Some(default)).someOrFail(AgentError.Config(s"$name must be a number")))
 
   /** CodeBuild with `IAE_BUILD_BUCKET` and `IAE_BUILD_ROLE` (the builds' service role), and optionally
-    * `IAE_BUILD_IMAGE`; without them, builds run in the agent, which is only for development.
+    * `IAE_BUILD_IMAGE`; without them, builds run in the agent, which is only for development. Apps whose build pushes
+    * their image get their repositories in ECR in the agent's account.
     */
   def buildsFrom(base: AwsConfig, http: Client): IO[AgentError, ManifestSource] =
     env("IAE_BUILD_BUCKET").flatMap:
@@ -38,7 +39,7 @@ object AgentApp extends ZIOAppDefault:
           bucket <- ZIO.fromEither(BucketName.from(name)).mapError(AgentError.Config(_))
           role   <- required("IAE_BUILD_ROLE")
           image  <- env("IAE_BUILD_IMAGE").map(_.getOrElse("aws/codebuild/amazonlinux-x86_64-standard:5.0"))
-          builds <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, base)), S3Client(http, base), bucket, role, image)
+          builds <- CodeBuildManifests.make(CodeBuildClient(AwsJsonClient(http, base)), S3Client(http, base), bucket, role, image, Some(EcrClient(AwsJsonClient(http, base))))
         yield builds
 
   /** The GitHub App the agent opens pull requests as: `IAE_GITHUB_APP_ID`, `IAE_GITHUB_INSTALLATION_ID` and the private

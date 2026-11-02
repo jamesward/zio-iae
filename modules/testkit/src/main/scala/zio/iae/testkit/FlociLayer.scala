@@ -1,6 +1,7 @@
 package zio.iae.testkit
 
 import io.floci.testcontainers.FlociContainer
+import org.testcontainers.containers.Network
 import org.testcontainers.utility.DockerImageName
 import zio.*
 import zio.iae.aws.client.*
@@ -13,8 +14,12 @@ object FlociLayer:
     ZLayer.scoped:
       ZIO.acquireRelease(
         ZIO.attemptBlocking:
-          // The Docker socket lets Floci run CodeBuild builds (and later ECS tasks) as real containers.
-          val floci = FlociContainer(DockerImageName.parse(image)).withDockerSocket(true).nn
+          // The Docker socket lets Floci run CodeBuild builds and ECS tasks as real containers. A network of its own
+          // lets it reach its ECR registry (another container) by name, which Docker's default bridge doesn't. Path-style
+          // repository URIs (localhost:<port>/<account>/<region>/<repo>) are the ones every Docker daemon pulls over plain
+          // HTTP; one with the containerd image store takes `*.localhost` for HTTPS.
+          val floci = FlociContainer(DockerImageName.parse(image)).withDockerSocket(true).nn.withNetwork(Network.newNetwork()).nn
+            .withEnv("FLOCI_SERVICES_ECR_URI_STYLE", "path").nn
           floci.start()
           floci
       )(floci => ZIO.attemptBlocking(floci.stop()).ignoreLogged)

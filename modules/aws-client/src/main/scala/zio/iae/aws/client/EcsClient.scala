@@ -126,6 +126,14 @@ final case class EcrClient(json: AwsJsonClient):
       .someOrElseZIO:
         call[Create, Created]("CreateRepository", Create(name, tags.toList.sorted.map((k, v) => EcsClient.Tag(k, v)))).map(_.repository.repositoryUri)
 
+  /** Lets the accounts pull the repository's images (replacing whoever could before). */
+  def setPullers(name: String, accounts: Set[String]): IO[AwsError, Unit] =
+    val principals = accounts.toList.sorted.map(a => s"\"arn:aws:iam::$a:root\"").mkString(",")
+    val policy =
+      s"""{"Version":"2012-10-17","Statement":[{"Sid":"iae-pull","Effect":"Allow","Principal":{"AWS":[$principals]},""" +
+        """"Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"]}]}"""
+    call[SetPolicy, AwsJsonClient.Empty]("SetRepositoryPolicy", SetPolicy(name, policy)).unit
+
   /** Whether an image with the tag is in the repository. */
   def hasImage(repository: String, tag: String): IO[AwsError, Boolean] =
     call[ImagesRequest, Images]("DescribeImages", ImagesRequest(repository, List(ImageId(tag))))
@@ -144,6 +152,7 @@ object EcrClient:
   final case class Repositories(repositories: Option[List[Repository]]) derives Schema
   final case class Create(repositoryName: String, tags: List[EcsClient.Tag]) derives Schema
   final case class Created(repository: Repository) derives Schema
+  final case class SetPolicy(repositoryName: String, policyText: String) derives Schema
   final case class ImageId(imageTag: String) derives Schema
   final case class ImagesRequest(repositoryName: String, imageIds: List[ImageId]) derives Schema
   final case class ImageDetail(imageTags: Option[List[String]]) derives Schema

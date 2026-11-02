@@ -25,17 +25,26 @@ final case class ExecutorService(
   def handle(request: ApplyRequest): UIO[Unit] =
     execute(request).foldZIO(reason => refuse(request, reason), _ => ZIO.unit)
 
-  /** Reads the executor's queue, one request at a time. */
+  /** Reads the executor's queue. Each env has a lane of its own, where requests are handled one at a time (an env's
+    * workspace is checked out at one commit at a time), so a canary baking in one env doesn't hold up the others. A
+    * request already waiting in its lane is dropped: the agent asks again on each reconcile until the change is in.
+    * Messages are deleted once they're in a lane; if the executor stops first, the agent's next reconcile asks again.
+    */
   def consume(sqs: SqsClient, url: QueueUrl): UIO[Nothing] =
-    sqs.receive(url, 10, 20)
-      .flatMap: messages =>
-        ZIO.foreachDiscard(messages): message =>
-          (ApplyRequest.decode(message.body) match
-            case Left(e)        => ZIO.logWarning(s"executor: ignoring an unreadable request: $e")
-            case Right(request) => handle(request)
-          ) *> sqs.delete(url, message.receipt)
-      .catchAllCause(c => ZIO.logErrorCause("executor: reading the queue failed", c).delay(5.seconds))
-      .forever
+    for
+      lanes <- ZIO.foreach(envs)(r => Lane.make(handle).map(r.env.value -> _)).map(_.toMap)
+      other <- Lane.make(handle)
+      _     <- ZIO.foreachDiscard(other :: lanes.values.toList)(_.run.fork)
+      never <- sqs.receive(url, 10, 20)
+                 .flatMap: messages =>
+                   ZIO.foreachDiscard(messages): message =>
+                     (ApplyRequest.decode(message.body) match
+                       case Left(e)        => ZIO.logWarning(s"executor: ignoring an unreadable request: $e")
+                       case Right(request) => lanes.getOrElse(request.env, other).offer(request)
+                     ) *> sqs.delete(url, message.receipt)
+                 .catchAllCause(c => ZIO.logErrorCause("executor: reading the queue failed", c).delay(5.seconds))
+                 .forever
+    yield never
 
   /** Applies the plan if every check passes; None if there's nothing left to apply. */
   def execute(request: ApplyRequest): IO[String, Option[ApplyReport]] =
@@ -119,3 +128,22 @@ final case class ExecutorService(
       recent  <- slack.history(config.slack.channel, now.minus(approvalExpiry).nn).mapError(_.message)
       _       <- slack.post(config.slack.channel, text, None, None).mapError(_.message).unless(recent.exists(_.text == text))
     yield ()).catchAll(e => ZIO.logWarning(s"executor: announcing a refusal: $e"))
+
+/** One env's requests, handled in order; a request already waiting is not queued twice. */
+final case class Lane(queue: Queue[ApplyRequest], waiting: Ref[Set[(String, String)]], handle: ApplyRequest => UIO[Unit]):
+  private def key(r: ApplyRequest) = (r.app, r.plan)
+
+  def offer(request: ApplyRequest): UIO[Unit] =
+    waiting.modify(w => if w(key(request)) then (false, w) else (true, w + key(request)))
+      .flatMap(fresh => queue.offer(request).unit.when(fresh))
+      .unit
+
+  def run: UIO[Nothing] =
+    queue.take.flatMap(r => waiting.update(_ - key(r)) *> handle(r)).forever
+
+object Lane:
+  def make(handle: ApplyRequest => UIO[Unit]): UIO[Lane] =
+    for
+      queue   <- Queue.unbounded[ApplyRequest]
+      waiting <- Ref.make(Set.empty[(String, String)])
+    yield Lane(queue, waiting, handle)

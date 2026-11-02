@@ -22,6 +22,9 @@ object ServiceNaming:
   def family(address: Address): String                 = s"iae-${address.app.value}-${address.env.value}-${address.id.value}"
   def alarm(address: Address, c: Color): String        = s"iae-${address.app.value}-${address.env.value}-${address.id.value}-$c-5xx"
 
+  /** The role ECS pulls images and writes logs as: the account's, made by bootstrap. */
+  def executionRole(context: AwsContext): String = s"arn:aws:iam::${context.account.value}:role/iae/iae-task-execution"
+
 /** The two sides of a blue/green deploy. */
 enum Color derives CanEqual:
   case Blue, Green
@@ -145,7 +148,7 @@ final case class ServiceProvider(
       liveGroup <- ZIO.fromOption(current.group(live)).orElseFail(AwsError.InvalidRequest(s"no $live target group"))
       nextGroup <- ZIO.fromOption(current.group(next)).orElseFail(AwsError.InvalidRequest(s"no $next target group"))
       role       = s"arn:aws:iam::${context.account.value}:role/iae/iae-${address.app.value}-${address.env.value}"
-      taskDef   <- ecs.registerTaskDefinition(ServiceNaming.family(address), ContainerSpec("app", image, spec.port, spec.environment, spec.cpu, spec.memory, spec.command), Some(role), None)
+      taskDef   <- ecs.registerTaskDefinition(ServiceNaming.family(address), ContainerSpec("app", image, spec.port, spec.environment, spec.cpu, spec.memory, spec.command), Some(role), Some(ServiceNaming.executionRole(context)))
       name       = ServiceNaming.ecsService(address, next)
       existing  <- ecs.service(cluster, name)
       _         <- existing match
