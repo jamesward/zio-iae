@@ -676,7 +676,8 @@ Approvers are the @infra-approvers Slack group. Owners are @platform-owners.
 `EvaluatePolicy`: env; resource kind and id; change type (`Create`, `Update(fields)`, `Replace`, `Delete`, `Move`,
 `Deploy`, `Rollback`, `Cleanup`); risk; derived flags (`iamWidening`, `publicAccess`, `encryptionChange`,
 `dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert`,
-`Drift`, `Cleanup`, `Cost` and `Security` for changes the background jobs propose, §5.10); author; current date and time. PR
+`Drift`, `Cleanup`, `Cost` and `Security` for changes the background jobs propose, §5.10); the projected monthly cost
+change (§5.5.1, planned); author; current date and time. PR
 descriptions, commit messages, Slack text and logs are not included, so they can't argue for a weaker verdict.
 
 Risk classes, assigned by providers with these defaults (a provider can raise a specific change's risk):
@@ -687,6 +688,34 @@ Risk classes, assigned by providers with these defaults (a provider can raise a 
 | `Medium` | In-place config update (visibility timeout, lifecycle rules); IAM narrowing |
 | `High` | Replace of a stateless resource; IAM widening; public-access, encryption or network change; new prod service |
 | `Critical` | Delete or replace of a stateful resource; anything touching data retention |
+
+**5.5.1 Cost projection (planned).** Every plan says what it will cost, so people approve with the money in view and
+the policy can gate on it.
+
+- **What gets projected.** Each planned change gets an estimated monthly cost before and after, and the delta; the
+  plan gets the total. Examples:
+  - a `Service` from its size × count × hours (Fargate vCPU and memory) plus its load balancer (hours and LCUs);
+  - a `Table` from its capacity mode and the observed reads and writes;
+  - a `Bucket` from the observed storage and requests;
+  - a `Queue` or `Topic` from the observed message volume.
+- **Estimates come from deterministic code**, not the model. Each provider has a cost model that turns its spec and
+  usage into billable units. The units are priced from the AWS Price List API (`pricing:GetProducts`), cached daily
+  per region, with a bundled table as the fallback when the API isn't reachable.
+- **Usage.** Usage comes from the env's CloudWatch metrics over the last 30 days. A new resource has no usage, so its
+  estimate states its assumptions ("assumes 0 GB stored, 1M requests a month"). Each figure is marked `Exact`
+  (fixed by the spec, e.g. Fargate tasks) or `Estimated` (usage-driven).
+- **Where it shows:**
+  - the plan text and approval requests (`~ update Service web [Low] +$43.20/month: 2 -> 4 tasks`);
+  - `ExplainPlan`'s input;
+  - a `costDelta` fact per change, plus the plan's total, so `POLICY.md` can say "anything adding more than
+    $200 a month in prod needs an owner";
+  - the change evidence (§6).
+- **A deterministic guard:** an optional `costLimits` per env in `.iae/config.json`; a plan over its limit needs an
+  owner whatever the policy text says.
+- **Calibration:** the cost job (§5.10) compares the projections with Cost Explorer's actuals by the `iae:app` and
+  `iae:env` tags, and reports where the estimates are off.
+- **Testing:** Floci doesn't emulate the Price List API (to be confirmed), so `iae-testkit` gets a `PricingFake`
+  with fixed prices, and the cost models are unit-tested against hand-worked bills.
 
 **Verdict.** `EvaluatePolicy` uses zio-bedrock structured output (`.as[PolicyVerdict]`), one verdict per change:
 
@@ -1220,7 +1249,7 @@ and the "iae" GitHub App installed.
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 (in progress) | Monitor ✅ + drift jobs; `Triage` task ✅ (rollback to follow) | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
-| M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
+| M7 | Cleanup, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
 
@@ -1248,6 +1277,7 @@ and the "iae" GitHub App installed.
 | Q18 | One Floci container per simulated account vs. one shared container (does Floci separate accounts by credentials?) | Per account to start: simplest isolation; revisit if startup time hurts |
 | Q19 | Floci CodeBuild for local builds (real Docker, slow) vs. a local build runner | Floci CodeBuild, so the build path matches production; add a local runner behind the same service only if it's too slow |
 | Q20 | Which git hosts to support (§5.2.1) | GitHub first (built); CodeCommit as the second host, behind the same inbox event and a `PullRequests` implementation per host, once the GitHub path runs on real accounts |
+| Q21 | Price source for cost projection (§5.5.1): the Price List API, a bundled table, or both | Both: the Price List API cached daily, with a bundled table for when it's unreachable and for tests; usage from 30 days of CloudWatch metrics |
 
 ---
 
