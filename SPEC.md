@@ -689,7 +689,7 @@ Risk classes, assigned by providers with these defaults (a provider can raise a 
 | `High` | Replace of a stateless resource; IAM widening; public-access, encryption or network change; new prod service |
 | `Critical` | Delete or replace of a stateful resource; anything touching data retention |
 
-**5.5.1 Cost projection (planned).** Every plan says what it will cost, so people approve with the money in view and
+**5.5.1 Cost projection.** Every plan says what it will cost, so people approve with the money in view and
 the policy can gate on it.
 
 - **What gets projected.** Each planned change gets an estimated monthly cost before and after, and the delta; the
@@ -716,6 +716,28 @@ the policy can gate on it.
   `iae:env` tags, and reports where the estimates are off.
 - **Testing:** Floci doesn't emulate the Price List API (to be confirmed), so `iae-testkit` gets a `PricingFake`
   with fixed prices, and the cost models are unit-tested against hand-worked bills.
+
+*As built (M7):*
+- **The estimate:** each `PlannedChange` carries a `CostDelta` (monthly USD before and after, `exact` or estimated,
+  with its assumptions), filled in by the engine's `Pricing` after planning. An estimate that fails is left out
+  and never fails a plan.
+- **The plan hash leaves costs out,** since usage-based estimates drift between the agent's plan and the
+  executor's.
+- **`AwsPricing`** prices from a bundled us-east-1 `PriceBook` of public list prices:
+  - a service: tasks (vCPU and GB × count × 730 h), the load balancer (hours plus an assumed one LCU) and its alarms
+    on both colors. An update compares with the size the live version recorded (`iae:capacity` on the load
+    balancer).
+  - a secret: its monthly price. A role: nothing.
+  - a queue, topic or table: 30 days of CloudWatch traffic (messages, publishes, consumed capacity) plus its
+    default alarms.
+  - a bucket: its stored bytes; requests aren't counted, since S3 request metrics are off by default.
+  - a new resource has no usage yet, which its assumptions say.
+- **Where it shows:** the plan text shows each change's cost (`+$43.20/month (est.)`) and the total ("cost: +$…
+  a month (projected)"), so approval requests carry it. Facts carry `monthlyCost`.
+- **The limit:** `costLimits` per env in `.iae/config.json` puts a change that adds more than the limit to an owner,
+  whatever the policy text says.
+- **Not yet:** the Price List API (the bundled book is the fallback the spec calls for), the plan-level limit (it
+  is per change for now), and calibration against Cost Explorer.
 
 **Verdict.** `EvaluatePolicy` uses zio-bedrock structured output (`.as[PolicyVerdict]`), one verdict per change:
 
@@ -1298,7 +1320,7 @@ and the "iae" GitHub App installed.
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 ✅ (locally) | Monitor ✅ (service gates, queue and table default alarms, health without an alarm) + drift reporting with CloudTrail attribution and policy-gated revert ✅; `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
-| M7 | Cleanup, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
+| M7 (in progress) | Cleanup, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) ✅ (bundled prices; Price List API to follow) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
 
