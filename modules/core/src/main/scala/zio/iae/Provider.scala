@@ -29,6 +29,9 @@ trait ResourceDriver:
   /** The commit that last changed the resource, if it exists and records one. */
   def lastCommit(address: Address): IO[ProviderError, Option[CommitSha]]
 
+  /** Deleting the resource, as cleanup proposes it for an orphan: None if it doesn't exist or the kind isn't deleted. */
+  def deletion(address: Address): IO[ProviderError, Option[PlannedChange]] = zio.ZIO.none
+
   /** Back to the version that was live before, if the kind can do that and has one. */
   def rollback(address: Address): IO[ProviderError, Option[PlannedChange]] = zio.ZIO.none
 

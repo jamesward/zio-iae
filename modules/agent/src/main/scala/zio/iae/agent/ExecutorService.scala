@@ -48,7 +48,32 @@ final case class ExecutorService(
 
   /** Applies the plan if every check passes; None if there's nothing left to apply. */
   def execute(request: ApplyRequest): IO[String, Option[ApplyReport]] =
-    request.rollback.fold(executePlan(request))(executeRollback(request, _))
+    (request.rollback, request.cleanup) match
+      case (Some(service), _) => executeRollback(request, service)
+      case (_, Some(cutoff))  => executeCleanup(request, cutoff)
+      case _                  => executePlan(request)
+
+  /** A cleanup: planned here from the env's orphans, no newer than the deployed config's retention allows, judged by
+    * the policy deployed in the env as `origin = Cleanup`.
+    */
+  private def executeCleanup(request: ApplyRequest, cutoff: String): IO[String, Option[ApplyReport]] =
+    for
+      runtime  <- ZIO.fromOption(envs.find(_.env.value == request.env)).orElseFail(s"no env ${request.env}")
+      app      <- ZIO.fromEither(AppName.from(request.app)).mapError(_.toString)
+      before   <- ZIO.attempt(java.time.LocalDate.parse(cutoff).nn).orElseFail(s"$cutoff isn't a date")
+      deployed <- runtime.engine.deployed(List(app), runtime.env).mapError(_.message)
+      commit   <- ZIO.fromOption(deployed.filter(_.value == request.commit)).orElseFail(s"${request.commit.take(7)} isn't the commit deployed in ${request.env}")
+      _        <- runtime.workspace.sync.mapError(_.message)
+      (config, text) <- RepoConfig.loadAt(runtime.workspace, commit).mapError(_.message)
+      today    <- Clock.localDateTime.map(_.toLocalDate.nn)
+      _        <- ZIO.fail(s"orphans since $before haven't been kept ${config.orphanRetentionDays} days")
+                    .when(before.isAfter(today.minusDays(config.orphanRetentionDays.toLong).nn))
+      plan     <- runtime.engine.cleanup(app, runtime.env, before).mapError(_.message)
+      report <- if plan.isEmpty then ZIO.none
+                else if plan.hash.value != request.plan then ZIO.fail(s"the cleanup is now ${plan.hash.short}, not ${request.plan.take(12)}")
+                else checked(runtime, plan, commit, Governance(config, text, None, deployed), Pipeline.agentAuthor, Origin.Cleanup, request.approval).map(Some(_))
+      _ <- inbox.send(InboxEvent.Tick).catchAll(e => ZIO.logWarning(s"executor: waking the agent: $e")).when(report.isDefined)
+    yield report
 
   /** A rollback: planned here from what's live, judged by the policy deployed in the env, as `origin = Alert`. */
   private def executeRollback(request: ApplyRequest, service: String): IO[String, Option[ApplyReport]] =

@@ -62,6 +62,12 @@ object Pipeline:
       s"*Drift:* ${drifted.map(c => s"${c.address.kind} ${c.address.id.value}").mkString(", ")} changed outside the pipeline; this reverts it to the manifest."
     )
 
+  /** For an approval request: what cleanup deletes, and why. */
+  def cleanupSection(plan: Plan, retentionDays: Int): String =
+    s"*Cleanup:* ${plan.changes.map(c => s"${c.address.kind} ${c.address.id.value}").mkString(", ")} " +
+      s"${if plan.changes.size == 1 then "has" else "have"} been orphaned (removed from the manifest) for over $retentionDays days; this deletes " +
+      s"${if plan.changes.size == 1 then "it" else "them"}."
+
   /** The service a rollback plan rolls back. */
   def rolledBack(plan: Plan): Option[LogicalId] =
     plan.changes.collectFirst { case PlannedChange(Change.Rollback(address, _, _), _, _, _) => address.id }
@@ -163,6 +169,29 @@ final case class Pipeline(
       _        <- ZIO.logInfo(s"rollback of ${app.value}/${runtime.env.value}/${service.value}: $outcome")
     yield outcome
 
+  /** The cleanup job's proposal: delete the app's resources orphaned longer than the deployed config's retention.
+    * Judged by the policy deployed in the env as `origin = Cleanup`, with the agent as its author; deleting stateful
+    * resources is critical, so the default policy asks approvers. None when nothing has expired.
+    */
+  def cleanup(runtime: EnvRuntime, app: AppName): IO[AgentError, Option[Outcome]] =
+    for
+      deployed <- runtime.engine.deployed(List(app), runtime.env).mapError(AgentError.Engine(_))
+      outcome <- ZIO.foreach(deployed): commit =>
+                   for
+                     _              <- runtime.workspace.sync
+                     (config, text) <- RepoConfig.loadAt(runtime.workspace, commit)
+                     today          <- Clock.localDateTime.map(_.toLocalDate.nn)
+                     cutoff          = today.minusDays(config.orphanRetentionDays.toLong).nn
+                     plan           <- runtime.engine.cleanup(app, runtime.env, cutoff).mapError(AgentError.Engine(_))
+                     approvals       = Approvals(slack, self, config.slack.channel, approvalExpiry)
+                     outcome <- ZIO.unless(plan.isEmpty):
+                                  judged(runtime, Governance(config, text, None, deployed), Pipeline.agentAuthor, approvals, plan, commit, Origin.Cleanup,
+                                    List(Pipeline.cleanupSection(plan, config.orphanRetentionDays)), cleanup = Some(cutoff))
+                   yield outcome
+      found = outcome.flatten
+      _ <- ZIO.logInfo(s"cleanup of ${app.value}/${runtime.env.value}: $found").when(found.isDefined)
+    yield found
+
   private def judged(
       runtime: EnvRuntime,
       governance: Governance,
@@ -171,20 +200,22 @@ final case class Pipeline(
       plan: Plan,
       commit: CommitSha,
       origin: Origin,
+      sections: List[String] = Nil,
+      cleanup: Option[java.time.LocalDate] = None,
   ): IO[AgentError, Outcome] =
     val config  = governance.config
     val drifted = plan.changes.filter(_.flags.contains(ChangeFlag.Drift))
     for
       _        <- ZIO.when(drifted.nonEmpty)(driftNotice(runtime, config, plan, drifted))
       decision <- decide(governance, plan, author.slack, origin)
-      done      = applied(runtime, governance, author, plan, decision, commit, approvals)
+      done      = applied(runtime, governance, author, plan, decision, commit, approvals, cleanup)
       outcome <- (plan.isEmpty, decision.decision) match
                    case (true, _)                => ZIO.succeed(Outcome.Converged(commit))
                    case (_, Decision.Auto)       => done("the policy lets it go ahead", None)
                    case (_, Decision.Deny)       => stopped(config, plan, decision, "the policy denies it")
                    case (_, approve: Decision.Approve) =>
-                     val sections = examples(runtime, governance).map(Pipeline.driftSection(drifted).toList ++ _)
-                     approvals.status(plan, decision, approve, author.slack, sections, explain(config, plan, decision)).flatMap:
+                     val extra = examples(runtime, governance).map(Pipeline.driftSection(drifted).toList ++ sections ++ _)
+                     approvals.status(plan, decision, approve, author.slack, extra, explain(config, plan, decision)).flatMap:
                        case ApprovalStatus.Approved(by, request) =>
                          done(s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", Some(request -> by))
                        case ApprovalStatus.Rejected(by, _) => stopped(config, plan, decision, s"<@$by> rejected it")
@@ -219,7 +250,16 @@ final case class Pipeline(
   /** In process, or through the executor when there is one: the agent then only asks, and the executor checks
     * everything again before applying.
     */
-  private def applied(runtime: EnvRuntime, governance: Governance, author: Author, plan: Plan, decision: PlanDecision, commit: CommitSha, approvals: Approvals)(
+  private def applied(
+      runtime: EnvRuntime,
+      governance: Governance,
+      author: Author,
+      plan: Plan,
+      decision: PlanDecision,
+      commit: CommitSha,
+      approvals: Approvals,
+      cleanup: Option[java.time.LocalDate] = None,
+  )(
       why: String,
       approval: Option[(SlackMessage, Set[String])],
   ): IO[AgentError, Outcome] =
@@ -236,6 +276,7 @@ final case class Pipeline(
               approval.map(_._1.ts),
               author.email,
               Pipeline.rolledBack(plan).map(_.value),
+              cleanup.map(_.toString),
             )
           )
           .as(Outcome.Submitted(plan.app, plan.hash.short))

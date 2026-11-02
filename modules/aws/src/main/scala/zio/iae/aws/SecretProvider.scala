@@ -67,6 +67,11 @@ final case class SecretProvider(secrets: SecretsClient) extends Provider[SecretS
 final case class SecretDriver(provider: SecretProvider) extends ResourceDriver:
   val kind: ResourceKind = ResourceKind.Secret
 
+  override def deletion(address: Address): IO[ProviderError, Option[PlannedChange]] =
+    provider.observe(address).map(_.map: observed =>
+      val assessment = provider.assess(Change.Delete(address), Some(observed))
+      PlannedChange(Change.Delete(address), assessment.risk, assessment.flags))
+
   def plan(address: Address, desired: ResourceSpec): IO[ProviderError, Option[PlannedChange]] =
     desired match
       case ResourceSpec.Secret(spec) =>

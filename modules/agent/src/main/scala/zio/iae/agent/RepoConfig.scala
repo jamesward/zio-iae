@@ -42,6 +42,7 @@ final case class RepoConfig(
     identities: Map[String, String] = Map.empty,
     accounts: Map[String, EnvAccount] = Map.empty,
     costLimits: Map[String, Double] = Map.empty,
+    orphanRetentionDays: Int = 14,
 ) derives Schema:
   def policy(text: String): PolicyConfig =
     PolicyConfig(text, slack.owners, (slack.owners :: slack.groups).toSet, production.toSet,

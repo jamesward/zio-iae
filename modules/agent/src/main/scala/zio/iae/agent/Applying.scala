@@ -51,8 +51,9 @@ object Applying:
 /** What the agent asks the executor to apply. The executor trusts none of it beyond identifying the plan: it
   * recomputes the plan, the floor and the approval itself.
   */
-/** What the agent asks the executor to apply. `rollback` names the service of a rollback, which the executor plans
-  * from the env itself; `commit` is then the commit deployed there.
+/** What the agent asks the executor to apply. `rollback` names the service of a rollback and `cleanup` the cutoff
+  * date of a cleanup (orphans since then or earlier), which the executor plans from the env itself; `commit` is then
+  * the commit deployed there.
   */
 final case class ApplyRequest(
     env: String,
@@ -63,6 +64,7 @@ final case class ApplyRequest(
     approval: Option[String],
     authorEmail: String,
     rollback: Option[String] = None,
+    cleanup: Option[String] = None,
 )
     derives Schema
 

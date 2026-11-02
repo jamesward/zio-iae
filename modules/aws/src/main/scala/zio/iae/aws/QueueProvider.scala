@@ -153,6 +153,11 @@ object QueueProvider:
 final case class QueueDriver(provider: QueueProvider) extends ResourceDriver:
   val kind: ResourceKind = ResourceKind.Queue
 
+  override def deletion(address: Address): IO[ProviderError, Option[PlannedChange]] =
+    provider.observe(address).map(_.map: observed =>
+      val assessment = provider.assess(Change.Delete(address), Some(observed))
+      PlannedChange(Change.Delete(address), assessment.risk, assessment.flags))
+
   def plan(address: Address, desired: ResourceSpec): IO[ProviderError, Option[PlannedChange]] =
     desired match
       case ResourceSpec.Queue(spec) =>

@@ -14,6 +14,17 @@ final case class Planner(drivers: Drivers, discovery: Discovery):
       case Phase.Contract => contract(manifest, env)
     changes.map(Plan(manifest.app, env, target, ContentHash.of(manifest), phase, _))
 
+  /** Deleting the app's resources in the env that have been orphaned since `before` or earlier, as cleanup proposes:
+    * the kinds that are deleted (not services), each assessed by its provider. The plan's hash depends only on its
+    * changes, so a proposal stays the same from one day to the next until another orphan qualifies.
+    */
+  def cleanup(app: AppName, env: EnvName, before: java.time.LocalDate): IO[EngineError, Plan] =
+    for
+      found   <- discovery.managed(app, env).mapError(EngineError.Provider(_))
+      expired  = found.filter(_.orphanedSince.exists(!_.isAfter(before))).sortBy(d => (d.address.kind.ordinal, d.address.id))
+      changes <- ZIO.foreach(expired)(d => drivers(d.address.kind).flatMap(_.deletion(d.address).mapError(EngineError.Provider(_))))
+    yield Plan(app, env, None, ContentHash.of("cleanup"), Phase.Contract, changes.flatten)
+
   /** Back to the version a resource ran before: a plan with that one change, or none if there's nothing to go back
     * to. It isn't for a commit: the resources keep the commit they record.
     */
@@ -91,6 +102,9 @@ final case class Engine(
       .map(changes => plan.copy(changes = changes))
 
   def apply(plan: Plan): IO[EngineError, ApplyReport] = executor.apply(plan)
+
+  /** The plan that deletes the app's resources orphaned since `before` or earlier. */
+  def cleanup(app: AppName, env: EnvName, before: java.time.LocalDate): IO[EngineError, Plan] = planner.cleanup(app, env, before).flatMap(costed)
 
   /** The plan that puts a resource back to the version it ran before; empty if there's none. */
   def rollback(address: Address): IO[EngineError, Plan] = planner.rollback(address)

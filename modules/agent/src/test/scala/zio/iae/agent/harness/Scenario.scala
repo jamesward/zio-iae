@@ -349,7 +349,34 @@ object Scenario:
     ),
   )
 
+  object Thumbs extends Bucket.Id(LogicalId("thumbs"))
+
+  private val withThumbs = (Bucket.readWrite(Harness.Uploads) ++ Bucket.reader(Thumbs)).manifest(Harness.app).toOption.get.toJson
+
+  val cleanup = Scenario(
+    "cleanup",
+    "A bucket removed from the manifest is orphaned; two weeks later the cleanup job proposes deleting it, and an approver approves the deletion.",
+    List(
+      Step.Push("add a thumbs bucket", "add thumbs", _ => ZIO.succeed(Map(Harness.manifest -> withThumbs))),
+      approvalIn(0),
+      Step.React("U_ALICE", "white_check_mark"),
+      appliedIn(0, Some("U_ALICE")),
+      Step.Push("remove the thumbs bucket", "drop thumbs", _ => ZIO.succeed(Map(Harness.manifest -> plain))),
+      Step.WaitFor("the bucket orphaned in env 1", (h, text) => text.startsWith("Applied") && text.contains(s"${Harness.app.value}/${env(h, 0)}") && text.contains("orphan  Bucket thumbs")),
+      Step.Advance(15.days),
+      Step.WaitFor(
+        "the cleanup's approval request in env 1",
+        (h, text) => text.startsWith("*Approval needed*") && text.contains(s"${Harness.app.value}/${env(h, 0)}") && text.contains("*Cleanup:* Bucket thumbs"),
+      ),
+      Step.React("U_ALICE", "white_check_mark"),
+      Step.WaitFor(
+        "the bucket deleted in env 1",
+        (h, text) => text.startsWith("Applied") && text.contains(s"${Harness.app.value}/${env(h, 0)}") && text.contains("delete  Bucket thumbs"),
+      ),
+    ),
+  )
+
   val slowDeploy    = faultyDeploy("slow-deploy", Fault.Slow, "latency")
   val failingMetric = faultyDeploy("failing-metric", Fault.FailingMetric, "uploads")
 
-  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, driftInProd, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric, incident, incidentRollback)
+  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, driftInProd, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric, incident, incidentRollback, cleanup)
