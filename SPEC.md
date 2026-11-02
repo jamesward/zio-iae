@@ -1140,6 +1140,21 @@ default, while old images and task definitions can be `Auto` if the user's polic
 rule), with the expected savings in the description. It then goes through the normal pipeline and policy
 (`origin = Cost`).
 
+*As built (M7):*
+- **The data:** the cost optimizer reads Compute Optimizer's ECS recommendations for each app's live services
+  (`GetECSServiceRecommendations` by the live color's service ARN).
+- **The saving:** each recommendation that isn't `Optimized` is priced as a monthly saving from the same price book
+  as plans: vCPU and memory × the live task count × 730 h.
+- **The report:** `CostJob` (weekly) posts "*Cost* `app/env`: right-sizing could save $… a month" once per set of
+  recommendations, with each service's size now and recommended.
+- **The review:** with a model configured, `ReviewCost` reads the deployed commit and says what to resize and where
+  it's declared. With a GitHub App it can open the PR that changes the `ServiceSpec`, which then goes through the
+  pipeline and policy like any change.
+- **Task sizes:** a `ServiceSpec` whose CPU and memory aren't a Fargate task size is refused in the manifest. Floci,
+  like AWS, rejects one at deploy.
+- **Testing:** `ComputeOptimizerFake` in `iae-testkit`, since Floci doesn't emulate Compute Optimizer.
+- **Not yet:** Cost Explorer totals by `iae:app`/`iae:env`, Cost Anomaly events, and storage-pattern findings.
+
 **Security auditor.** Continuous, plus a weekly report. Sources, all scoped to `iae:managed` resources:
 
 - IAM Access Analyzer: unused permissions on the generated roles, and external or public access;
@@ -1151,6 +1166,22 @@ rule), with the expected savings in the description. It then goes through the no
 in the app code (`Bucket` to `BucketReader`), turn on a setting in the `Infra` declaration, or bump a base image or
 dependency and rebuild. The PRs go through the normal pipeline and policy (`origin = Security`). Active threats
 (a GuardDuty finding of compromised credentials, for example) are escalations, not PRs.
+
+*As built (M7):*
+- **Unused permissions:** the security auditor checks each app's runtime role with IAM's Access Advisor
+  (`GenerateServiceLastAccessedDetails` at action level). It reads the role's generated inline policy, where each
+  statement is one grant named for it (e.g. `BucketWriteUploads`). A statement is unused when none of its actions
+  was used in the window (90 days): per action where IAM tracks actions (S3), per service otherwise. A role younger
+  than the window is left alone.
+- **The report:** `SecurityJob` (daily) posts "*Security* `app/env`: the runtime role hasn't used these permissions
+  in 90 days" once per set, naming each statement and its actions.
+- **The review:** with a model configured, `ReviewSecurity` finds where each capability is declared and whether the
+  code calls it. With a GitHub App it can open the PR that narrows it (e.g. `Bucket.reader` instead of
+  `Bucket.readWrite`), which goes through the pipeline and policy.
+- **Testing:** Floci implements Access Advisor but records no usage, so with a zero-day window every permission of a
+  new role is unused, which the test checks.
+- **Not yet:** Security Hub, GuardDuty and Inspector findings, Access Analyzer's external access, and the
+  engine's own configuration checks.
 
 ### 5.11 Credentials and trust boundary
 
@@ -1337,7 +1368,7 @@ and the "iae" GitHub App installed.
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 ✅ (locally) | Monitor ✅ (service gates, queue and table default alarms, health without an alarm) + drift reporting with CloudTrail attribution and policy-gated revert ✅; `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
-| M7 (in progress) | Cleanup job (orphans past retention) ✅, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) ✅ (bundled prices; Price List API to follow) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
+| M7 (in progress) | Cleanup job (orphans past retention) ✅; cost optimizer (Compute Optimizer right-sizing report + `ReviewCost`) ✅; security auditor (unused permissions + `ReviewSecurity`) ✅; cost projection on plans (§5.5.1) ✅ (bundled prices; Price List API to follow) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
 
