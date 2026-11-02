@@ -125,7 +125,7 @@ final case class TopicDriver(provider: TopicProvider) extends ResourceDriver:
         provider.observe(address).map: observed =>
           provider.diff(address, spec, observed).map: change =>
             val assessment = provider.assess(change, observed)
-            PlannedChange(change.map(ResourceSpec.Topic(_)), assessment.risk, assessment.flags)
+            PlannedChange(change.map(ResourceSpec.Topic(_)), assessment.risk, assessment.flags ++ Drifted.flags(change))
       case other => ZIO.fail(ProviderError(address, "plan", s"expected a topic spec, got ${other.kind}"))
 
   def apply(change: Change[ResourceSpec], context: ApplyContext): IO[ProviderError, Unit] =

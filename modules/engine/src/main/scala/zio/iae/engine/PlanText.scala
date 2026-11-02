@@ -22,7 +22,7 @@ object PlanText:
       val names = groups.toList.sorted.map("@" + _.handle).mkString(", ")
       if groups.size > 1 then s"needs $count approval(s) from each of $names" else s"needs $count approval(s) from $names"
 
-  private def line(planned: PlannedChange): String =
+  def line(planned: PlannedChange): String =
     val target = s"${planned.address.kind} ${planned.address.id.value}"
     planned.change match
       case Change.Create(_, _) => s"  + create  $target [${planned.risk}]"

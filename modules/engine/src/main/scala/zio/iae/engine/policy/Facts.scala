@@ -71,7 +71,8 @@ object ChangeFacts:
         Subject.Resource(planned.address, action, fields),
         planned.risk,
         planned.flags,
-        origin,
+        // A revert of a hand change is the drift job's, whatever started the reconcile.
+        if planned.flags.contains(ChangeFlag.Drift) && origin == Origin.Human then Origin.Drift else origin,
         author,
         at,
       )

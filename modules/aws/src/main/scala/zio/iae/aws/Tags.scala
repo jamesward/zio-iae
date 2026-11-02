@@ -53,3 +53,13 @@ object ManagedTags:
       case (key, value) if !current.get(key).contains(value) => FieldChange(s"tag $key", current.get(key).fold("(none)")(v => v), value)
     val orphan = current.get(TagKey.Orphaned.wire).map(since => FieldChange("orphaned", since, "(none)"))
     changed ++ orphan.toList
+
+/** Drift: an update to a resource whose recorded spec (`iae:spec-hash`) is already the desired one, so what differs
+  * was changed outside the pipeline. A service's version isn't drift: after a rollback its recorded spec is the one
+  * it went back to, and the desired one is a version waiting for a fix.
+  */
+object Drifted:
+  def flags(change: Change[?]): Set[ChangeFlag] = change match
+    case Change.Update(address, _, fields) if address.kind != ResourceKind.Service && !fields.exists(_.field == s"tag ${TagKey.Spec.wire}") =>
+      Set(ChangeFlag.Drift)
+    case _ => Set.empty

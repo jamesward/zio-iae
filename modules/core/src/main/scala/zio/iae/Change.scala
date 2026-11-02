@@ -45,6 +45,9 @@ object Risk:
 enum ChangeFlag derives Schema, CanEqual:
   case IamWidening, PublicAccess, EncryptionChange, DataLoss
 
+  /** The resource was changed outside the pipeline since it was converged to the spec it still records. */
+  case Drift
+
 /** How risky a change is, and why. */
 final case class Assessment(risk: Risk, flags: Set[ChangeFlag]) derives CanEqual
 

@@ -183,22 +183,42 @@ object Scenario:
     ),
   )
 
+  /** Flips the uploads bucket's versioning in an env (by index) through the S3 API, as someone in the console would. */
+  private def flipVersioning(index: Int): Step = Step.Drift(
+    s"flip the env ${index + 1} bucket's versioning through the S3 API",
+    harness =>
+      for
+        manifest <- current(harness, Harness.manifest)
+        bucket   <- ZIO.fromEither(BucketNaming(None).physical(Address(Harness.app, harness.envs(index).env, ResourceKind.Bucket, Harness.Uploads.logicalId)))
+                      .mapError(_.message)
+        _        <- harness.s3(index).putBucketVersioning(bucket, enabled = manifest.trim != versioned.trim).mapError(_.toString)
+      yield (),
+  )
+
+  private def driftIn(index: Int): Step = Step.WaitFor(
+    s"the drift in env ${index + 1} to be reported",
+    (h, text) => text.startsWith("*Drift*") && text.contains(s"${Harness.app.value}/${env(h, index)}") && text.contains("Bucket uploads"),
+  )
+
   val drift = Scenario(
     "drift",
-    "Someone changes the staging bucket's versioning by hand; the next periodic reconcile puts it back.",
+    "Someone changes the staging bucket's versioning by hand; the next periodic reconcile reports it and puts it back.",
+    List(flipVersioning(0), Step.Advance(16.minutes), driftIn(0), appliedIn(0)),
+  )
+
+  val driftInProd = Scenario(
+    "drift-in-prod",
+    "Someone changes the prod bucket by hand: the drift is reported, and its revert (medium risk in prod) waits for an approver, who is told it's a revert.",
     List(
-      Step.Drift(
-        "flip the staging bucket's versioning through the S3 API",
-        harness =>
-          for
-            manifest <- current(harness, Harness.manifest)
-            bucket   <- ZIO.fromEither(BucketNaming(None).physical(Address(Harness.app, harness.envs.head.env, ResourceKind.Bucket, Harness.Uploads.logicalId)))
-                          .mapError(_.message)
-            _        <- harness.s3.head.putBucketVersioning(bucket, enabled = manifest.trim != versioned.trim).mapError(_.toString)
-          yield (),
-      ),
+      flipVersioning(1),
       Step.Advance(16.minutes),
-      appliedIn(0),
+      driftIn(1),
+      Step.WaitFor(
+        "an approval request for the revert in env 2",
+        (h, text) => text.startsWith("*Approval needed*") && text.contains(s"${Harness.app.value}/${env(h, 1)}") && text.contains("*Drift:*"),
+      ),
+      Step.React("U_ALICE", "white_check_mark"),
+      appliedIn(1, Some("U_ALICE")),
     ),
   )
 
@@ -332,4 +352,4 @@ object Scenario:
   val slowDeploy    = faultyDeploy("slow-deploy", Fault.Slow, "latency")
   val failingMetric = faultyDeploy("failing-metric", Fault.FailingMetric, "uploads")
 
-  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric, incident, incidentRollback)
+  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, driftInProd, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric, incident, incidentRollback)

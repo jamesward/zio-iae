@@ -56,6 +56,12 @@ object Pipeline:
   /** The author of what the agent starts itself, such as a rollback: no person, so nobody is excluded from approving. */
   val agentAuthor: Author = Author("iae", None)
 
+  /** For an approval request: what drifted, so approvers know they are approving a revert. */
+  def driftSection(drifted: List[PlannedChange]): Option[String] =
+    Option.when(drifted.nonEmpty)(
+      s"*Drift:* ${drifted.map(c => s"${c.address.kind} ${c.address.id.value}").mkString(", ")} changed outside the pipeline; this reverts it to the manifest."
+    )
+
   /** The service a rollback plan rolls back. */
   def rolledBack(plan: Plan): Option[LogicalId] =
     plan.changes.collectFirst { case PlannedChange(Change.Rollback(address, _, _), _, _) => address.id }
@@ -166,8 +172,10 @@ final case class Pipeline(
       commit: CommitSha,
       origin: Origin,
   ): IO[AgentError, Outcome] =
-    val config = governance.config
+    val config  = governance.config
+    val drifted = plan.changes.filter(_.flags.contains(ChangeFlag.Drift))
     for
+      _        <- ZIO.when(drifted.nonEmpty)(driftNotice(config, plan, drifted))
       decision <- decide(governance, plan, author.slack, origin)
       done      = applied(runtime, governance, author, plan, decision, commit, approvals)
       outcome <- (plan.isEmpty, decision.decision) match
@@ -175,7 +183,8 @@ final case class Pipeline(
                    case (_, Decision.Auto)       => done("the policy lets it go ahead", None)
                    case (_, Decision.Deny)       => stopped(config, plan, decision, "the policy denies it")
                    case (_, approve: Decision.Approve) =>
-                     approvals.status(plan, decision, approve, author.slack, examples(runtime, governance), explain(config, plan, decision)).flatMap:
+                     val sections = examples(runtime, governance).map(Pipeline.driftSection(drifted).toList ++ _)
+                     approvals.status(plan, decision, approve, author.slack, sections, explain(config, plan, decision)).flatMap:
                        case ApprovalStatus.Approved(by, request) =>
                          done(s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}", Some(request -> by))
                        case ApprovalStatus.Rejected(by, _) => stopped(config, plan, decision, s"<@$by> rejected it")
@@ -232,6 +241,20 @@ final case class Pipeline(
           .as(Outcome.Submitted(plan.app, plan.hash.short))
       case None =>
         Applying.run(slack, runtime, governance, author, plan, decision, commit, why, approval, approvals).as(Outcome.Converged(commit))
+
+  /** A hand change is announced once per plan: what changed outside the pipeline, before its revert is judged. */
+  private def driftNotice(config: RepoConfig, plan: Plan, drifted: List[PlannedChange]): IO[AgentError, Unit] =
+    val marker = s"plan ${plan.hash.short}"
+    for
+      now    <- Clock.instant
+      recent <- slack.history(config.slack.channel, now.minus(approvalExpiry).nn)
+      _ <- notice(
+             config,
+             s"*Drift* `${plan.app.value}/${plan.env.value}` ($marker): changed outside the pipeline since it was applied. " +
+               s"Reverting to the manifest goes through the policy.\n```\n${drifted.map(PlanText.line).mkString("\n")}\n```\n" +
+               "To keep the change, change the `Infra` declaration instead.",
+           ).unless(recent.exists(m => m.botId.contains(self.botId) && m.text.contains(marker) && m.text.startsWith("*Drift*")))
+    yield ()
 
   /** Stopping is announced once per plan, not on every reconcile. */
   private def stopped(config: RepoConfig, plan: Plan, decision: PlanDecision, why: String): IO[AgentError, Outcome] =

@@ -80,7 +80,7 @@ final case class TableDriver(provider: TableProvider) extends ResourceDriver:
         provider.observe(address).map: observed =>
           provider.diff(address, spec, observed).map: change =>
             val assessment = provider.assess(change, observed)
-            PlannedChange(change.map(ResourceSpec.Table(_)), assessment.risk, assessment.flags)
+            PlannedChange(change.map(ResourceSpec.Table(_)), assessment.risk, assessment.flags ++ Drifted.flags(change))
       case other => ZIO.fail(ProviderError(address, "plan", s"expected a table spec, got ${other.kind}"))
 
   def apply(change: Change[ResourceSpec], context: ApplyContext): IO[ProviderError, Unit] =

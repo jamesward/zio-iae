@@ -156,7 +156,7 @@ final case class QueueDriver(provider: QueueProvider) extends ResourceDriver:
         provider.observe(address).map: observed =>
           provider.diff(address, spec, observed).map: change =>
             val assessment = provider.assess(change, observed)
-            PlannedChange(change.map(ResourceSpec.Queue(_)), assessment.risk, assessment.flags)
+            PlannedChange(change.map(ResourceSpec.Queue(_)), assessment.risk, assessment.flags ++ Drifted.flags(change))
       case other => ZIO.fail(ProviderError(address, "plan", s"expected a queue spec, got ${other.kind}"))
 
   def apply(change: Change[ResourceSpec], context: ApplyContext): IO[ProviderError, Unit] =
