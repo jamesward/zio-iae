@@ -1195,7 +1195,26 @@ daily limit), and contract tests run against a real account when gated on.
 - **Findings:** it writes what's happening, the likely cause with evidence, a recommendation (rollback, code fix,
   `Infra` change, or a person's investigation) and how sure it is.
 - **Without a model:** the alert still mentions the owners, but no triage runs.
-- **Rollback:** the `rollback` tool and its policy gate are next.
+- **Rollback (`rollback` tool):** asks for the alerting service to go back to the version it ran before.
+  - **The plan:** a canary deploy records the version it replaced (`iae:previous-image`, `iae:previous-spec-hash` on
+    the load balancer). `Engine.rollback` plans one `Rollback` change from it; there is none when nothing is
+    recorded.
+  - **The policy:** the plan is judged by the policy deployed in the env, as `origin = Alert` with the agent as its
+    author. It's `Low` risk (the previous version was live and approved), so the default table lets it go ahead;
+    `POLICY.md` can ask for approvers.
+  - **The apply:** in process, or through the executor, which plans the rollback again from the env, checks that
+    the request's commit is the one deployed there, and verifies the floor and approvals as for any plan.
+  - **Waiting on approvers:** the monitor asks again on each sweep and reports the outcome in the alert's thread.
+  - **What the provider does:**
+    - restarts the previous color (scaled to zero after the canary, with its task definition kept);
+    - moves all the traffic back and stops the live color;
+    - marks the live spec failed (`iae:failed`), so the reconcile asks for a fix ("push a fix") instead of
+      redeploying it.
+  - **The alert:** it resolves once its version no longer has the traffic ("Cleared: its version no longer has
+    the traffic").
+  - **Harness:** a fault on the live version is pinned to that version, so it stays with it after a rollback. The
+    `incident-rollback` scenario has v2 fail in prod and rolled back through the executor, and the alert resolves
+    although v2 is still broken.
 - **Harness:** fault controls also target the live version, and the `incident` scenario raises and resolves an
   alert in prod. It never mutates prod
   outside the pipeline; rollback is the only fast path, and it's policy-gated.
@@ -1248,7 +1267,7 @@ and the "iae" GitHub App installed.
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
-| M6 (in progress) | Monitor ✅ + drift jobs; `Triage` task ✅ (rollback to follow) | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
+| M6 (in progress) | Monitor ✅ + drift jobs; `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
