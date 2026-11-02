@@ -1047,6 +1047,20 @@ role mean someone changed infra by hand. The agent posts what changed and who di
 manifest. The revert is a normal plan, gated by policy (`origin = Drift`), with the drift described in the
 approval request. If the hand change should stay, the answer is a PR changing the `Infra` declaration.
 
+*As built (M6):*
+- **Detection:** the reconcile finds drift by itself, deterministically. A planned update to a resource whose
+  recorded spec (`iae:spec-hash`) is already the desired one changed outside the pipeline, so its provider flags it
+  `Drift`. A pending new spec, or a service's version waiting for a fix after a rollback, isn't drift.
+- **Judging:** a drifted change's facts carry `origin = Drift` and the `drift` flag, so `POLICY.md` can treat
+  reverts on their own terms.
+- **Reporting:** the agent posts "*Drift* `app/env`: changed outside the pipeline …" once per plan, with the changed
+  fields. If the revert needs approval, the request says it's a revert ("*Drift:* Bucket uploads changed outside
+  the pipeline; this reverts it to the manifest").
+- **Who did it:** not yet. Attribution from CloudTrail (`LookupEvents` on the resource) is to follow; Floci records
+  only S3 data events and Secrets Manager writes, so it is tested with a fake.
+- **Harness:** the `drift` scenario reverts a hand change in staging. In `drift-in-prod`, the revert of a prod
+  hand change waits for an approver.
+
 **Cleanup.** Daily. Candidates:
 
 - orphaned resources (`iae:orphaned=<date>`) older than the retention window in policy;
@@ -1267,7 +1281,7 @@ and the "iae" GitHub App installed.
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
-| M6 (in progress) | Monitor ✅ + drift jobs; `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
+| M6 (in progress) | Monitor ✅ + drift reporting and policy-gated revert ✅ (CloudTrail attribution to follow); `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
