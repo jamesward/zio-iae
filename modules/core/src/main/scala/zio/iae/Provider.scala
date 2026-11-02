@@ -71,3 +71,16 @@ trait Attribution:
 
 object Attribution:
   val none: Attribution = (_, _) => zio.ZIO.succeed(Nil)
+
+/** A permission an app's runtime role has but hasn't used: one statement of its generated policy, named for the grant
+  * it comes from (e.g. `BucketWriteUploads`).
+  */
+final case class UnusedPermission(statement: String, actions: List[String], resources: List[String]) derives CanEqual
+
+/** What an app's runtime identity actually uses of what it's granted. */
+trait Access:
+  /** The permissions not used since `since`; none for a role younger than that, which hasn't had the time. */
+  def unused(app: AppName, env: EnvName, since: java.time.Instant): IO[ProviderError, List[UnusedPermission]]
+
+object Access:
+  val none: Access = (_, _, _) => zio.ZIO.succeed(Nil)

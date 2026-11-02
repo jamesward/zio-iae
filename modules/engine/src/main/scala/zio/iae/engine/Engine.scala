@@ -81,7 +81,12 @@ final case class Engine(
     watch: Watch = Watch.none,
     attribution: Attribution = Attribution.none,
     pricing: Pricing = Pricing.none,
+    access: Access = Access.none,
 ):
+  /** The app's runtime role's permissions not used since a time. */
+  def unusedPermissions(app: AppName, env: EnvName, since: java.time.Instant): IO[EngineError, List[UnusedPermission]] =
+    access.unused(app, env, since).mapError(EngineError.Provider(_))
+
   /** Who changed a resource since a time, by its write calls other than the pipeline's. */
   def changedBy(address: Address, since: java.time.Instant): IO[EngineError, List[ChangedBy]] =
     attribution.changes(address, since).mapError(EngineError.Provider(_))

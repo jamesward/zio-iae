@@ -17,7 +17,10 @@ object RoleName:
 
   given CanEqual[RoleName, RoleName] = CanEqual.derived
 
-final case class IamRole(name: RoleName, path: String, arn: String, trustPolicy: Option[String])
+final case class IamRole(name: RoleName, path: String, arn: String, trustPolicy: Option[String], created: Option[java.time.Instant] = None)
+
+/** When an IAM principal last used a service, and (where IAM tracks them, as for S3) each of its actions. */
+final case class ServiceAccess(namespace: String, lastUsed: Option[java.time.Instant], actions: Map[String, Option[java.time.Instant]])
 
 /** IAM roles and their inline policies and tags. IAM is global: one endpoint, signed for us-east-1. */
 final case class IamClient(query: AwsQueryClient):
@@ -45,6 +48,24 @@ final case class IamClient(query: AwsQueryClient):
   def deleteInlinePolicy(name: RoleName, policyName: String): IO[AwsError, Unit] =
     call("DeleteRolePolicy", List("RoleName" -> name.value, "PolicyName" -> policyName)).unit
       .catchSome { case e if e.errorCode.contains("NoSuchEntity") => ZIO.unit }
+
+  /** Access Advisor: which services (and tracked actions) the principal used, and when. Starts the report and waits
+    * for it.
+    */
+  def lastAccessed(arn: String): IO[AwsError, List[ServiceAccess]] =
+    for
+      job    <- call("GenerateServiceLastAccessedDetails", List("Arn" -> arn, "Granularity" -> "ACTION_LEVEL")).map(e => (e \\ "JobId").text.trim)
+      report <- call("GetServiceLastAccessedDetails", List("JobId" -> job))
+                  .repeat(Schedule.spaced(1.second) && Schedule.recurUntil[Elem](e => (e \\ "JobStatus").text.trim != "IN_PROGRESS") && Schedule.recurs(60))
+                  .map(_._2)
+                  .withClock(Clock.ClockLive)
+      _ <- ZIO.fail(AwsError.InvalidRequest(s"Access Advisor job $job: ${(report \\ "JobStatus").text.trim}")).when((report \\ "JobStatus").text.trim == "FAILED")
+    yield (report \\ "ServicesLastAccessed" \ "member").toList.map: m =>
+      ServiceAccess(
+        (m \ "ServiceNamespace").text.trim,
+        instant((m \ "LastAuthenticated").text),
+        (m \ "TrackedActionsLastAccessed" \ "member").toList.map(a => (a \ "ActionName").text.trim -> instant((a \ "LastAccessedTime").text)).toMap,
+      )
 
   def deleteRole(name: RoleName): IO[AwsError, Unit] =
     call("DeleteRole", List("RoleName" -> name.value)).unit.catchSome { case e if e.errorCode.contains("NoSuchEntity") => ZIO.unit }
@@ -75,7 +96,10 @@ object IamClient:
 
   private def roleOf(node: Node): Option[IamRole] =
     RoleName.from((node \ "RoleName").text.trim).toOption.map: name =>
-      IamRole(name, (node \ "Path").text.trim, (node \ "Arn").text.trim, (node \ "AssumeRolePolicyDocument").headOption.map(n => decode(n.text)))
+      IamRole(name, (node \ "Path").text.trim, (node \ "Arn").text.trim, (node \ "AssumeRolePolicyDocument").headOption.map(n => decode(n.text)), instant((node \ "CreateDate").text))
+
+  private def instant(text: String): Option[java.time.Instant] =
+    Option(text.trim).filter(_.nonEmpty).flatMap(t => scala.util.Try(java.time.Instant.parse(t).nn).toOption)
 
   private def tagsOf(tags: scala.xml.NodeSeq): Map[String, String] =
     (tags \ "member").map(m => (m \ "Key").text.trim -> (m \ "Value").text.trim).toMap
