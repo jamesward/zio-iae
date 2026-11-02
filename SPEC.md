@@ -862,8 +862,8 @@ and either proposes a fix PR or asks for guidance.
 
 ### 5.9 Deploy and canary
 
-- The build (CodeBuild, §5.8) produces a container image (sbt-native-packager Docker) pushed to ECR, tagged
-  with the sha.
+- The build (CodeBuild, §5.8) produces a container image (e.g. sbt-native-packager Docker) pushed to ECR, tagged
+  with the sha (see **Images** below).
 - `Service` resource: ECS Fargate service with **two target groups** behind an ALB listener with weighted
   forwarding.
 - Canary: start the new task set on the green target group, shift weight `0 → 10 → 50 → 100%` with a bake time at
@@ -901,8 +901,25 @@ An alarm during a bake puts all traffic back on the old color and stops the new 
 failed (`iae:failed`), so the version isn't retried and re-planning it fails with "rolled back …; push a fix". That
 keeps the env from converging, so later envs never get the version.
 
-Still to come: the canary watcher as its own fiber (today the deploy holds the env's reconcile, or the executor,
-until it finishes); latency and app-declared alarms; and builds that push images to ECR.
+**Images.** An app either names its image (`container`) or sets `pushesImage`, and then its build pushes it:
+
+- The agent keeps an ECR repository per app, `iae/<app>`, in the builds' (tooling) account.
+- Its policy lets the env accounts in `accounts` pull from it.
+- The build is given `IAE_IMAGE` (`<repository>:<commit>`) to push, e.g.
+  `docker build -t "$IAE_IMAGE" . && docker push "$IAE_IMAGE"` (CodeBuild with privileged mode).
+- A build that succeeds without pushing it fails ("succeeded but didn't push …").
+- The app's services run `$IAE_IMAGE`.
+
+Task definitions use the env account's `iae/iae-task-execution` role to pull images and write logs, which bootstrap
+creates. In the harness, Floci's CodeBuild has no Docker daemon, so the tests push the image the build would have
+pushed (`FlociRegistry`). ECS on Floci then runs it from Floci's ECR.
+
+**The executor and long deploys.** The executor has a lane per env: requests run one at a time within an env, and
+side by side across envs. So a canary baking in staging doesn't hold up a prod apply. A request that is already
+waiting in its lane is dropped, since the agent asks again on each reconcile until the change is in. Without an
+executor, the deploy holds only its own env's reconcile.
+
+Still to come: latency and app-declared alarms.
 
 ### 5.10 Background jobs
 
@@ -1109,7 +1126,7 @@ and the "iae" GitHub App installed.
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
-| M5 (in progress) | `Service` + ALB canary + auto-rollback ✅ (ECR image builds to follow); harness traffic generator ✅ and the `bad-deploy` scenario ✅ (fault controls to follow) | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
+| M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; harness traffic generator ✅ and the `bad-deploy` scenario ✅ (fault controls to follow) | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
