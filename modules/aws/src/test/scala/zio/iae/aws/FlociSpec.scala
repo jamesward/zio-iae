@@ -62,6 +62,29 @@ object FlociSpec extends ZIOSpecDefault:
           provider.diff(address, desired, after).isEmpty,
         )
       ,
+      test("a lifecycle is set, shown as a change, changed, and removed"):
+        for
+          env      <- uniqueEnv
+          provider <- ZIO.serviceWith[S3Client](BucketProvider(_, naming))
+          address   = Address(app, env, ResourceKind.Bucket, LogicalId("logs"))
+          tiered    = BucketSpec(lifecycle = Some(Lifecycle(tieringAfterDays = Some(0), expireAfterDays = Some(365))))
+          _        <- ZIO.foreachDiscard(provider.diff(address, tiered, None))(provider.applyChange(_, ApplyContext.local))
+          set      <- provider.observe(address)
+          shorter   = BucketSpec(lifecycle = Some(Lifecycle(expireAfterDays = Some(30))))
+          change    = provider.diff(address, shorter, set)
+          _        <- ZIO.foreachDiscard(change)(provider.applyChange(_, ApplyContext.local))
+          changed  <- provider.observe(address)
+          _        <- ZIO.foreachDiscard(provider.diff(address, BucketSpec(), changed))(provider.applyChange(_, ApplyContext.local))
+          removed  <- provider.observe(address)
+        yield assertTrue(
+          set.map(_.lifecycle).contains(Lifecycle(Some(0), Some(365))),
+          provider.diff(address, tiered, set).isEmpty,
+          change.toList.flatMap { case Change.Update(_, _, fields) => fields.toList; case _ => Nil }.exists(f =>
+            f.field == "lifecycle" && f.from == "Intelligent-Tiering after 0 days, expire after 365 days" && f.to == "expire after 30 days"),
+          changed.map(_.lifecycle).contains(Lifecycle(expireAfterDays = Some(30))),
+          removed.map(_.lifecycle).contains(Lifecycle()),
+        )
+      ,
       test("a spec change converges and keeps tags that aren't ours"):
         for
           env      <- uniqueEnv

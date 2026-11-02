@@ -19,6 +19,26 @@ object CostJobSpec extends ZIOSpecDefault:
     def isAncestor(ancestor: CommitSha, descendant: CommitSha): IO[EngineError, Boolean] = ZIO.succeed(true)
 
   def spec = suite("Cost optimizer")(
+    test("a storage finding is reported with the change that makes it"):
+      ZIO.scoped:
+        for
+          repo    <- TestRepo.make
+          ws       = repo.workspace(env)
+          photos   = Address(app, env, ResourceKind.Bucket, LogicalId("photos"))
+          advice: Recommendations = new Recommendations:
+            def services(app: AppName, env: EnvName) = ZIO.succeed(Nil)
+            override def storage(app: AppName, env: EnvName) =
+              ZIO.succeed(List(StorageFinding(photos, "200.0 GB in S3 Standard and no Intelligent-Tiering", "add `lifecycle = Some(Lifecycle(tieringAfterDays = Some(0)))` to its `BucketSpec`", 1.05)))
+          none: Discovery = (_, _) => ZIO.succeed(Nil)
+          runtime  = EnvRuntime(env, Engine.make(Drivers(Nil), none, AnyOrder).copy(recommendations = advice), ws)
+          slack   <- InMemorySlack.make(Map.empty)
+          _       <- CostJob(List(runtime), List(app), slack, slack.self, channel, None).sweep
+          posted  <- slack.posted(channel)
+        yield assertTrue(
+          posted.size == 1,
+          posted.head.text.startsWith("*Cost* `photo-app/prod`: storing data for less could save $1.05 a month"),
+          posted.head.text.contains("- Bucket `photos`: 200.0 GB in S3 Standard and no Intelligent-Tiering; add `lifecycle = Some(Lifecycle(tieringAfterDays = Some(0)))` to its `BucketSpec` saves about $1.05 a month"),
+        ),
     test("the bill is posted once a week beside the projection, which is called out when it's off; each anomaly is posted once"):
       ZIO.scoped:
         for

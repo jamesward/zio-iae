@@ -4,7 +4,7 @@ import zio.*
 import zio.iae.*
 import zio.iae.aws.client.*
 
-final case class ObservedBucket(name: BucketName, versioning: VersioningStatus, tags: Map[String, String])
+final case class ObservedBucket(name: BucketName, versioning: VersioningStatus, tags: Map[String, String], lifecycle: Lifecycle = Lifecycle())
 
 final case class BucketProvider(s3: S3Client, naming: BucketNaming) extends Provider[BucketSpec, ObservedBucket]:
   val kind: ResourceKind = ResourceKind.Bucket
@@ -16,7 +16,8 @@ final case class BucketProvider(s3: S3Client, naming: BucketNaming) extends Prov
       observed <- ZIO.when(exists):
                     s3.getBucketVersioning(name)
                       .zipPar(s3.getBucketTagging(name))
-                      .mapBoth(failed(address, "observe"), (v, t) => ObservedBucket(name, v, t))
+                      .zipPar(s3.getBucketLifecycle(name))
+                      .mapBoth(failed(address, "observe"), (v, t, l) => ObservedBucket(name, v, t, Lifecycle(l.tieringAfterDays, l.expireAfterDays, l.noncurrentExpireAfterDays)))
     yield observed
 
   def diff(address: Address, desired: BucketSpec, observed: Option[ObservedBucket]): Option[Change[BucketSpec]] =
@@ -50,6 +51,11 @@ final case class BucketProvider(s3: S3Client, naming: BucketNaming) extends Prov
       _ <- s3.putBucketVersioning(name, enabled = spec.versioning == Versioning.Enabled)
              .mapError(failed(address, "set versioning"))
              .when(BucketProvider.versioningChanges(spec.versioning, versioning))
+      current <- s3.getBucketLifecycle(name).mapError(failed(address, "read lifecycle"))
+      wanted   = spec.lifecycle.getOrElse(Lifecycle())
+      _ <- s3.putBucketLifecycle(name, wanted.tieringAfterDays, wanted.expireAfterDays, wanted.noncurrentExpireAfterDays)
+             .mapError(failed(address, "set lifecycle"))
+             .when(Lifecycle(current.tieringAfterDays, current.expireAfterDays, current.noncurrentExpireAfterDays) != wanted)
       tags <- s3.getBucketTagging(name).mapError(failed(address, "read tags"))
       merged = ManagedTags.converged(tags, address, SpecHash.of(ResourceSpec.Bucket(spec)), context)
       _ <- s3.putBucketTagging(name, merged).mapError(failed(address, "tag")).when(merged != tags)
@@ -69,11 +75,16 @@ object BucketProvider:
       case Some(current) =>
         val versioning = Option.when(versioningChanges(desired.versioning, current.versioning)):
           FieldChange("versioning", current.versioning.toString, desired.versioning.toString)
+        val wanted    = desired.lifecycle.getOrElse(Lifecycle())
+        val lifecycle = Option.when(current.lifecycle != wanted)(FieldChange("lifecycle", current.lifecycle.toString, wanted.toString))
         val tags = ManagedTags.differences(current.tags, desiredTags(address, desired))
-        NonEmptyChunk.fromIterableOption(versioning.toList ++ tags).map(Change.Update(address, desired, _))
+        NonEmptyChunk.fromIterableOption(versioning.toList ++ lifecycle ++ tags).map(Change.Update(address, desired, _))
 
   def assess(change: Change[BucketSpec]): Assessment = change match
     case Change.Create(_, _)    => Assessment(Risk.Low, Set.empty)
+    // Expiring objects (or old versions) sooner, or at all, touches data retention.
+    case Change.Update(_, _, fields) if fields.exists(f => f.field == "lifecycle" && (f.from.contains("expire") || f.to.contains("expire"))) =>
+      Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))
     case Change.Update(_, _, _) => Assessment(Risk.Medium, Set.empty)
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))

@@ -1,5 +1,6 @@
 package zio.iae.aws
 
+import zio.NonEmptyChunk
 import zio.iae.*
 import zio.iae.aws.client.*
 import zio.test.*
@@ -70,6 +71,11 @@ object BucketDiffSpec extends ZIOSpecDefault:
       assertTrue(
         provider.assess(Change.Create(address, BucketSpec())) == Assessment(Risk.Low, Set.empty),
         provider.assess(Change.Delete(address)) == Assessment(Risk.Critical, Set(ChangeFlag.DataLoss)),
+        // Tiering keeps every object; expiring them touches retention.
+        provider.assess(Change.Update(address, BucketSpec(), NonEmptyChunk(FieldChange("lifecycle", "none", "Intelligent-Tiering after 30 days")))) ==
+          Assessment(Risk.Medium, Set.empty),
+        provider.assess(Change.Update(address, BucketSpec(), NonEmptyChunk(FieldChange("lifecycle", "none", "expire after 30 days")))) ==
+          Assessment(Risk.Critical, Set(ChangeFlag.DataLoss)),
       )
     ,
   )

@@ -45,6 +45,29 @@ object CostSpec extends ZIOSpecDefault:
           found.exists(r => math.abs(r.monthlySavings - saving) < 0.01),
         )
     ,
+    test("a big bucket without Intelligent-Tiering is a storage finding, until its lifecycle tiers it"):
+      for
+        clients <- ZIO.environment[AwsEngine.Clients]
+        engine   = AwsEngine.make(BucketNaming(None), clients, clients, AnyOrder)
+        env     <- EngineSpec.uniqueEnv
+        plain    = Manifest(app, List(ResourceDecl(LogicalId("photos"), ResourceSpec.Bucket(BucketSpec()))), Nil)
+        _       <- engine.converge(plain, env, None)
+        bucket   = BucketNaming(None).physical(Address(app, env, ResourceKind.Bucket, LogicalId("photos"))).toOption.get.value
+        cw       = clients.get[DeployClients].cloudwatch
+        // What S3 publishes daily for a bucket holding 200 GB in 1,000 objects.
+        _       <- cw.putMetric("AWS/S3", "BucketSizeBytes", 200e9, Map("BucketName" -> bucket, "StorageType" -> "StandardStorage"))
+        _       <- cw.putMetric("AWS/S3", "NumberOfObjects", 1000, Map("BucketName" -> bucket, "StorageType" -> "AllStorageTypes"))
+        found   <- engine.storage(app, env)
+        tiered   = Manifest(app, List(ResourceDecl(LogicalId("photos"), ResourceSpec.Bucket(BucketSpec(lifecycle = Some(Lifecycle(tieringAfterDays = Some(0))))))), Nil)
+        _       <- engine.converge(tiered, env, None)
+        after   <- engine.storage(app, env)
+      yield assertTrue(
+        found.map(f => (f.address.id.value, f.finding)) == List(("photos", "200.0 GB in S3 Standard and no Intelligent-Tiering")),
+        // Half of 200 GB at the infrequent tier's price, less monitoring 1,000 objects.
+        found.exists(f => math.abs(f.monthlySavings - (100 * (0.023 - 0.0125) - 0.0025)) < 0.01),
+        after.isEmpty,
+      )
+    ,
     test("money is signed and rounded to cents"):
       assertTrue(PlanText.money(43.2) == "+$43.20", PlanText.money(-1.5) == "-$1.50", PlanText.money(0.001) == "$0.00")
     ,

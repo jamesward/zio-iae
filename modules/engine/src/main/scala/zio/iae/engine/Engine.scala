@@ -130,6 +130,10 @@ final case class Engine(
     planner.discovery.managed(app, env).mapError(EngineError.Provider(_)).flatMap: found =>
       ZIO.foreach(found.sortBy(d => (d.address.kind.ordinal, d.address.id)))(d => activity.usage(d.address, since).mapError(EngineError.Provider(_))).map(_.flatten)
 
+  /** Cheaper ways to store the app's data. */
+  def storage(app: AppName, env: EnvName): IO[EngineError, List[StorageFinding]] =
+    recommendations.storage(app, env).mapError(EngineError.Provider(_))
+
   /** Right-sizing recommendations for the app's live services. */
   def rightSizing(app: AppName, env: EnvName): IO[EngineError, List[RightSizing]] =
     recommendations.services(app, env).mapError(EngineError.Provider(_))

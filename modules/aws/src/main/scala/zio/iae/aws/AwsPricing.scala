@@ -24,6 +24,8 @@ object PriceBook:
       "alb.lcu-hour"                -> 0.008,
       "cloudwatch.alarm-month"      -> 0.10,
       "s3.gb-month"                 -> 0.023,
+      "s3.ia-gb-month"              -> 0.0125,
+      "s3.tiering-1000-objects"     -> 0.0025,
       "sqs.million-requests"        -> 0.40,
       "sns.million-publishes"       -> 0.50,
       "dynamodb.million-writes"     -> 0.625,

@@ -59,3 +59,6 @@ enum S3Error derives CanEqual:
     case Service(status, code, _) => status >= 500 || code.exists(Set("SlowDown", "Throttling", "RequestTimeout"))
     case Transport(_)             => true
     case _                        => false
+
+/** The lifecycle rules iae manages on a bucket, in days, and whether there are rules of anyone else's. */
+final case class S3Lifecycle(tieringAfterDays: Option[Int], expireAfterDays: Option[Int], noncurrentExpireAfterDays: Option[Int], others: Boolean) derives CanEqual

@@ -59,6 +59,8 @@ object LivePrices:
     Query("alb.lcu-hour", "AWSELB", "LCUUsage", Some("Load Balancer-Application")),
     Query("cloudwatch.alarm-month", "AmazonCloudWatch", "CW:AlarmMonitorUsage"),
     Query("s3.gb-month", "AmazonS3", "TimedStorage-ByteHrs"),
+    Query("s3.ia-gb-month", "AmazonS3", "TimedStorage-INT-IA-ByteHrs"),
+    Query("s3.tiering-1000-objects", "AmazonS3", "Monitoring-Automation-INT", scale = 1000),
     Query("sqs.million-requests", "AWSQueueService", "Requests-Tier1", scale = 1e6),
     Query("sns.million-publishes", "AmazonSNS", "Requests-Tier1", scale = 1e6),
     Query("dynamodb.million-writes", "AmazonDynamoDB", "WriteRequestUnits", scale = 1e6),

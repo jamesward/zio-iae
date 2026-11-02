@@ -65,7 +65,8 @@ object AwsEngine:
     val prices  = LivePrices.make(deploy.prices, planner.get[AwsContext].region.value)
     val pricing = AwsPricing(prices, deploy.cloudwatch, deploy.elb, naming)
     Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution, pricing, IamAccess(planner.get[IamClient]),
-      ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, prices), AwsActivity(deploy.cloudwatch, deploy.elb, planner.get[SqsClient], planner.get[DynamoClient], naming),
+      AwsRecommendations(ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, prices),
+        StorageAdvice(planner.get[S3Client], deploy.cloudwatch, found, naming, prices)), AwsActivity(deploy.cloudwatch, deploy.elb, planner.get[SqsClient], planner.get[DynamoClient], naming),
       CostExplorerBills(deploy.costs))
 
   /** The clients for one account's config. */

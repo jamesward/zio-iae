@@ -18,7 +18,20 @@ enum ResourceKind derives Schema, CanEqual:
 enum Versioning derives Schema, CanEqual:
   case Enabled, Disabled
 
-final case class BucketSpec(versioning: Versioning = Versioning.Disabled) derives Schema, CanEqual
+/** What happens to a bucket's objects as they age, each after so many days: moved to S3 Intelligent-Tiering (which
+  * moves objects nobody reads to cheaper tiers by itself), deleted, and, in a versioned bucket, old versions deleted.
+  */
+final case class Lifecycle(tieringAfterDays: Option[Int] = None, expireAfterDays: Option[Int] = None, noncurrentExpireAfterDays: Option[Int] = None)
+    derives Schema, CanEqual:
+  def isEmpty: Boolean = tieringAfterDays.isEmpty && expireAfterDays.isEmpty && noncurrentExpireAfterDays.isEmpty
+
+  override def toString: String =
+    if isEmpty then "none"
+    else
+      (tieringAfterDays.map(d => s"Intelligent-Tiering after $d days").toList ++ expireAfterDays.map(d => s"expire after $d days") ++
+        noncurrentExpireAfterDays.map(d => s"old versions expire after $d days")).mkString(", ")
+
+final case class BucketSpec(versioning: Versioning = Versioning.Disabled, lifecycle: Option[Lifecycle] = None) derives Schema, CanEqual
 
 /** Which compute service may assume an app's runtime role. */
 @simpleEnum

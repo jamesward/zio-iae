@@ -105,9 +105,18 @@ object Access:
 final case class RightSizing(address: Address, finding: String, cpu: Int, memory: Int, toCpu: Int, toMemory: Int, monthlySavings: Double)
     derives CanEqual
 
-/** What the cloud recommends for an app's resources (Compute Optimizer). */
+/** A cheaper way to store a resource's data: what was found, the change to its declaration that makes it, and what that
+  * saves a month (USD, an estimate).
+  */
+final case class StorageFinding(address: Address, finding: String, change: String, monthlySavings: Double) derives CanEqual
+
+/** What the cloud recommends for an app's resources: right-sizing services (Compute Optimizer), and storing data for
+  * less.
+  */
 trait Recommendations:
   def services(app: AppName, env: EnvName): IO[ProviderError, List[RightSizing]]
+
+  def storage(app: AppName, env: EnvName): IO[ProviderError, List[StorageFinding]] = zio.ZIO.succeed(Nil)
 
 object Recommendations:
   val none: Recommendations = (_, _) => zio.ZIO.succeed(Nil)

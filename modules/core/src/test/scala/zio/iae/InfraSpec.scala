@@ -26,6 +26,10 @@ object InfraSpec extends ZIOSpecDefault:
       val unwatched = Service.run(Unwatched).manifest(app).map(_.grants)
       assertTrue(watched == Right(List(Grant(LogicalId("web"), ResourceKind.Service, Capability.MetricsPublish))), unwatched == Right(Nil))
     ,
+    test("a bucket without a lifecycle hashes as it did before lifecycles existed, so existing buckets aren't changed"):
+      val json = zio.schema.codec.JsonCodec.jsonEncoder(zio.schema.Schema[ResourceSpec]).encodeJson(ResourceSpec.Bucket(BucketSpec()), None).toString
+      assertTrue(!json.contains("lifecycle"), SpecHash.of(ResourceSpec.Bucket(BucketSpec(lifecycle = Some(Lifecycle(Some(30)))))) != SpecHash.of(ResourceSpec.Bucket(BucketSpec())))
+    ,
     test("a task size Fargate doesn't offer is refused"):
       assertTrue(
         Service.fargate(256, 512),

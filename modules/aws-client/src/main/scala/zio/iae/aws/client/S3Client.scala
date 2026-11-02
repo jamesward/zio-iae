@@ -57,6 +57,36 @@ final case class S3Client(http: Client, config: AwsConfig):
     val body = utf8(s"""<Tagging xmlns="$xmlns"><TagSet>$tagXml</TagSet></Tagging>""")
     execute(Call(Method.PUT, bucket, query = List("tagging" -> ""), body = body, md5 = true)).unit
 
+  /** The bucket's lifecycle rules that iae manages (IDs `iae-tiering`, `iae-expire`, `iae-noncurrent`), and whether
+    * it has rules of anyone else's.
+    */
+  def getBucketLifecycle(bucket: BucketName): IO[S3Error, S3Lifecycle] =
+    executeXml(Call(Method.GET, bucket, query = List("lifecycle" -> ""))): elem =>
+      val rules = (elem \\ "Rule").toList
+      def days(id: String, path: List[String]): Option[Int] =
+        rules.find(r => (r \ "ID").text.trim == id && (r \ "Status").text.trim == "Enabled")
+          .flatMap(r => path.foldLeft[scala.xml.NodeSeq](r)(_ \ _).headOption.flatMap(_.text.trim.toIntOption))
+      Right(S3Lifecycle(
+        days("iae-tiering", List("Transition", "Days")),
+        days("iae-expire", List("Expiration", "Days")),
+        days("iae-noncurrent", List("NoncurrentVersionExpiration", "NoncurrentDays")),
+        rules.exists(r => !(r \ "ID").text.trim.startsWith("iae-")),
+      ))
+    .catchSome:
+      case S3Error.Service(_, Some("NoSuchLifecycleConfiguration"), _) => ZIO.succeed(S3Lifecycle(None, None, None, others = false))
+
+  /** Replaces the bucket's lifecycle rules with iae's; with none, removes the configuration. */
+  def putBucketLifecycle(bucket: BucketName, tiering: Option[Int], expire: Option[Int], noncurrent: Option[Int]): IO[S3Error, Unit] =
+    def rule(id: String, action: String) = s"<Rule><ID>$id</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status>$action</Rule>"
+    val rules =
+      tiering.map(d => rule("iae-tiering", s"<Transition><Days>$d</Days><StorageClass>INTELLIGENT_TIERING</StorageClass></Transition>")).toList ++
+        expire.map(d => rule("iae-expire", s"<Expiration><Days>$d</Days></Expiration>")) ++
+        noncurrent.map(d => rule("iae-noncurrent", s"<NoncurrentVersionExpiration><NoncurrentDays>$d</NoncurrentDays></NoncurrentVersionExpiration>"))
+    if rules.isEmpty then execute(Call(Method.DELETE, bucket, query = List("lifecycle" -> ""))).unit
+    else
+      val body = utf8(s"""<LifecycleConfiguration xmlns="$xmlns">${rules.mkString}</LifecycleConfiguration>""")
+      execute(Call(Method.PUT, bucket, query = List("lifecycle" -> ""), body = body, md5 = true)).unit
+
   def putObject(bucket: BucketName, key: S3Key, body: Chunk[Byte], contentType: Option[String]): IO[S3Error, Unit] =
     val headers = contentType.map("content-type" -> _).toList
     execute(Call(Method.PUT, bucket, Some(key), body = body, headers = headers)).unit
