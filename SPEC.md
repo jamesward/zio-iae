@@ -1111,6 +1111,23 @@ approval request. If the hand change should stay, the answer is a PR changing th
 proposal is a plan with `origin = Cleanup`: deleting stateful resources is `Critical`, so it needs approvals by
 default, while old images and task definitions can be `Auto` if the user's policy allows.
 
+*As built (M7):*
+- **The plan:** `Engine.cleanup(app, env, before)` plans one `Delete` for each of the app's resources orphaned on or
+  before the cutoff (`iae:orphaned`). Each deletion is assessed by its kind's provider: deleting stateful data is
+  `Critical` with `dataLoss`; topics and roles are `High`. Services are only ever orphaned, never deleted. The plan's
+  hash depends only on its deletions, so a waiting proposal stays the same from day to day.
+- **The job:** the cleanup job runs on a schedule (hourly; every 15 minutes of agent time in the harness). Its
+  cutoff is today minus the deployed config's `orphanRetentionDays` (default 14).
+- **Judging and approval:** the plan is judged by the deployed policy as `origin = Cleanup`, with the agent as its
+  author. Its approval request says what it deletes and why ("*Cleanup:* Bucket thumbs has been orphaned … for over
+  14 days"). Each run finds the open request again, and applies once it's approved.
+- **The executor** plans the cleanup again from the env, checks the deployed commit, and refuses a cutoff newer than
+  the deployed config's retention.
+- **Harness:** the `cleanup` scenario orphans a bucket, moves the clock two weeks ahead, and the deletion applies
+  after an approver approves it.
+- **Not yet:** the other candidates (resources of apps no repo declares, idle resources, old images and task
+  definitions) and `ReviewCleanup`'s grouping and context.
+
 **Cost optimizer.** Daily data collection, weekly report:
 
 - Cost Explorer by the `iae:app` and `iae:env` cost-allocation tags (activated by `iae bootstrap`);
@@ -1320,7 +1337,7 @@ and the "iae" GitHub App installed.
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 ✅ (locally) | Monitor ✅ (service gates, queue and table default alarms, health without an alarm) + drift reporting with CloudTrail attribution and policy-gated revert ✅; `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
-| M7 (in progress) | Cleanup, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) ✅ (bundled prices; Price List API to follow) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
+| M7 (in progress) | Cleanup job (orphans past retention) ✅, cost optimizer and security auditor jobs; cost projection on plans (§5.5.1) ✅ (bundled prices; Price List API to follow) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
 
