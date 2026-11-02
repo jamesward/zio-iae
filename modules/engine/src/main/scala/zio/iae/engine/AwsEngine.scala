@@ -62,9 +62,10 @@ object AwsEngine:
     )
     // The pipeline's own calls come from the deployer role bootstrap creates in each env account.
     val attribution = CloudTrailAttribution(planner.get[DeployClients].cloudtrail, naming, Some("iae-deployer"))
-    val pricing = AwsPricing(PriceBook.usEast1, deploy.cloudwatch, deploy.elb, naming)
+    val prices  = LivePrices.make(deploy.prices, planner.get[AwsContext].region.value)
+    val pricing = AwsPricing(prices, deploy.cloudwatch, deploy.elb, naming)
     Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution, pricing, IamAccess(planner.get[IamClient]),
-      ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, PriceBook.usEast1), AwsActivity(deploy.cloudwatch, deploy.elb, planner.get[SqsClient], planner.get[DynamoClient], naming),
+      ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, prices), AwsActivity(deploy.cloudwatch, deploy.elb, planner.get[SqsClient], planner.get[DynamoClient], naming),
       CostExplorerBills(deploy.costs))
 
   /** The clients for one account's config. */
@@ -80,9 +81,10 @@ final case class DeployClients(
     cloudtrail: CloudTrailClient,
     optimizer: ComputeOptimizerClient,
     costs: CostExplorerClient,
+    prices: PriceListClient,
 )
 
 object DeployClients:
   val layer: ZLayer[AwsJsonClient & AwsQueryClient, Nothing, DeployClients] =
     ZLayer.fromFunction((json: AwsJsonClient, query: AwsQueryClient) =>
-      DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query), CloudTrailClient(json), ComputeOptimizerClient(json), CostExplorerClient(json)))
+      DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query), CloudTrailClient(json), ComputeOptimizerClient(json), CostExplorerClient(json), PriceListClient(json)))

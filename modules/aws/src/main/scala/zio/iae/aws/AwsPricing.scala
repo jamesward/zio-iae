@@ -6,14 +6,14 @@ import zio.iae.*
 import zio.iae.aws.client.*
 
 /** Unit prices in USD. */
-final case class PriceBook(region: String, prices: Map[String, Double]):
+final case class PriceBook(region: String, prices: Map[String, Double]) derives CanEqual:
   def apply(unit: String): Double = prices.getOrElse(unit, 0d)
 
 object PriceBook:
   val hoursPerMonth = 730d
 
-  /** AWS's public on-demand list prices in us-east-1 (2025). Real accounts are to read the Price List API, cached
-    * daily, with this as the fallback.
+  /** AWS's public on-demand list prices in us-east-1 (2025): the fallback when the Price List API doesn't answer
+    * (`LivePrices`), and what tests price with.
     */
   val usEast1: PriceBook = PriceBook(
     "us-east-1",
@@ -39,15 +39,23 @@ object PriceBook:
   *   - a bucket, queue, topic or table: what its storage or traffic was, which a spec change doesn't change, so an
   *     update costs nothing more; a new one has no usage yet, which its assumptions say.
   */
-final case class AwsPricing(book: PriceBook, cloudwatch: CloudWatchClient, elb: Elbv2Client, buckets: BucketNaming) extends Pricing:
+final case class AwsPricing(prices: Prices, cloudwatch: CloudWatchClient, elb: Elbv2Client, buckets: BucketNaming) extends Pricing:
+  def estimate(planned: PlannedChange): IO[ProviderError, Option[CostDelta]] =
+    prices.book.flatMap(PricedBy(_, cloudwatch, elb, buckets).estimate(planned))
+
+  override def monthly(address: Address): IO[ProviderError, Option[Double]] =
+    prices.book.flatMap(PricedBy(_, cloudwatch, elb, buckets).monthly(address))
+
+/** The cost models, by one price book. */
+final case class PricedBy(book: PriceBook, cloudwatch: CloudWatchClient, elb: Elbv2Client, buckets: BucketNaming) extends Pricing:
   import AwsPricing.*
 
   def estimate(planned: PlannedChange): IO[ProviderError, Option[CostDelta]] =
     planned.change match
-      case Change.Create(address, spec) => monthly(address, spec, existing = false).map(c => Some(CostDelta(0, c.amount, c.exact, c.assumptions)))
+      case Change.Create(address, spec) => cost(address, spec, existing = false).map(c => Some(CostDelta(0, c.amount, c.exact, c.assumptions)))
       case Change.Update(address, spec, _) =>
         for
-          after  <- monthly(address, spec, existing = true)
+          after  <- cost(address, spec, existing = true)
           before <- previous(address).map(_.getOrElse(after))
         yield Some(CostDelta(before.amount, after.amount, after.exact && before.exact, (before.assumptions ++ after.assumptions).distinct))
       case Change.Delete(address) =>
@@ -57,7 +65,7 @@ final case class AwsPricing(book: PriceBook, cloudwatch: CloudWatchClient, elb: 
   override def monthly(address: Address): IO[ProviderError, Option[Double]] = previous(address).map(_.map(_.amount))
 
   /** The monthly cost of a resource as the spec declares it. */
-  def monthly(address: Address, spec: ResourceSpec, existing: Boolean): IO[ProviderError, Cost] =
+  def cost(address: Address, spec: ResourceSpec, existing: Boolean): IO[ProviderError, Cost] =
     spec match
       case ResourceSpec.Service(s) => ZIO.succeed(service(s.cpu, s.memory, s.count, ServiceProvider.gateCount(s.canary)))
       case ResourceSpec.Secret(_)  => ZIO.succeed(Cost(book("secretsmanager.secret-month"), exact = true))

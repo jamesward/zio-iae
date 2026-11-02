@@ -30,7 +30,7 @@ object CostSpec extends ZIOSpecDefault:
           fake    <- ComputeOptimizerFake.make.orDie
           optimizer = ComputeOptimizerClient(AwsJsonClient(http, aws.copy(endpoint = Endpoint.parse(fake.url.encode).toOption)))
           watch    = base.watch.asInstanceOf[ServiceWatch]
-          engine   = base.copy(recommendations = ComputeOptimizerRecommendations(optimizer, watch.provider, base.planner.discovery, PriceBook.usEast1))
+          engine   = base.copy(recommendations = ComputeOptimizerRecommendations(optimizer, watch.provider, base.planner.discovery, Prices.fixed(PriceBook.usEast1)))
           env     <- EngineSpec.uniqueEnv
           port    <- Random.nextIntBounded(1000).map(14000 + _)
           _       <- engine.converge(web(port, 2, cpu = 1024, memory = 2048), env, None)
