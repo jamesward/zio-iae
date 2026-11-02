@@ -70,6 +70,9 @@ object Watch:
 trait Pricing:
   def estimate(change: PlannedChange): IO[ProviderError, Option[CostDelta]]
 
+  /** What an existing resource costs a month now, by the same model: None when the kind has no cost model. */
+  def monthly(address: Address): IO[ProviderError, Option[Double]] = zio.ZIO.none
+
 object Pricing:
   val none: Pricing = _ => zio.ZIO.none
 
@@ -120,3 +123,23 @@ trait Activity:
 
 object Activity:
   val none: Activity = (_, _) => zio.ZIO.none
+
+/** What an app actually cost in an env over a period, from the bill (USD): in total and by AWS service. */
+final case class Spend(from: LocalDate, to: LocalDate, total: Double, byService: Map[String, Double]) derives CanEqual
+
+/** A spike in an env's spending that the cloud's anomaly detection found: how much more than expected (USD), since
+  * when, on what, and the causes it names.
+  */
+final case class CostAnomaly(id: String, start: Option[LocalDate], dimension: Option[String], impact: Double, causes: List[String]) derives CanEqual
+
+/** The bill: what the managed resources actually cost (Cost Explorer by the `iae:app` and `iae:env` tags), and the
+  * spending anomalies in an env's account.
+  */
+trait Bills:
+  def spend(app: AppName, env: EnvName, from: LocalDate, to: LocalDate): IO[ProviderError, Option[Spend]]
+  def anomalies(env: EnvName, since: LocalDate): IO[ProviderError, List[CostAnomaly]]
+
+object Bills:
+  val none: Bills = new Bills:
+    def spend(app: AppName, env: EnvName, from: LocalDate, to: LocalDate) = zio.ZIO.none
+    def anomalies(env: EnvName, since: LocalDate)                         = zio.ZIO.succeed(Nil)

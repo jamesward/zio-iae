@@ -126,8 +126,10 @@ final case class ExecutorService(
     for
       now        <- Clock.instant
       policy      = governance.policy
-      floors      = governance.facts(plan, author.slack, now, origin).map(f => f -> Floor(f, policy))
-      floor       = floors.map(_._2._1).foldLeft[Decision](Decision.Auto)(Decision.strictest)
+      facts       = governance.facts(plan, author.slack, now, origin)
+      floors      = facts.map(f => f -> Floor(f, policy))
+      whole       = Floor.plan(facts, policy)
+      floor       = (floors.map(_._2._1) ++ whole.map(_.decision)).foldLeft[Decision](Decision.Auto)(Decision.strictest)
       channel     = governance.config.slack.channel
       approvals   = Approvals(slack, agent, channel, approvalExpiry)
       request    <- ZIO.foreach(approvalTs)(ts => requestFor(channel, ts, plan, now))
@@ -141,7 +143,7 @@ final case class ExecutorService(
                           case ApprovalStatus.Approved(by, m) => ZIO.some(m -> by)
                           case ApprovalStatus.Rejected(by, _) => ZIO.fail(s"<@$by> rejected it")
                           case ApprovalStatus.Pending(_)      => ZIO.fail(s"it ${PlanText.describe(approve)}, which the request doesn't have")
-      decision = PlanDecision(required, floors.map((f, d) => ChangeDecision(f.id, d._1, d._2)))
+      decision = PlanDecision(required, floors.map((f, d) => ChangeDecision(f.id, d._1, d._2)) ++ whole.toList)
       why      = approved.fold("the policy lets it go ahead")((_, by) => s"approved by ${by.toList.sorted.map(u => s"<@$u>").mkString(", ")}") + "; checked by the executor"
       report  <- Applying.run(slack, runtime, governance, author, plan, decision, commit, why, approved, approvals).mapError(_.message)
     yield report

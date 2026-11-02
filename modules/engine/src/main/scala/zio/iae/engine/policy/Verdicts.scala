@@ -27,7 +27,7 @@ final case class ChangeVerdict(change: ChangeId, decision: Decision, clauses: Li
 /** The policy's settings that code relies on: the owners group, the groups verdicts may name, and which envs are
   * production for the built-in floor.
   */
-/** `costLimits`: per env, the monthly cost a single change may add (USD) before it needs an owner. */
+/** `costLimits`: per env, the monthly cost (USD) a change, or a whole plan, may add before it needs an owner. */
 final case class PolicyConfig(text: String, owners: SlackGroup, groups: Set[SlackGroup], production: Set[EnvName], costLimits: Map[EnvName, Double] = Map.empty)
 
 final case class ChangeDecision(change: ChangeId, decision: Decision, reasons: List[String]) derives Schema, CanEqual
@@ -43,7 +43,8 @@ object Verdicts:
       val (evaluated, why) = failSafe(fact, verdicts.filter(_.change == fact.id), policy)
       val (floor, floorWhy) = Floor(fact, policy)
       ChangeDecision(fact.id, Decision.strictest(evaluated, floor), why ++ floorWhy)
-    PlanDecision(changes.map(_.decision).foldLeft[Decision](Decision.Auto)(Decision.strictest), changes)
+    val all = changes ++ Floor.plan(facts, policy).toList
+    PlanDecision(all.map(_.decision).foldLeft[Decision](Decision.Auto)(Decision.strictest), all)
 
   private def failSafe(fact: ChangeFacts, verdicts: List[ChangeVerdict], policy: PolicyConfig): (Decision, List[String]) =
     val owners = Decision.Approve(1, Set(policy.owners))
@@ -75,6 +76,18 @@ object Floor:
         val limit = policy.costLimits(fact.env)
         (owners, List(f"it adds $$${fact.monthlyCost.get}%.2f a month, over ${fact.env.value}'s limit of $$$limit%.2f"))
       case Subject.Resource(_, _, _) => (Decision.Auto, Nil)
+
+  /** The plan's own floor: its changes together adding more than the env's cost limit need an owner, although each
+    * may be under it. None when they don't, or the env has no limit.
+    */
+  def plan(facts: List[ChangeFacts], policy: PolicyConfig): Option[ChangeDecision] =
+    val priced = facts.filter(f => f.subject.isInstanceOf[Subject.Resource] && f.monthlyCost.isDefined)
+    for
+      env   <- priced.headOption.map(_.env)
+      limit <- policy.costLimits.get(env)
+      total  = math.round(priced.flatMap(_.monthlyCost).sum * 100) / 100d
+      if priced.size > 1 && total > limit
+    yield ChangeDecision(ChangeId("plan"), Decision.Approve(1, Set(policy.owners)), List(f"together its changes add $$$total%.2f a month, over ${env.value}'s limit of $$$limit%.2f"))
 
 /** A policy without an LLM: the default risk table from the spec. Used by the CLI and in tests. */
 final case class RiskTable(approvers: SlackGroup, owners: SlackGroup, production: Set[EnvName], free: Set[EnvName]):

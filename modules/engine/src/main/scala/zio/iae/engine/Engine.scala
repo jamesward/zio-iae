@@ -95,7 +95,24 @@ final case class Engine(
     access: Access = Access.none,
     recommendations: Recommendations = Recommendations.none,
     activity: Activity = Activity.none,
+    bills: Bills = Bills.none,
 ):
+  /** What the app actually cost in the env from `from` (inclusive) to `to` (exclusive), from the bill. */
+  def spend(app: AppName, env: EnvName, from: java.time.LocalDate, to: java.time.LocalDate): IO[EngineError, Option[Spend]] =
+    bills.spend(app, env, from, to).mapError(EngineError.Provider(_))
+
+  /** The spending anomalies in the env's account since a day. */
+  def anomalies(env: EnvName, since: java.time.LocalDate): IO[EngineError, List[CostAnomaly]] =
+    bills.anomalies(env, since).mapError(EngineError.Provider(_))
+
+  /** What the app's resources in the env should cost a month by the price model, for comparing with the bill. None
+    * when nothing of it is priced.
+    */
+  def projected(app: AppName, env: EnvName): IO[EngineError, Option[Double]] =
+    planner.discovery.managed(app, env).mapError(EngineError.Provider(_)).flatMap: found =>
+      ZIO.foreach(found)(d => pricing.monthly(d.address).mapError(EngineError.Provider(_))).map: costs =>
+        Option.when(costs.exists(_.isDefined))(costs.flatten.sum)
+
   /** The apps with managed resources in the env. */
   def apps(env: EnvName): IO[EngineError, Set[AppName]] = planner.discovery.apps(env).mapError(EngineError.Provider(_))
 

@@ -19,6 +19,35 @@ object CostJobSpec extends ZIOSpecDefault:
     def isAncestor(ancestor: CommitSha, descendant: CommitSha): IO[EngineError, Boolean] = ZIO.succeed(true)
 
   def spec = suite("Cost optimizer")(
+    test("the bill is posted once a week beside the projection, which is called out when it's off; each anomaly is posted once"):
+      ZIO.scoped:
+        for
+          repo    <- TestRepo.make
+          ws       = repo.workspace(env)
+          web      = Address(app, env, ResourceKind.Service, LogicalId("web"))
+          found: Discovery = (_, _) => ZIO.succeed(List(Discovered(web, None, None)))
+          priced: Pricing = new Pricing:
+            def estimate(change: PlannedChange) = ZIO.none
+            override def monthly(address: Address) = ZIO.some(40d)
+          bills: Bills = new Bills:
+            def spend(app: AppName, env: EnvName, from: java.time.LocalDate, to: java.time.LocalDate) =
+              ZIO.some(Spend(from, to, 61.2, Map("Amazon Elastic Container Service" -> 58.7, "Amazon Simple Storage Service" -> 2.5)))
+            def anomalies(env: EnvName, since: java.time.LocalDate) =
+              ZIO.succeed(List(CostAnomaly("arn:aws:ce::1:anomalymonitor/m/a1", Some(java.time.LocalDate.parse("2026-10-30").nn), Some("AmazonECS"), 18.4, List("Amazon Elastic Container Service / us-east-1"))))
+          runtime  = EnvRuntime(env, Engine.make(Drivers(Nil), found, AnyOrder).copy(pricing = priced, bills = bills), ws)
+          slack   <- InMemorySlack.make(Map.empty)
+          job      = CostJob(List(runtime), List(app), slack, slack.self, channel, None)
+          _       <- job.sweep *> job.sweep *> job.anomalies *> job.anomalies
+          posted  <- slack.posted(channel)
+          bill     = posted.filter(_.text.startsWith("*Cost* `photo-app/prod`: $61.20"))
+          spikes   = posted.filter(_.text.startsWith("*Cost anomaly*"))
+        yield assertTrue(
+          bill.size == 1,
+          bill.head.text.contains("Amazon Elastic Container Service $58.70, Amazon Simple Storage Service $2.50."),
+          bill.head.text.contains("iae projects $40.00 a month for its resources. The bill is 53% higher than that"),
+          spikes.size == 1,
+          spikes.head.text == "*Cost anomaly* in `prod`'s account: $18.40 more than expected on AmazonECS since 2026-10-30 (anomaly a1). Causes: Amazon Elastic Container Service / us-east-1.",
+        ),
     test("right-sizing recommendations are reported once with their savings (the review needs a deployed commit; none here)"):
       ZIO.scoped:
         for

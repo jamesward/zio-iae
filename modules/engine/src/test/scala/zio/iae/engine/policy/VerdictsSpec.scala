@@ -40,6 +40,18 @@ object VerdictsSpec extends ZIOSpecDefault:
         Floor(elsewhere, limited)._1 == Decision.Auto,
       )
     ,
+    test("a plan whose changes together add more than the limit needs an owner, although each is under it"):
+      val limited = policy.copy(costLimits = Map(prod -> 100d))
+      val facts   = List(fact("0", prod).copy(monthlyCost = Some(60)), fact("1", prod).copy(monthlyCost = Some(70)))
+      val decided = Verdicts.decide(facts, List(verdict("0", Decision.Auto), verdict("1", Decision.Auto)), limited)
+      val cheaper = Verdicts.decide(facts.map(_.copy(monthlyCost = Some(30))), List(verdict("0", Decision.Auto), verdict("1", Decision.Auto)), limited)
+      assertTrue(
+        decided.decision == ownersOnce,
+        decided.changes.exists(c => c.change.value == "plan" && c.reasons == List("together its changes add $130.00 a month, over prod's limit of $100.00")),
+        cheaper.decision == Decision.Auto,
+        Floor.plan(facts, policy).isEmpty,
+      )
+    ,
     test("the strictest decision wins and approvals combine"):
       assertTrue(
         Decision.strictest(Decision.Auto, Decision.Deny) == Decision.Deny,

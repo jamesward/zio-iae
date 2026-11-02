@@ -57,6 +57,7 @@ object CostSpec extends ZIOSpecDefault:
         created <- engine.plan(web(port, 1), env, None, Phase.Expand)
         _       <- engine.converge(web(port, 1), env, None)
         scaled  <- engine.plan(web(port, 2), env, None, Phase.Expand)
+        now     <- engine.projected(app, env)
         task     = (256 / 1024d * 0.04048 + 512 / 1024d * 0.004445) * 730
         delta    = scaled.changes.head.cost.map(_.delta).getOrElse(0d)
       yield assertTrue(
@@ -64,5 +65,7 @@ object CostSpec extends ZIOSpecDefault:
         PlanText.render(created).contains("cost: +$"),
         math.abs(delta - task) < 0.01,
         scaled.hash == scaled.copy(changes = scaled.changes.map(_.copy(cost = None))).hash,
+        // What it costs now, as planned when it was created (the role costs nothing).
+        now.exists(p => created.changes.head.cost.exists(c => math.abs(c.after - p) < 0.01)),
       ),
   ).provideShared(FlociLayer.live, Client.default, AwsEngine.clients) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom @@ TestAspect.timeout(5.minutes)
