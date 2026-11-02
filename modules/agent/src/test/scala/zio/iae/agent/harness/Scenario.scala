@@ -23,6 +23,8 @@ enum Step:
   case Drift(description: String, change: Harness => IO[String, Unit])
   /** Switches a fault on or off for a version in an env (by index): the one in canary, or the live one. */
   case InjectFault(env: Int, fault: Fault, on: Boolean, target: Target = Target.Canary)
+  /** Asks the agent to roll the web service back in an env (by index), as the triage's tool or an approver would. */
+  case RequestRollback(env: Int)
   /** A reply in the thread of a message, both matching. */
   case WaitForReply(description: String, root: (Harness, String) => Boolean, reply: String => Boolean)
 
@@ -37,6 +39,7 @@ enum Step:
     case InjectFault(env, fault, on, target) =>
       s"${if on then "make" else "stop making"} the ${if target == Target.Live then "live version" else "canary"} in env ${env + 1} ${fault.describe}"
     case WaitForReply(d, _, _) => s"wait for $d"
+    case RequestRollback(env)  => s"ask the agent to roll the web service back in env ${env + 1}"
 
 final case class Scenario(name: String, description: String, steps: List[Step])
 
@@ -84,7 +87,9 @@ object Scenario:
       case Step.RestartAgent      => harness.agent.restart
       case Step.Drift(_, change)  => change(harness)
       case Step.InjectFault(env, fault, on, target) =>
-        ZIO.fromOption(harness.envs.lift(env)).orElseFail(s"no env ${env + 1}").flatMap(r => harness.faults.set(r.env, fault, target, on))
+        ZIO.fromOption(harness.envs.lift(env)).orElseFail(s"no env ${env + 1}").flatMap(r => harness.fault(r.env, fault, target, on))
+      case Step.RequestRollback(env) =>
+        harness.agent.rollback(env).flatMap(outcome => ZIO.logInfo(s"rollback in env ${env + 1}: $outcome"))
       case Step.WaitForReply(description, root, reply) =>
         harness.slack.messages.get
           .map(_.exists(m => root(harness, m.text) && m.replies.exists(r => reply(r.text))))
@@ -306,7 +311,25 @@ object Scenario:
     ),
   )
 
+  val incidentRollback = Scenario(
+    "incident-rollback",
+    "v2 goes live everywhere, then starts answering 5xx in prod: the alert's rollback (as the triage asks for it) puts v1 back through the executor, and the alert resolves although v2 is still broken.",
+    webGoesLive ++ List(
+      Step.Push("deploy v2", "deploy v2", _ => ZIO.succeed(withService(WebV2))),
+      appliedIn(1),
+      Step.InjectFault(1, Fault.Errors, on = true, Target.Live),
+      Step.WaitFor("an alert for env 2", (h, text) => text.startsWith("*Alert*") && text.contains(s"${Harness.app.value}/${env(h, 1)}")),
+      Step.RequestRollback(1),
+      Step.WaitFor("the rollback applied in env 2", (h, text) => text.startsWith("Applied") && text.contains(s"${Harness.app.value}/${env(h, 1)}") && text.contains("rollback")),
+      Step.WaitForReply(
+        "the alert to be resolved",
+        (h, text) => text.startsWith("*Resolved*") && text.contains(s"${Harness.app.value}/${env(h, 1)}"),
+        _.startsWith("Cleared"),
+      ),
+    ),
+  )
+
   val slowDeploy    = faultyDeploy("slow-deploy", Fault.Slow, "latency")
   val failingMetric = faultyDeploy("failing-metric", Fault.FailingMetric, "uploads")
 
-  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric, incident)
+  val all: List[Scenario] = List(gatedChange, rejectedChange, nobodyAnswers, droppedEvent, agentRestart, drift, policyChange, buildFailure, badDeploy, slowDeploy, failingMetric, incident, incidentRollback)

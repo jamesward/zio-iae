@@ -2,6 +2,7 @@ package zio.iae.agent.harness
 
 import zio.*
 import zio.iae.EnvName
+import zio.iae.aws.Color
 import zio.schema.{Schema, derived}
 
 /** What can go wrong with a version, injected by the harness. */
@@ -19,22 +20,29 @@ enum Fault derives Schema, CanEqual:
     case Slow          => "answers slowly"
     case FailingMetric => "reports failing uploads"
 
-/** Which version a fault hits: the one in canary (a bad deploy), or the one with the traffic (an incident). */
+/** Which version a fault hits: whichever is in canary (a bad deploy), or the version live when it was injected (an
+  * incident), which keeps its fault after a rollback moves the traffic away from it.
+  */
 @zio.schema.annotation.simpleEnum
 enum Target derives Schema, CanEqual:
   case Canary, Live
 
-final case class ActiveFault(env: String, fault: Fault, target: Target) derives Schema
+/** Where an active fault sits: `canary`, or a color (`blue`, `green`). */
+final case class ActiveFault(env: String, fault: Fault, on: String) derives Schema
 
-/** The faults switched on per env and target. */
-final case class Faults(active: Ref[Set[(EnvName, Fault, Target)]]):
-  def set(env: EnvName, fault: Fault, target: Target, on: Boolean): UIO[Unit] =
-    active.update(a => if on then a + ((env, fault, target)) else a - ((env, fault, target)))
+final case class Faults(active: Ref[Set[(EnvName, Fault, String)]]):
+  /** `on` is `canary` or a color. */
+  def set(env: EnvName, fault: Fault, on: String, enabled: Boolean): UIO[Unit] =
+    active.update(a => if enabled then a + ((env, fault, on)) else a - ((env, fault, on)))
 
-  def in(env: EnvName, target: Target): UIO[Set[Fault]] = active.get.map(_.collect { case (`env`, f, `target`) => f })
+  /** The faults on a color: its own, plus the canary's while it isn't live. */
+  def on(env: EnvName, color: Color, live: Boolean): UIO[Set[Fault]] =
+    active.get.map(_.collect { case (`env`, f, where) if where == color.toString || (!live && where == Faults.Canary) => f })
 
   def list: UIO[List[ActiveFault]] =
-    active.get.map(_.toList.map((e, f, t) => ActiveFault(e.value, f, t)).sortBy(a => (a.env, a.target.ordinal, a.fault.ordinal)))
+    active.get.map(_.toList.map((e, f, w) => ActiveFault(e.value, f, w)).sortBy(a => (a.env, a.on, a.fault.ordinal)))
 
 object Faults:
-  def make: UIO[Faults] = Ref.make(Set.empty[(EnvName, Fault, Target)]).map(Faults(_))
+  val Canary = "canary"
+
+  def make: UIO[Faults] = Ref.make(Set.empty[(EnvName, Fault, String)]).map(Faults(_))

@@ -13,7 +13,7 @@ import zio.schema.{Schema, derived}
 final case class Triage(bedrock: Bedrock, instructions: String, prs: Option[PullRequests] = None) extends AlertTriage:
   import Triage.*
 
-  def triage(alert: Alert, runtime: EnvRuntime): IO[String, String] =
+  def triage(alert: Alert, runtime: EnvRuntime, rollback: IO[String, String]): IO[String, String] =
     val workspace = runtime.workspace
     val commit    = alert.alarm.commit
     val prompt =
@@ -29,6 +29,11 @@ final case class Triage(bedrock: Bedrock, instructions: String, prs: Option[Pull
           .mapBoth(_.message, log => Deployment(alert.alarm.image, commit.map(_.value), log.linesIterator.toList)),
       "What is live (image and commit) and the branch's last 15 commits (short sha, time, author: subject).",
     )
+    val rollbackTool = ToolHandler(
+      (_: NoInput) => rollback.map(RollbackResult(_)),
+      "Ask to roll the alerting service back to the version it ran before. The team's policy decides whether that happens " +
+        "now or needs approvers; the answer says which. Use it only when a recent deploy clearly correlates with the alert.",
+    )
     val config = InferenceConfig(maxTokens = 1500, temperature = 0.2)
     val answer = ZIO.fromOption(commit).orElse(workspace.sync.mapError(_.message)).flatMap: at =>
       val repo      = RepoAt(workspace, at)
@@ -37,7 +42,7 @@ final case class Triage(bedrock: Bedrock, instructions: String, prs: Option[Pull
       val search    = ToolHandler(repo.search, "Lines matching an extended regular expression at the live commit, as path:line:text.")
       prs match
         case None =>
-          Bedrock.loop(prompt, (alarms = alarms, deployment = deployment, listFiles = listFiles, readFile = readFile, search = search))
+          Bedrock.loop(prompt, (alarms = alarms, deployment = deployment, listFiles = listFiles, readFile = readFile, search = search, rollback = rollbackTool))
             .system(instructions).inferenceConfig(config).maxIterations(14).text
             .provideEnvironment(ZEnvironment(bedrock)).mapError(_.getMessage)
         case Some(p) =>
@@ -52,6 +57,7 @@ final case class Triage(bedrock: Bedrock, instructions: String, prs: Option[Pull
                     listFiles = listFiles,
                     readFile = readFile,
                     search = search,
+                    rollback = rollbackTool,
                     writeFile = ToolHandler(fix.writeFile, "Replace a file's whole content in the fix (a scratch copy at the live commit)."),
                     openPullRequest = ToolHandler(fix.openPullRequest, "Commit the files written so far and open one pull request with them."),
                   ),
@@ -69,6 +75,7 @@ object Triage:
   final case class AlarmInfo(service: String, gate: String, firing: Boolean, image: Option[String]) derives Schema
   final case class Alarms(alarms: List[AlarmInfo]) derives Schema
   final case class Deployment(image: Option[String], commit: Option[String], recentCommits: List[String]) derives Schema
+  final case class RollbackResult(outcome: String) derives Schema
 
   def make(bedrock: Bedrock, prs: Option[PullRequests] = None): IO[AgentError, AlertTriage] =
     Model.prompt("triage").mapBoth(AgentError.Config(_), Triage(bedrock, _, prs))

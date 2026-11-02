@@ -27,19 +27,34 @@ final case class Harness(
     audit: AuditManagerFake,
     pulls: LocalPullRequests,
     faults: Faults,
-)
+    traffic: TrafficGenerator,
+):
+  /** Switches a fault on or off: for the canary, or pinned to the version live now. */
+  def fault(env: EnvName, fault: Fault, target: Target, on: Boolean): IO[String, Unit] =
+    target match
+      case Target.Canary => faults.set(env, fault, Faults.Canary, on)
+      case Target.Live =>
+        if on then traffic.live(env).someOrFail(s"nothing is live in ${env.value}").flatMap(c => faults.set(env, fault, c.toString, enabled = true))
+        else faults.list.flatMap(all => ZIO.foreachDiscard(all.filter(a => a.env == env.value && a.fault == fault && a.on != Faults.Canary))(a => faults.set(env, fault, a.on, false)))
 
 /** The agent as a process the harness can stop and start; a restart loses everything in memory, like a new
   * container would.
   */
-final class AgentProcess(start: IO[String, (Fiber.Runtime[Nothing, Nothing], Reconcilers)], running: Ref.Synchronized[Option[(Fiber.Runtime[Nothing, Nothing], Reconcilers)]]):
-  def signal: UIO[Unit]          = running.get.flatMap(r => ZIO.foreachDiscard(r)(_._2.signalAll))
-  def restart: IO[String, Unit] = running.updateZIO(r => ZIO.foreachDiscard(r)(_._1.interrupt) *> start.map(Some(_)))
+final class AgentProcess(start: IO[String, AgentProcess.Running], running: Ref.Synchronized[Option[AgentProcess.Running]]):
+  def signal: UIO[Unit]          = running.get.flatMap(r => ZIO.foreachDiscard(r)(_.reconcilers.signalAll))
+  def restart: IO[String, Unit] = running.updateZIO(r => ZIO.foreachDiscard(r)(_.fiber.interrupt) *> start.map(Some(_)))
+
+  /** What the triage's `rollback` tool asks for, as an approver might too: the web service in the env (by index). */
+  def rollback(env: Int): IO[String, String] =
+    running.get.someOrFail("the agent isn't running").flatMap: r =>
+      r.pipeline.rollback(r.reconcilers.envs(env), Harness.app, Scenario.Web.logicalId).mapBoth(_.message, Monitor.describe)
 
 object AgentProcess:
-  def make(start: IO[String, (Fiber.Runtime[Nothing, Nothing], Reconcilers)]): IO[String, AgentProcess] =
+  final case class Running(fiber: Fiber.Runtime[Nothing, Nothing], reconcilers: Reconcilers, pipeline: Pipeline)
+
+  def make(start: IO[String, Running]): IO[String, AgentProcess] =
     for
-      running <- Ref.Synchronized.make(Option.empty[(Fiber.Runtime[Nothing, Nothing], Reconcilers)])
+      running <- Ref.Synchronized.make(Option.empty[Running])
       process  = AgentProcess(start, running)
       _       <- process.restart
     yield process
@@ -135,7 +150,8 @@ object Harness:
       executor  = ExecutorService(SlackWebApi(http, SlackToken("xoxb-executor"), base), self, executorEnvs, builds, SqsInbox(sqs, inboxUrl), 24.hours)
       _        <- ZIO.withClock(clock)(executor.consume(sqs, executorUrl)).forkIn(scope)
       faults   <- Faults.make
-      _        <- TrafficGenerator(http, app, Scenario.Web.logicalId, envNames.map(e => e -> accounts.getOrElse(e, tooling)), faults).run.forkIn(scope)
+      traffic   = TrafficGenerator(http, app, Scenario.Web.logicalId, envNames.map(e => e -> accounts.getOrElse(e, tooling)), faults)
+      _        <- traffic.run.forkIn(scope)
       httpEnv  <- ZIO.environment[Client]
       start = (for
                 model     <- Model.fromEnvironment.provideEnvironment(httpEnv).mapError(_.message)
@@ -149,12 +165,12 @@ object Harness:
                 talk        <- ZIO.foreach(model)(m => Converse.make(client, self, m, envs, builds).flatMap(Conversations.make)).mapError(_.message)
                 triage      <- ZIO.foreach(model)(Triage.make(_, Some(pulls))).mapError(_.message)
                 owners       = SlackGroup.from("platform-owners").toOption.get
-                monitor     <- Monitor.make(envs, List(app), client, self, channel, owners, triage)
+                monitor     <- Monitor.make(envs, List(app), client, self, channel, owners, triage, rollbacks = Some(pipeline.rollback))
                 fiber       <- ZIO.withClock(clock)(Agent(reconcilers, InboxConsumer(sqs, inboxUrl, "main", reconcilers, talk), 15.minutes, Some(monitor)).run).forkIn(scope)
-              yield (fiber, reconcilers))
+              yield AgentProcess.Running(fiber, reconcilers, pipeline))
       agent    <- AgentProcess.make(start)
       s3        = envNames.map(env => S3Client(http, accounts.getOrElse(env, tooling)))
-      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3, audit, pulls, faults)
+      harness   = Harness(bound, ui, slack, repo, envs, clock, agent, s3, audit, pulls, faults, traffic)
       _        <- started.succeed(harness)
     yield harness
 

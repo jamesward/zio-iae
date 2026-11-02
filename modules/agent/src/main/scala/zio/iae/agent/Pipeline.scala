@@ -25,10 +25,10 @@ final case class Governance(config: RepoConfig, text: String, proposed: Option[(
   def policy: PolicyConfig = config.policy(text)
 
   /** The facts a plan is judged on: its changes, plus a policy change when the target proposes one. */
-  def facts(plan: Plan, author: Option[String], now: java.time.Instant): List[ChangeFacts] =
+  def facts(plan: Plan, author: Option[String], now: java.time.Instant, origin: Origin = Origin.Human): List[ChangeFacts] =
     val policyFact = Option.when(proposed.isDefined && !plan.isEmpty):
-      ChangeFacts(ChangeId("policy"), plan.env, Subject.PolicyText, Risk.High, Set.empty, Origin.Human, author, now)
-    ChangeFacts.of(plan, Origin.Human, author, now) ++ policyFact
+      ChangeFacts(ChangeId("policy"), plan.env, Subject.PolicyText, Risk.High, Set.empty, origin, author, now)
+    ChangeFacts.of(plan, origin, author, now) ++ policyFact
 
 object Governance:
   /** A change can't loosen its own gate: the policy and the approval settings (owners, groups, production envs,
@@ -52,6 +52,14 @@ object Governance:
 /** Reconciles one env to the head of the branch: expand, then contract, each through the user's policy. Level-
   * triggered and idempotent: running it again after a crash or a dropped event just does what is left.
   */
+object Pipeline:
+  /** The author of what the agent starts itself, such as a rollback: no person, so nobody is excluded from approving. */
+  val agentAuthor: Author = Author("iae", None)
+
+  /** The service a rollback plan rolls back. */
+  def rolledBack(plan: Plan): Option[LogicalId] =
+    plan.changes.collectFirst { case PlannedChange(Change.Rollback(address, _, _), _, _) => address.id }
+
 final case class Pipeline(
     manifests: ManifestSource,
     evaluator: PolicyEvaluator,
@@ -129,10 +137,38 @@ final case class Pipeline(
       phase: Phase,
       commit: CommitSha,
   ): IO[AgentError, Outcome] =
+    runtime.engine.plan(manifest, runtime.env, Some(commit), phase).mapError(AgentError.Engine(_))
+      .flatMap(judged(runtime, governance, author, approvals, _, commit, Origin.Human))
+
+  /** A rollback an alert asks for: judged by the policy deployed in the env, as `origin = Alert` with the agent as its
+    * author, and applied, handed to the executor or put to approvers like any plan. Asking again is harmless: an
+    * open request is found again, and once rolled back there's nothing left to roll back.
+    */
+  def rollback(runtime: EnvRuntime, app: AppName, service: LogicalId): IO[AgentError, Option[Outcome]] =
+    for
+      deployed <- runtime.engine.deployed(List(app), runtime.env).mapError(AgentError.Engine(_))
+      commit   <- ZIO.fromOption(deployed).orElseFail(AgentError.Config(s"nothing of ${app.value} is deployed in ${runtime.env.value}"))
+      _        <- runtime.workspace.sync
+      (config, text) <- RepoConfig.loadAt(runtime.workspace, commit)
+      governance = Governance(config, text, None, deployed)
+      plan     <- runtime.engine.rollback(Address(app, runtime.env, ResourceKind.Service, service)).mapError(AgentError.Engine(_))
+      approvals = Approvals(slack, self, config.slack.channel, approvalExpiry)
+      outcome  <- ZIO.unless(plan.isEmpty)(judged(runtime, governance, Pipeline.agentAuthor, approvals, plan, commit, Origin.Alert))
+      _        <- ZIO.logInfo(s"rollback of ${app.value}/${runtime.env.value}/${service.value}: $outcome")
+    yield outcome
+
+  private def judged(
+      runtime: EnvRuntime,
+      governance: Governance,
+      author: Author,
+      approvals: Approvals,
+      plan: Plan,
+      commit: CommitSha,
+      origin: Origin,
+  ): IO[AgentError, Outcome] =
     val config = governance.config
     for
-      plan     <- runtime.engine.plan(manifest, runtime.env, Some(commit), phase).mapError(AgentError.Engine(_))
-      decision <- decide(governance, plan, author.slack)
+      decision <- decide(governance, plan, author.slack, origin)
       done      = applied(runtime, governance, author, plan, decision, commit, approvals)
       outcome <- (plan.isEmpty, decision.decision) match
                    case (true, _)                => ZIO.succeed(Outcome.Converged(commit))
@@ -146,11 +182,11 @@ final case class Pipeline(
                        case ApprovalStatus.Pending(ts)   => ZIO.succeed(Outcome.WaitingForApproval(plan.app, ts))
     yield outcome
 
-  private def decide(governance: Governance, plan: Plan, author: Option[String]): UIO[PlanDecision] =
+  private def decide(governance: Governance, plan: Plan, author: Option[String], origin: Origin): UIO[PlanDecision] =
     val policy = governance.policy
     for
       now      <- Clock.instant
-      facts     = governance.facts(plan, author, now)
+      facts     = governance.facts(plan, author, now, origin)
       verdicts <- evaluator.evaluate(policy, facts).catchAll(e => ZIO.logWarning(s"policy evaluation failed, asking the owners: $e").as(Nil))
     yield Verdicts.decide(facts, verdicts, policy)
 
@@ -181,7 +217,18 @@ final case class Pipeline(
     executor match
       case Some(queue) =>
         queue
-          .submit(ApplyRequest(runtime.env.value, plan.app.value, commit.value, plan.phase.toString, plan.hash.value, approval.map(_._1.ts), author.email))
+          .submit(
+            ApplyRequest(
+              runtime.env.value,
+              plan.app.value,
+              commit.value,
+              plan.phase.toString,
+              plan.hash.value,
+              approval.map(_._1.ts),
+              author.email,
+              Pipeline.rolledBack(plan).map(_.value),
+            )
+          )
           .as(Outcome.Submitted(plan.app, plan.hash.short))
       case None =>
         Applying.run(slack, runtime, governance, author, plan, decision, commit, why, approval, approvals).as(Outcome.Converged(commit))

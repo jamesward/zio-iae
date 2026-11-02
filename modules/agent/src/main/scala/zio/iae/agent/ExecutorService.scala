@@ -48,6 +48,26 @@ final case class ExecutorService(
 
   /** Applies the plan if every check passes; None if there's nothing left to apply. */
   def execute(request: ApplyRequest): IO[String, Option[ApplyReport]] =
+    request.rollback.fold(executePlan(request))(executeRollback(request, _))
+
+  /** A rollback: planned here from what's live, judged by the policy deployed in the env, as `origin = Alert`. */
+  private def executeRollback(request: ApplyRequest, service: String): IO[String, Option[ApplyReport]] =
+    for
+      runtime  <- ZIO.fromOption(envs.find(_.env.value == request.env)).orElseFail(s"no env ${request.env}")
+      app      <- ZIO.fromEither(AppName.from(request.app)).mapError(_.toString)
+      id       <- ZIO.fromEither(LogicalId.from(service)).mapError(_.toString)
+      deployed <- runtime.engine.deployed(List(app), runtime.env).mapError(_.message)
+      commit   <- ZIO.fromOption(deployed.filter(_.value == request.commit)).orElseFail(s"${request.commit.take(7)} isn't the commit deployed in ${request.env}")
+      _        <- runtime.workspace.sync.mapError(_.message)
+      (config, text) <- RepoConfig.loadAt(runtime.workspace, commit).mapError(_.message)
+      plan     <- runtime.engine.rollback(Address(app, runtime.env, ResourceKind.Service, id)).mapError(_.message)
+      report <- if plan.isEmpty then ZIO.none
+                else if plan.hash.value != request.plan then ZIO.fail(s"the rollback is now ${plan.hash.short}, not ${request.plan.take(12)}")
+                else checked(runtime, plan, commit, Governance(config, text, None, deployed), Pipeline.agentAuthor, Origin.Alert, request.approval).map(Some(_))
+      _ <- inbox.send(InboxEvent.Tick).catchAll(e => ZIO.logWarning(s"executor: waking the agent: $e")).when(report.isDefined)
+    yield report
+
+  private def executePlan(request: ApplyRequest): IO[String, Option[ApplyReport]] =
     for
       runtime  <- ZIO.fromOption(envs.find(_.env.value == request.env)).orElseFail(s"no env ${request.env}")
       commit   <- ZIO.fromEither(CommitSha.from(request.commit))
@@ -62,7 +82,12 @@ final case class ExecutorService(
       plan     <- runtime.engine.plan(manifest, runtime.env, Some(commit), phase).mapError(_.message)
       report <- if plan.isEmpty then ZIO.none
                 else if plan.hash.value != request.plan then ZIO.fail(s"the plan is now ${plan.hash.short}, not ${request.plan.take(12)}; the agent will ask again")
-                else checked(runtime, plan, commit, apps, target, text, request.approval).map(Some(_))
+                else
+                  for
+                    governance <- Governance.of(runtime, apps, commit, target, text).mapError(_.message)
+                    email      <- runtime.workspace.authorOf(commit).mapError(_.message)
+                    report     <- checked(runtime, plan, commit, governance, Author(email, governance.config.identities.get(email)), Origin.Human, request.approval)
+                  yield Some(report)
       _ <- inbox.send(InboxEvent.Tick).catchAll(e => ZIO.logWarning(s"executor: waking the agent: $e")).when(report.isDefined)
     yield report
 
@@ -70,18 +95,15 @@ final case class ExecutorService(
       runtime: EnvRuntime,
       plan: Plan,
       commit: CommitSha,
-      apps: List[Manifest],
-      target: RepoConfig,
-      text: String,
+      governance: Governance,
+      author: Author,
+      origin: Origin,
       approvalTs: Option[String],
   ): IO[String, ApplyReport] =
     for
-      governance <- Governance.of(runtime, apps, commit, target, text).mapError(_.message)
-      email      <- runtime.workspace.authorOf(commit).mapError(_.message)
-      author      = Author(email, governance.config.identities.get(email))
       now        <- Clock.instant
       policy      = governance.policy
-      floors      = governance.facts(plan, author.slack, now).map(f => f -> Floor(f, policy))
+      floors      = governance.facts(plan, author.slack, now, origin).map(f => f -> Floor(f, policy))
       floor       = floors.map(_._2._1).foldLeft[Decision](Decision.Auto)(Decision.strictest)
       channel     = governance.config.slack.channel
       approvals   = Approvals(slack, agent, channel, approvalExpiry)

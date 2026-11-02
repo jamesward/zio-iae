@@ -33,7 +33,7 @@ object HarnessPage:
       |    <input id="commitMessage" placeholder="commit message" value="change infra">
       |    <p><button id="push">Commit and push</button></p>
       |    <h2>Commits</h2><pre id="commits"></pre>
-      |    <h2>Faults</h2><p>Injected into the version in canary (a bad deploy) or the live one (an incident).</p><div id="faults"></div>
+      |    <h2>Faults</h2><p>Injected into whichever version is in canary (a bad deploy), or into the version live now (an incident), which keeps it after a rollback.</p><div id="faults"></div>
       |    <h2>Scenarios</h2><div id="run"></div><div id="scenarios"></div></section>
       |</main>
       |<script>
@@ -72,17 +72,24 @@ object HarnessPage:
       |  const r = s.run;
       |  document.getElementById('run').innerHTML = r ? `<p><strong>${esc(r.name)}</strong>: ${r.status} — step ${Math.min(r.step, r.total)}/${r.total}: ${esc(r.current)}${r.error ? '<br>' + esc(r.error) : ''}</p>` : '';
       |  const faults = [['Errors','answers 5xx'],['Slow','answers slowly'],['FailingMetric','reports failing uploads']];
-      |  document.getElementById('faults').innerHTML = s.envs.flatMap(env => ['Canary', 'Live'].map(target => `<p><strong>${esc(env)}</strong> ${target.toLowerCase()}: ` + faults.map(([f, label]) => {
-      |      const on = s.faults.some(a => a.env === env && a.fault === f && a.target === target);
-      |      return `<button class="${on ? 'reacted' : ''}" onclick="fault('${env}','${f}','${target}',${!on})">${on ? '⚠ ' : ''}${label}</button>`;
-      |    }).join(' ') + '</p>')).join('');
+      |  document.getElementById('faults').innerHTML = s.envs.map(env => {
+      |    const canary = `<p><strong>${esc(env)}</strong> canary: ` + faults.map(([f, label]) => {
+      |      const on = s.faults.some(a => a.env === env && a.fault === f && a.on === 'canary');
+      |      return `<button class="${on ? 'reacted' : ''}" onclick="fault('${env}','${f}','canary',${!on})">${on ? '⚠ ' : ''}${label}</button>`;
+      |    }).join(' ') + '</p>';
+      |    const live = `<p><strong>${esc(env)}</strong> live version: ` + faults.map(([f, label]) =>
+      |      `<button onclick="fault('${env}','${f}','live',true)">${label}</button>`).join(' ') + '</p>';
+      |    const pinned = s.faults.filter(a => a.env === env && a.on !== 'canary').map(a =>
+      |      `<button class="reacted" onclick="fault('${env}','${a.fault}','${a.on}',false)">⚠ ${a.on} ${(faults.find(f => f[0] === a.fault) || [0, a.fault])[1]} (stop)</button>`).join(' ');
+      |    return canary + live + (pinned ? `<p>${pinned}</p>` : '');
+      |  }).join('');
       |  if (!scenariosShown) {
       |    document.getElementById('scenarios').innerHTML = s.scenarios.map(sc =>
       |      `<p><button onclick="runScenario('${sc.name}')">Run ${esc(sc.name)}</button> ${esc(sc.description)}</p>`).join('');
       |    scenariosShown = true;
       |  }
       |}
-      |function fault(env, fault, target, on) { post('/ui/fault', {env, fault, target, on}).then(refresh); }
+      |function fault(env, fault, on, enabled) { post('/ui/fault', {env, fault, on, enabled}).then(refresh); }
       |function runScenario(name) { post('/ui/scenario', {name}).then(refresh); }
       |function advance(minutes) { post('/ui/clock/advance', {minutes}).then(refresh); }
       |document.getElementById('speed').onchange = e => post('/ui/clock/speed', {speed: Number(e.target.value)}).then(refresh);

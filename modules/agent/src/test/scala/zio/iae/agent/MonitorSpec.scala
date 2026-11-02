@@ -77,6 +77,44 @@ object MonitorSpec extends ZIOSpecDefault:
           after.head.text.startsWith("*Resolved*"),
           thread.last.startsWith("Cleared: the alarm is quiet again"),
         ),
+    test("the triage's rollback goes through the pipeline; one waiting on approvers is asked again until it's done"):
+      ZIO.scoped:
+        for
+          repo    <- TestRepo.make
+          _       <- repo.commit(Map("README.md" -> "web"), "v2")
+          ws       = repo.workspace(env)
+          _       <- ws.sync.mapError(_.message)
+          alarms  <- Ref.make(List(alarm(firing = true)))
+          slack   <- InMemorySlack.make(Map("platform-owners" -> Set("U_BOB")))
+          model   <- ScriptedModel.make.orDie
+          bedrock <- Model.make(ConverseConfig(ApiKey("k"), model.url, ModelId("scripted")))
+          triage  <- Triage.make(bedrock).mapError(_.message)
+          _       <- model.reply(
+                       ScriptedModel.Turn.ToolUse("rollback", Json.Obj()),
+                       ScriptedModel.Turn.Text("v2 broke it; I asked to roll back, and the policy wants an approver."),
+                     )
+          asked   <- Ref.make(0)
+          rollbacks: Rollbacks = (_, _, service) =>
+                       asked.updateAndGet(_ + 1).map: n =>
+                         if n == 1 then Some(Outcome.WaitingForApproval(app, "1700000000.000001")) else Some(Outcome.Submitted(app, s"rollback-${service.value}"))
+          monitor <- Monitor.make(List(runtime(alarms, ws)), List(app), slack, slack.self, channel, owners, Some(triage), rollbacks = Some(rollbacks))
+          worker  <- monitor.run.fork
+          alert   <- slack.posted(channel).repeat(Schedule.spaced(100.millis) && Schedule.recurUntil[List[SlackMessage]](_.nonEmpty) && Schedule.recurs(50)).map(_._2.head)
+          notes   <- slack.threadTexts(channel, alert.ts).repeat(Schedule.spaced(100.millis) && Schedule.recurUntil[List[String]](_.nonEmpty) && Schedule.recurs(50)).map(_._2)
+          result  <- model.requests.map(_.last.toJson)
+          _       <- monitor.sweep.mapError(_.message)
+          thread  <- slack.threadTexts(channel, alert.ts)
+          calls   <- asked.get
+          _       <- monitor.sweep.mapError(_.message)
+          again   <- asked.get
+          _       <- worker.interrupt
+        yield assertTrue(
+          notes == List("v2 broke it; I asked to roll back, and the policy wants an approver."),
+          result.contains("the policy needs approvers for it"),
+          calls == 2,
+          thread.last == "Rollback: handed to the executor (plan rollback-web), which checks it again and rolls back.",
+          again == 2,
+        ),
     test("after a restart, an open alert is found in the channel: not raised again, and resolved when it clears"):
       ZIO.scoped:
         for

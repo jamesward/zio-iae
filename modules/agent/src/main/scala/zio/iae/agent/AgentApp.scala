@@ -102,7 +102,7 @@ object AgentApp extends ZIOAppDefault:
         reconcilers <- Reconcilers.make(pipeline, envs)
         talk        <- ZIO.foreach(model)(m => Converse.make(slack, self, m, envs, manifests).flatMap(Conversations.make))
         triage      <- ZIO.foreach(model)(Triage.make(_, prs))
-        monitor     <- Monitor.make(envs, config.apps.map(_.name), slack, self, config.slack.channel, config.slack.owners, triage)
+        monitor     <- Monitor.make(envs, config.apps.map(_.name), slack, self, config.slack.channel, config.slack.owners, triage, rollbacks = Some(pipeline.rollback))
         _           <- ZIO.logInfo(s"agent started for $repo ($branch): envs ${config.envs.map(_.value).mkString(", ")}")
         _           <- Agent(reconcilers, InboxConsumer(sqs, QueueUrl(inboxUrl), branch, reconcilers, talk), every.minutes, Some(monitor)).run
       yield ()

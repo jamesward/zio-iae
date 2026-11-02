@@ -28,12 +28,19 @@ final case class TrafficGenerator(http: Client, app: AppName, service: LogicalId
       case None => ZIO.unit
       case Some(lb) =>
         for
-          tags   <- elb.tags(lb.arn).mapError(_.message)
-          live    = tags.get(ServiceProvider.ColorTag).flatMap(Color.from)
-          canary <- faults.in(env, Target.Canary)
-          onLive <- faults.in(env, Target.Live)
-          _      <- ZIO.foreachDiscard(Color.values.toList)(color => observe(env, address, lb, color, if live.contains(color) then onLive else canary, elb, cw))
+          tags <- elb.tags(lb.arn).mapError(_.message)
+          live  = tags.get(ServiceProvider.ColorTag).flatMap(Color.from)
+          _ <- ZIO.foreachDiscard(Color.values.toList): color =>
+                 faults.on(env, color, live.contains(color)).flatMap(observe(env, address, lb, color, _, elb, cw))
         yield ()
+
+  /** The color with the env's traffic, if its service is deployed. */
+  def live(env: EnvName): IO[String, Option[Color]] =
+    ZIO.fromOption(envs.find(_._1 == env)).orElseFail(s"no env ${env.value}").flatMap: (_, config) =>
+      val elb = Elbv2Client(AwsQueryClient(http, config))
+      elb.loadBalancer(ServiceNaming.loadBalancer(Address(app, env, ResourceKind.Service, service))).mapError(_.message).flatMap:
+        case None     => ZIO.none
+        case Some(lb) => elb.tags(lb.arn).mapBoth(_.message, _.get(ServiceProvider.ColorTag).flatMap(Color.from))
 
   private def observe(env: EnvName, address: Address, lb: LoadBalancer, color: Color, faults: Set[Fault], elb: Elbv2Client, cw: CloudWatchClient)
       : IO[String, Unit] =
