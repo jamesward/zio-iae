@@ -64,7 +64,11 @@ final case class Executor(drivers: Drivers, commits: CommitOrder):
           commits.isAncestor(t, last).flatMap(newer => ZIO.fail(EngineError.Guarded(address, last, t)).when(newer))
         case _ => ZIO.unit
 
-final case class Engine(planner: Planner, executor: Executor, watch: Watch = Watch.none):
+final case class Engine(planner: Planner, executor: Executor, watch: Watch = Watch.none, attribution: Attribution = Attribution.none):
+  /** Who changed a resource since a time, by its write calls other than the pipeline's. */
+  def changedBy(address: Address, since: java.time.Instant): IO[EngineError, List[ChangedBy]] =
+    attribution.changes(address, since).mapError(EngineError.Provider(_))
+
   /** The alarms watching the app's live services in the env. */
   def alarms(app: AppName, env: EnvName): IO[EngineError, List[WatchedAlarm]] = watch.alarms(app, env).mapError(EngineError.Provider(_))
 

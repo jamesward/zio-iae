@@ -175,7 +175,7 @@ final case class Pipeline(
     val config  = governance.config
     val drifted = plan.changes.filter(_.flags.contains(ChangeFlag.Drift))
     for
-      _        <- ZIO.when(drifted.nonEmpty)(driftNotice(config, plan, drifted))
+      _        <- ZIO.when(drifted.nonEmpty)(driftNotice(runtime, config, plan, drifted))
       decision <- decide(governance, plan, author.slack, origin)
       done      = applied(runtime, governance, author, plan, decision, commit, approvals)
       outcome <- (plan.isEmpty, decision.decision) match
@@ -243,18 +243,34 @@ final case class Pipeline(
         Applying.run(slack, runtime, governance, author, plan, decision, commit, why, approval, approvals).as(Outcome.Converged(commit))
 
   /** A hand change is announced once per plan: what changed outside the pipeline, before its revert is judged. */
-  private def driftNotice(config: RepoConfig, plan: Plan, drifted: List[PlannedChange]): IO[AgentError, Unit] =
+  private def driftNotice(runtime: EnvRuntime, config: RepoConfig, plan: Plan, drifted: List[PlannedChange]): IO[AgentError, Unit] =
     val marker = s"plan ${plan.hash.short}"
     for
       now    <- Clock.instant
       recent <- slack.history(config.slack.channel, now.minus(approvalExpiry).nn)
-      _ <- notice(
-             config,
-             s"*Drift* `${plan.app.value}/${plan.env.value}` ($marker): changed outside the pipeline since it was applied. " +
-               s"Reverting to the manifest goes through the policy.\n```\n${drifted.map(PlanText.line).mkString("\n")}\n```\n" +
-               "To keep the change, change the `Infra` declaration instead.",
-           ).unless(recent.exists(m => m.botId.contains(self.botId) && m.text.contains(marker) && m.text.startsWith("*Drift*")))
+      _ <- ZIO.unless(recent.exists(m => m.botId.contains(self.botId) && m.text.contains(marker) && m.text.startsWith("*Drift*"))):
+             for
+               who <- ZIO.foreach(drifted)(c => whoChanged(runtime, c.address, now))
+               _ <- notice(
+                      config,
+                      s"*Drift* `${plan.app.value}/${plan.env.value}` ($marker): changed outside the pipeline since it was applied. " +
+                        s"Reverting to the manifest goes through the policy.\n```\n${drifted.map(PlanText.line).mkString("\n")}\n```\n" +
+                        who.mkString("\n") + "\nTo keep the change, change the `Infra` declaration instead.",
+                    )
+             yield ()
     yield ()
+
+  /** Who changed a resource, from the cloud's audit log (CloudTrail): its latest write calls in the last week by anyone
+    * but the pipeline. Best effort: a lookup that fails or finds nothing says so.
+    */
+  private def whoChanged(runtime: EnvRuntime, address: Address, now: java.time.Instant): UIO[String] =
+    val what = s"${address.kind} ${address.id.value}"
+    runtime.engine
+      .changedBy(address, now.minus(java.time.Duration.ofDays(7)).nn)
+      .map:
+        case Nil     => s"$what: who changed it isn't in CloudTrail"
+        case changes => s"$what: " + changes.take(3).map(c => s"${c.action} by `${c.by}` at ${c.at.toString.take(16).replace('T', ' ')} UTC").mkString("; ")
+      .catchAll(e => ZIO.succeed(s"$what: who changed it couldn't be looked up (${e.message.take(120)})"))
 
   /** Stopping is announced once per plan, not on every reconcile. */
   private def stopped(config: RepoConfig, plan: Plan, decision: PlanDecision, why: String): IO[AgentError, Outcome] =

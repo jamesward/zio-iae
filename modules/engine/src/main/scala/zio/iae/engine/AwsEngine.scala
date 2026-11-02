@@ -60,15 +60,18 @@ object AwsEngine:
       ServiceProvider(deploy.ecs, deploy.elb, deploy.cloudwatch, deploy.ec2.defaultNetwork.mapError(_.message).either, planner.get[AwsContext]),
       found,
     )
-    Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch)
+    // The pipeline's own calls come from the deployer role bootstrap creates in each env account.
+    val attribution = CloudTrailAttribution(planner.get[DeployClients].cloudtrail, naming, Some("iae-deployer"))
+    Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution)
 
   /** The clients for one account's config. */
   def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =
     (ZLayer.succeed(config) ++ ZLayer.environment[Client] >>> clients).build
 
 /** The clients a service's deploys use: ECS, the load balancer, its alarms, and the default network. */
-final case class DeployClients(ecs: EcsClient, elb: Elbv2Client, cloudwatch: CloudWatchClient, ec2: Ec2Client)
+final case class DeployClients(ecs: EcsClient, elb: Elbv2Client, cloudwatch: CloudWatchClient, ec2: Ec2Client, cloudtrail: CloudTrailClient)
 
 object DeployClients:
   val layer: ZLayer[AwsJsonClient & AwsQueryClient, Nothing, DeployClients] =
-    ZLayer.fromFunction((json: AwsJsonClient, query: AwsQueryClient) => DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query)))
+    ZLayer.fromFunction((json: AwsJsonClient, query: AwsQueryClient) =>
+      DeployClients(EcsClient(json), Elbv2Client(query), CloudWatchClient(query), Ec2Client(query), CloudTrailClient(json)))

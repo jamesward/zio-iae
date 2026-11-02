@@ -51,3 +51,13 @@ trait Watch:
 
 object Watch:
   val none: Watch = (_, _) => zio.ZIO.succeed(Nil)
+
+/** A change made to a resource, as the cloud's audit log recorded it: what, by whom, and when. */
+final case class ChangedBy(action: String, by: String, at: java.time.Instant) derives CanEqual
+
+/** Who changed a resource outside the pipeline: its write calls by anyone other than the pipeline's own deployer. */
+trait Attribution:
+  def changes(address: Address, since: java.time.Instant): IO[ProviderError, List[ChangedBy]]
+
+object Attribution:
+  val none: Attribution = (_, _) => zio.ZIO.succeed(Nil)

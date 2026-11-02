@@ -3,13 +3,13 @@ package zio.iae.agent
 import zio.*
 import zio.http.Client
 import zio.iae.*
-import zio.iae.aws.BucketNaming
-import zio.iae.aws.client.AwsError
+import zio.iae.aws.{BucketNaming, CloudTrailAttribution}
+import zio.iae.aws.client.{AwsConfig, AwsError, AwsJsonClient, CloudTrailClient, Endpoint, S3Client}
 import zio.iae.engine.*
 import zio.iae.engine.policy.*
 import com.jamesward.zio_bedrock.ConverseConfig
 import com.jamesward.zio_bedrock.Bedrock.{ApiKey, ModelId}
-import zio.iae.testkit.{FlociLayer, ScriptedModel}
+import zio.iae.testkit.{CloudTrailFake, FlociLayer, ScriptedModel}
 import zio.test.*
 
 object AgentSpec extends ZIOSpecDefault:
@@ -85,6 +85,31 @@ object AgentSpec extends ZIOSpecDefault:
           again.size == 1,
           done == Outcome.Converged(v2),
           posted.exists(m => m.text.startsWith("Applied") && m.text.contains("<@U_ALICE>")),
+        )
+    ,
+    test("a hand change in staging is reported as drift, naming who made it, and reverted"):
+      ZIO.scoped:
+        for
+          w       <- world
+          _       <- w.pipeline.reconcile(w.envs, 0)
+          fake    <- CloudTrailFake.make.orDie
+          http    <- ZIO.service[Client]
+          aws     <- ZIO.service[AwsConfig]
+          trail    = CloudTrailClient(AwsJsonClient(http, aws.copy(endpoint = Endpoint.parse(fake.url.encode).toOption)))
+          staging  = w.envs.head.copy(engine = w.envs.head.engine.copy(attribution = CloudTrailAttribution(trail, BucketNaming(None), Some("iae-deployer"))))
+          address  = Address(app, staging.env, ResourceKind.Bucket, LogicalId("uploads"))
+          bucket  <- ZIO.fromEither(BucketNaming(None).physical(address)).mapError(_.message)
+          now     <- Clock.instant
+          // Someone turns versioning on in the console.
+          _       <- S3Client(http, aws).putBucketVersioning(bucket, enabled = true).mapError(_.toString)
+          _       <- fake.record(bucket.value, "PutBucketVersioning", "arn:aws:sts::000000000000:assumed-role/Admin/carol", now)
+          revert  <- w.pipeline.reconcile(staging :: w.envs.tail, 0)
+          notices <- w.slack.posted(channel).map(_.filter(_.text.startsWith("*Drift*")))
+        yield assertTrue(
+          revert.isInstanceOf[Outcome.Converged],
+          notices.size == 1,
+          notices.head.text.contains("Bucket uploads"),
+          notices.head.text.contains("PutBucketVersioning by `arn:aws:sts::000000000000:assumed-role/Admin/carol`"),
         )
     ,
     test("a rejection stops the change and is announced once; a restarted agent has nothing to do"):
@@ -211,7 +236,7 @@ object AgentSpec extends ZIOSpecDefault:
         yield assertTrue(done.exists(_._2))
     ,
   ).provideShared(
-    ((FlociLayer.live ++ Client.default) >>> (AwsEngine.clients ++ ZLayer.environment[Client])).mapError(e => e match
+    ((FlociLayer.live ++ Client.default) >>> (AwsEngine.clients ++ ZLayer.environment[Client & AwsConfig])).mapError(e => e match
       case a: AwsError  => a.message
       case t: Throwable => t.getMessage
     )
