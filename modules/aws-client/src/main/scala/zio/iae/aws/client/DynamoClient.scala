@@ -4,7 +4,7 @@ import zio.*
 import zio.schema.{Schema, derived}
 import zio.schema.annotation.fieldName
 
-final case class DynamoTable(name: String, arn: String, status: String, billingMode: Option[String])
+final case class DynamoTable(name: String, arn: String, status: String, billingMode: Option[String], created: Option[java.time.Instant] = None)
 
 /** DynamoDB tables with a single string partition key `pk` and one string attribute `v`: what typed key-value
   * tables need.
@@ -68,7 +68,7 @@ object DynamoClient:
 
   private def tagList(tags: Map[String, String]): List[Tag] = tags.toList.sorted.map(Tag(_, _))
 
-  private def tableOf(t: TableDescription): DynamoTable = DynamoTable(t.name, t.arn, t.status, t.billing.map(_.mode))
+  private def tableOf(t: TableDescription): DynamoTable = DynamoTable(t.name, t.arn, t.status, t.billing.map(_.mode), t.created.map(s => java.time.Instant.ofEpochMilli((s * 1000).toLong).nn))
 
   private final case class Tag(@fieldName("Key") key: String, @fieldName("Value") value: String) derives Schema
   private final case class StringValue(@fieldName("S") s: String) derives Schema
@@ -81,6 +81,7 @@ object DynamoClient:
       @fieldName("TableArn") arn: String,
       @fieldName("TableStatus") status: String,
       @fieldName("BillingModeSummary") billing: Option[BillingSummary],
+      @fieldName("CreationDateTime") created: Option[Double] = None,
   ) derives Schema
   private final case class DescribeResponse(@fieldName("Table") table: TableDescription) derives Schema
   private final case class CreateRequest(

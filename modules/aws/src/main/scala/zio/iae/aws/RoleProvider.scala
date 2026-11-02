@@ -47,6 +47,7 @@ final case class RoleProvider(iam: IamClient, buckets: BucketNaming, context: Aw
     case Change.Orphan(_, _) => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)    => Assessment(Risk.High, Set.empty)
     case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
+    case Change.Prune(_, _) => Assessment(Risk.Low, Set.empty)
 
   def applyChange(change: Change[RoleSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -67,6 +68,7 @@ final case class RoleProvider(iam: IamClient, buckets: BucketNaming, context: Aw
         case Change.Delete(_) =>
           (iam.deleteInlinePolicy(name, policyName) *> iam.deleteRole(name)).mapError(failed(address, "delete"))
         case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
+        case Change.Prune(address, _) => ZIO.fail(ProviderError(address, "prune", "only a service has versions to prune"))
 
   private def converge(address: Address, name: RoleName, spec: RoleSpec, context: ApplyContext): IO[ProviderError, Unit] =
     for
@@ -140,6 +142,19 @@ final case class RoleDiscovery(iam: IamClient) extends Discovery:
             Discovered(Address(app, env, ResourceKind.Role, id), ManagedTags.commit(tags), ManagedTags.orphanedSince(tags)),
       )
 
+  override def apps(env: EnvName): IO[ProviderError, Set[AppName]] =
+    iam
+      .listRoles(RoleProvider.path)
+      .mapZIO(role => iam.roleTags(role.name))
+      .collect { case tags if tags.get(TagKey.Env.wire).contains(env.value) && tags.get(TagKey.Managed.wire).contains("true") => tags.get(TagKey.App.wire) }
+      .runCollect
+      .mapBoth(
+        e => ProviderError(Address(AppName("discovery"), env, ResourceKind.Role, Manifest.runtimeRole), "discover roles", e.message),
+        _.flatten.flatMap(AppName.from(_).toOption).toSet,
+      )
+
 final case class CompositeDiscovery(all: List[Discovery]) extends Discovery:
+  override def apps(env: EnvName): IO[ProviderError, Set[AppName]] = ZIO.foreach(all)(_.apps(env)).map(_.flatten.toSet)
+
   def managed(app: AppName, env: EnvName): IO[ProviderError, List[Discovered]] =
     ZIO.foreach(all)(_.managed(app, env)).map(_.flatten.distinctBy(_.address))

@@ -38,6 +38,7 @@ final case class TableProvider(dynamo: DynamoClient, cloudwatch: Option[CloudWat
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))
     case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
+    case Change.Prune(_, _) => Assessment(Risk.Low, Set.empty)
 
   def applyChange(change: Change[TableSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -60,6 +61,7 @@ final case class TableProvider(dynamo: DynamoClient, cloudwatch: Option[CloudWat
         dynamo.delete(name).mapError(failed(address, "delete")) *>
           ZIO.foreachDiscard(cloudwatch)(DefaultAlarms.remove(_, address)).mapError(failed(address, "alarms"))
       case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
+      case Change.Prune(address, _) => ZIO.fail(ProviderError(address, "prune", "only a service has versions to prune"))
 
   private def converge(address: Address, spec: TableSpec, context: ApplyContext): IO[ProviderError, Unit] =
     for

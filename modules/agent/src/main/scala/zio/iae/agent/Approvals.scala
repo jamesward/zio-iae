@@ -127,5 +127,9 @@ object Approvals:
   /** Requests that no longer cover anything. */
   def closed(text: String): Boolean = List(Approved, Superseded, Expired).exists(text.startsWith)
 
-  /** What a request covers: each change by kind and address. A plan recomputed after a partial apply is a subset. */
-  def keys(plan: Plan): Set[String] = plan.changes.map(c => s"${c.change.productPrefix}:${c.address.show}").toSet
+  /** What a request covers: each change by kind, address and content, so approving one update of a resource doesn't
+    * cover a different one (a plan made while another apply was half done, then a drift revert). A plan recomputed
+    * after a partial apply is a subset.
+    */
+  def keys(plan: Plan): Set[String] =
+    plan.changes.map(c => s"${c.change.productPrefix}:${c.address.show}:${ContentHash.of(c.change).short}").toSet

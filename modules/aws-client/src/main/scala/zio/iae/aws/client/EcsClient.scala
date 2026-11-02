@@ -56,12 +56,28 @@ final case class EcsClient(json: AwsJsonClient):
   def deleteService(cluster: String, name: String): IO[AwsError, Unit] =
     call[DeleteService, AwsJsonClient.Empty]("DeleteService", DeleteService(cluster, name, true)).unit
 
+  /** The family's active revisions (ARNs), newest first. */
+  def taskDefinitions(family: String): IO[AwsError, List[String]] =
+    def page(token: Option[String]): IO[AwsError, List[String]] =
+      call[ListTaskDefinitions, TaskDefinitionArns]("ListTaskDefinitions", ListTaskDefinitions(family, "ACTIVE", "DESC", token)).flatMap: r =>
+        val arns = r.taskDefinitionArns.getOrElse(Nil)
+        r.nextToken.filter(_.nonEmpty).fold(ZIO.succeed(arns))(t => page(Some(t)).map(arns ++ _))
+    page(None).map(_.sortBy(arn => -EcsClient.revision(arn)))
+
+  /** Takes a revision out of use: it can no longer start tasks or services. Already gone is fine. */
+  def deregisterTaskDefinition(arn: String): IO[AwsError, Unit] =
+    call[Deregister, AwsJsonClient.Empty]("DeregisterTaskDefinition", Deregister(arn)).unit
+      .catchSome { case e if e.errorCode.exists(c => c.endsWith("ClientException") || c.endsWith("InvalidParameterException")) => ZIO.unit }
+
   private def call[Req: Schema, Res: Schema](operation: String, request: Req): IO[AwsError, Res] = json.call[Req, Res](protocol, operation, request)
 
 object EcsClient:
   val layer: ZLayer[AwsJsonClient, Nothing, EcsClient] = ZLayer.fromFunction(EcsClient.apply)
 
   private val protocol = AwsJsonProtocol(AwsService("ecs", "ecs"), "AmazonEC2ContainerServiceV20141113", "1.1")
+
+  /** A task definition ARN's revision number (`...:task-definition/family:7` is 7). */
+  def revision(arn: String): Int = arn.split(':').lastOption.flatMap(_.toIntOption).getOrElse(0)
 
   private def tagList(tags: Map[String, String]): List[Tag] = tags.toList.sorted.map((k, v) => Tag(k, v))
 
@@ -113,6 +129,12 @@ object EcsClient:
   ) derives Schema
   final case class UpdateService(cluster: String, service: String, taskDefinition: Option[String], desiredCount: Option[Int]) derives Schema
   final case class DeleteService(cluster: String, service: String, force: Boolean) derives Schema
+  final case class ListTaskDefinitions(familyPrefix: String, status: String, sort: String, nextToken: Option[String]) derives Schema
+  final case class TaskDefinitionArns(taskDefinitionArns: Option[List[String]], nextToken: Option[String]) derives Schema
+  final case class Deregister(taskDefinition: String) derives Schema
+
+/** An image in an ECR repository. */
+final case class EcrImage(digest: String, tags: List[String], pushedAt: Option[java.time.Instant])
 
 /** ECR repositories for the apps' images. */
 final case class EcrClient(json: AwsJsonClient):
@@ -133,6 +155,20 @@ final case class EcrClient(json: AwsJsonClient):
       s"""{"Version":"2012-10-17","Statement":[{"Sid":"iae-pull","Effect":"Allow","Principal":{"AWS":[$principals]},""" +
         """"Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:BatchCheckLayerAvailability"]}]}"""
     call[SetPolicy, AwsJsonClient.Empty]("SetRepositoryPolicy", SetPolicy(name, policy)).unit
+
+  /** Every image in the repository: its digest, tags and when it was pushed. */
+  def images(repository: String): IO[AwsError, List[EcrImage]] =
+    def page(token: Option[String]): IO[AwsError, List[EcrImage]] =
+      call[ListAll, Images]("DescribeImages", ListAll(repository, token)).flatMap: r =>
+        val found = r.imageDetails.getOrElse(Nil).flatMap: d =>
+          d.imageDigest.map(EcrImage(_, d.imageTags.getOrElse(Nil), d.imagePushedAt.map(s => java.time.Instant.ofEpochMilli((s * 1000).toLong).nn)))
+        r.nextToken.filter(_.nonEmpty).fold(ZIO.succeed(found))(t => page(Some(t)).map(found ++ _))
+    page(None).catchSome { case e if e.errorCode.exists(_.endsWith("RepositoryNotFoundException")) => ZIO.succeed(Nil) }
+
+  /** Deletes images by digest, with all their tags. */
+  def deleteImages(repository: String, digests: List[String]): IO[AwsError, Unit] =
+    ZIO.foreachDiscard(digests.grouped(100).toList): batch =>
+      call[DeleteBatch, AwsJsonClient.Empty]("BatchDeleteImage", DeleteBatch(repository, batch.map(Digest(_))))
 
   /** Whether an image with the tag is in the repository. */
   def hasImage(repository: String, tag: String): IO[AwsError, Boolean] =
@@ -155,5 +191,8 @@ object EcrClient:
   final case class SetPolicy(repositoryName: String, policyText: String) derives Schema
   final case class ImageId(imageTag: String) derives Schema
   final case class ImagesRequest(repositoryName: String, imageIds: List[ImageId]) derives Schema
-  final case class ImageDetail(imageTags: Option[List[String]]) derives Schema
-  final case class Images(imageDetails: Option[List[ImageDetail]]) derives Schema
+  final case class ImageDetail(imageTags: Option[List[String]], imageDigest: Option[String] = None, imagePushedAt: Option[Double] = None) derives Schema
+  final case class Images(imageDetails: Option[List[ImageDetail]], nextToken: Option[String] = None) derives Schema
+  final case class ListAll(repositoryName: String, nextToken: Option[String]) derives Schema
+  final case class Digest(imageDigest: String) derives Schema
+  final case class DeleteBatch(repositoryName: String, imageIds: List[Digest]) derives Schema

@@ -62,12 +62,6 @@ object Pipeline:
       s"*Drift:* ${drifted.map(c => s"${c.address.kind} ${c.address.id.value}").mkString(", ")} changed outside the pipeline; this reverts it to the manifest."
     )
 
-  /** For an approval request: what cleanup deletes, and why. */
-  def cleanupSection(plan: Plan, retentionDays: Int): String =
-    s"*Cleanup:* ${plan.changes.map(c => s"${c.address.kind} ${c.address.id.value}").mkString(", ")} " +
-      s"${if plan.changes.size == 1 then "has" else "have"} been orphaned (removed from the manifest) for over $retentionDays days; this deletes " +
-      s"${if plan.changes.size == 1 then "it" else "them"}."
-
   /** The service a rollback plan rolls back. */
   def rolledBack(plan: Plan): Option[LogicalId] =
     plan.changes.collectFirst { case PlannedChange(Change.Rollback(address, _, _), _, _, _) => address.id }
@@ -169,24 +163,25 @@ final case class Pipeline(
       _        <- ZIO.logInfo(s"rollback of ${app.value}/${runtime.env.value}/${service.value}: $outcome")
     yield outcome
 
-  /** The cleanup job's proposal: delete the app's resources orphaned longer than the deployed config's retention.
-    * Judged by the policy deployed in the env as `origin = Cleanup`, with the agent as its author; deleting stateful
-    * resources is critical, so the default policy asks approvers. None when nothing has expired.
+  /** The cleanup job's proposal for an app in an env (`Engine.cleanup`): delete what has been orphaned longer than
+    * the deployed config's retention, prune old task definitions, and orphan what's left of an app the config no
+    * longer declares. Judged by the policy deployed in the env as `origin = Cleanup`, with the agent as its author;
+    * deleting stateful resources is critical, so the default policy asks approvers. None when there's nothing to do.
     */
   def cleanup(runtime: EnvRuntime, app: AppName): IO[AgentError, Option[Outcome]] =
     for
-      deployed <- runtime.engine.deployed(List(app), runtime.env).mapError(AgentError.Engine(_))
-      outcome <- ZIO.foreach(deployed): commit =>
+      basis <- Cleaning.basis(runtime, app)
+      outcome <- ZIO.foreach(basis): b =>
                    for
-                     _              <- runtime.workspace.sync
-                     (config, text) <- RepoConfig.loadAt(runtime.workspace, commit)
-                     today          <- Clock.localDateTime.map(_.toLocalDate.nn)
-                     cutoff          = today.minusDays(config.orphanRetentionDays.toLong).nn
-                     plan           <- runtime.engine.cleanup(app, runtime.env, cutoff).mapError(AgentError.Engine(_))
-                     approvals       = Approvals(slack, self, config.slack.channel, approvalExpiry)
+                     today  <- Clock.localDateTime.map(_.toLocalDate.nn)
+                     now    <- Clock.instant
+                     plan   <- runtime.engine.cleanup(app, runtime.env, b.cutoff(today), b.config.keepVersions, b.abandoned).mapError(AgentError.Engine(_))
+                     usage  <- runtime.engine.usage(app, runtime.env, now.minus(Cleaning.usageWindow).nn)
+                                 .catchAll(e => ZIO.logWarning(s"usage of ${app.value}/${runtime.env.value}: ${e.message}").as(Nil))
+                     approvals = Approvals(slack, self, b.config.slack.channel, approvalExpiry)
                      outcome <- ZIO.unless(plan.isEmpty):
-                                  judged(runtime, Governance(config, text, None, deployed), Pipeline.agentAuthor, approvals, plan, commit, Origin.Cleanup,
-                                    List(Pipeline.cleanupSection(plan, config.orphanRetentionDays)), cleanup = Some(cutoff))
+                                  judged(runtime, Governance(b.config, b.text, None, Some(b.commit)), Pipeline.agentAuthor, approvals, plan, b.commit, Origin.Cleanup,
+                                    List(Cleaning.section(plan, b, usage.map(u => u.address -> u).toMap)), cleanup = Some(b.cutoff(today)))
                    yield outcome
       found = outcome.flatten
       _ <- ZIO.logInfo(s"cleanup of ${app.value}/${runtime.env.value}: $found").when(found.isDefined)

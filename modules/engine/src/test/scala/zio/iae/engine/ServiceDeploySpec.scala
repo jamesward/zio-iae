@@ -47,6 +47,40 @@ object ServiceDeploySpec extends ZIOSpecDefault:
         watched.exists(a => a.alarm.endsWith("-health") && !a.firing && a.gate == "health"),
         watched.exists(_.gate == "5xx"),
       ),
+    test("cleanup prunes old task definitions but never the live or rollback ones, and keeps the images in use"):
+      for
+        http     <- ZIO.service[Client]
+        clients  <- ZIO.environment[AwsEngine.Clients]
+        engine    = AwsEngine.make(BucketNaming(None), clients, clients, AnyOrder)
+        env      <- EngineSpec.uniqueEnv
+        port     <- Random.nextIntBounded(1000).map(15000 + _)
+        address   = Address(app, env, ResourceKind.Service, LogicalId("web"))
+        _        <- engine.converge(manifest(port, List("-text=v1")), env, None)
+        ecs       = clients.get[DeployClients].ecs
+        family    = ServiceNaming.family(address)
+        container = ContainerSpec("app", "hashicorp/http-echo:1.0", 5678, Map.empty, 256, 512)
+        // Three revisions newer than the live one that nothing runs, as abandoned deploys would leave.
+        extra    <- ZIO.foreach(1 to 3)(_ => ecs.registerTaskDefinition(family, container, None, None))
+        today    <- Clock.localDateTime.map(_.toLocalDate.nn)
+        plan     <- engine.cleanup(app, env, today.minusDays(14).nn, keep = 1)
+        _        <- engine.apply(plan)
+        left     <- ecs.taskDefinitions(family)
+        again    <- engine.cleanup(app, env, today.minusDays(14).nn, keep = 1)
+        images   <- engine.artifacts(app, env)
+      yield
+        val pruned = plan.changes.collect { case PlannedChange(Change.Prune(_, versions), _, _, _) => versions }.flatten
+        assertTrue(
+          // The newest is kept (keep = 1), the live one is kept, the two in between go.
+          pruned.toSet == extra.take(2).toSet,
+          plan.changes.forall(_.risk == Risk.Low),
+          PlanText.render(plan).contains("prune   Service web"),
+          left.toSet.intersect(pruned.toSet).isEmpty,
+          left.contains(extra.last),
+          left.size == 2,
+          again.isEmpty,
+          images == Set("hashicorp/http-echo:1.0"),
+        )
+    ,
     test("a version whose own alarm goes off is rolled back, and the rollback names the alarm"):
       for
         floci    <- ZIO.service[FlociContainer]

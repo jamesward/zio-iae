@@ -14,16 +14,27 @@ final case class Planner(drivers: Drivers, discovery: Discovery):
       case Phase.Contract => contract(manifest, env)
     changes.map(Plan(manifest.app, env, target, ContentHash.of(manifest), phase, _))
 
-  /** Deleting the app's resources in the env that have been orphaned since `before` or earlier, as cleanup proposes:
-    * the kinds that are deleted (not services), each assessed by its provider. The plan's hash depends only on its
-    * changes, so a proposal stays the same from one day to the next until another orphan qualifies.
+  /** What cleanup proposes for an app in an env, as one plan:
+    *   - deleting its resources orphaned on `before` or earlier (the kinds that are deleted, not services), each
+    *     assessed by its provider;
+    *   - pruning old versions of its live services' deployments beyond the newest `keep`;
+    *   - for an app no repo declares any more (`abandoned`), orphaning whatever of it isn't yet, which starts its
+    *     retention.
+    *
+    * The plan's hash depends only on its changes, so a proposal stays the same from one day to the next until
+    * something else qualifies.
     */
-  def cleanup(app: AppName, env: EnvName, before: java.time.LocalDate): IO[EngineError, Plan] =
+  def cleanup(app: AppName, env: EnvName, before: java.time.LocalDate, keep: Int = 5, abandoned: Boolean = false): IO[EngineError, Plan] =
     for
       found   <- discovery.managed(app, env).mapError(EngineError.Provider(_))
-      expired  = found.filter(_.orphanedSince.exists(!_.isAfter(before))).sortBy(d => (d.address.kind.ordinal, d.address.id))
-      changes <- ZIO.foreach(expired)(d => drivers(d.address.kind).flatMap(_.deletion(d.address).mapError(EngineError.Provider(_))))
-    yield Plan(app, env, None, ContentHash.of("cleanup"), Phase.Contract, changes.flatten)
+      today   <- Clock.localDateTime.map(_.toLocalDate.nn)
+      ordered  = found.sortBy(d => (d.address.kind.ordinal, d.address.id))
+      expired  = ordered.filter(_.orphanedSince.exists(!_.isAfter(before)))
+      deletes <- ZIO.foreach(expired)(d => drivers(d.address.kind).flatMap(_.deletion(d.address).mapError(EngineError.Provider(_))))
+      live     = ordered.filter(_.orphanedSince.isEmpty)
+      prunes  <- ZIO.foreach(if abandoned then Nil else live)(d => drivers(d.address.kind).flatMap(_.prune(d.address, keep).mapError(EngineError.Provider(_))))
+      orphans  = if abandoned then live.map(d => PlannedChange(Change.Orphan(d.address, today), Risk.Low, Set.empty)) else Nil
+    yield Plan(app, env, None, ContentHash.of("cleanup"), Phase.Contract, deletes.flatten ++ prunes.flatten ++ orphans)
 
   /** Back to the version a resource ran before: a plan with that one change, or none if there's nothing to go back
     * to. It isn't for a commit: the resources keep the commit they record.
@@ -83,7 +94,25 @@ final case class Engine(
     pricing: Pricing = Pricing.none,
     access: Access = Access.none,
     recommendations: Recommendations = Recommendations.none,
+    activity: Activity = Activity.none,
 ):
+  /** The apps with managed resources in the env. */
+  def apps(env: EnvName): IO[EngineError, Set[AppName]] = planner.discovery.apps(env).mapError(EngineError.Provider(_))
+
+  /** The commits the app's resources in the env were last changed by. */
+  def commits(app: AppName, env: EnvName): IO[EngineError, Set[CommitSha]] =
+    planner.discovery.managed(app, env).mapBoth(EngineError.Provider(_), _.flatMap(_.commit).toSet)
+
+  /** The artifacts (images) the app's resources in the env run or would roll back to. */
+  def artifacts(app: AppName, env: EnvName): IO[EngineError, Set[String]] =
+    planner.discovery.managed(app, env).mapError(EngineError.Provider(_)).flatMap: found =>
+      ZIO.foreach(found)(d => planner.drivers(d.address.kind).flatMap(_.artifacts(d.address).mapError(EngineError.Provider(_)))).map(_.flatten.toSet)
+
+  /** How much each of the app's resources in the env (orphans included) has been used since a time. */
+  def usage(app: AppName, env: EnvName, since: java.time.Instant): IO[EngineError, List[ResourceUsage]] =
+    planner.discovery.managed(app, env).mapError(EngineError.Provider(_)).flatMap: found =>
+      ZIO.foreach(found.sortBy(d => (d.address.kind.ordinal, d.address.id)))(d => activity.usage(d.address, since).mapError(EngineError.Provider(_))).map(_.flatten)
+
   /** Right-sizing recommendations for the app's live services. */
   def rightSizing(app: AppName, env: EnvName): IO[EngineError, List[RightSizing]] =
     recommendations.services(app, env).mapError(EngineError.Provider(_))
@@ -113,8 +142,9 @@ final case class Engine(
 
   def apply(plan: Plan): IO[EngineError, ApplyReport] = executor.apply(plan)
 
-  /** The plan that deletes the app's resources orphaned since `before` or earlier. */
-  def cleanup(app: AppName, env: EnvName, before: java.time.LocalDate): IO[EngineError, Plan] = planner.cleanup(app, env, before).flatMap(costed)
+  /** What cleanup proposes for the app in the env (see `Planner.cleanup`). */
+  def cleanup(app: AppName, env: EnvName, before: java.time.LocalDate, keep: Int = 5, abandoned: Boolean = false): IO[EngineError, Plan] =
+    planner.cleanup(app, env, before, keep, abandoned).flatMap(costed)
 
   /** The plan that puts a resource back to the version it ran before; empty if there's none. */
   def rollback(address: Address): IO[EngineError, Plan] = planner.rollback(address)

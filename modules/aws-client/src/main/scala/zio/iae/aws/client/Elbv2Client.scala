@@ -3,7 +3,7 @@ package zio.iae.aws.client
 import scala.xml.{Elem, Node}
 import zio.*
 
-final case class LoadBalancer(arn: String, name: String, dnsName: String)
+final case class LoadBalancer(arn: String, name: String, dnsName: String, created: Option[java.time.Instant] = None)
 final case class TargetGroup(arn: String, name: String, port: Int)
 final case class Listener(arn: String, port: Int, weights: Map[String, Int])
 final case class TargetHealth(id: String, port: Int, state: String)
@@ -73,7 +73,9 @@ object Elbv2Client:
 
   private def single[A](a: Option[A], action: String): IO[AwsError, A] = ZIO.fromOption(a).orElseFail(AwsError.Decode("elasticloadbalancing", s"$action returned nothing"))
 
-  private def loadBalancerOf(m: Node): LoadBalancer = LoadBalancer(text(m \ "LoadBalancerArn"), text(m \ "LoadBalancerName"), text(m \ "DNSName"))
+  private def loadBalancerOf(m: Node): LoadBalancer =
+    LoadBalancer(text(m \ "LoadBalancerArn"), text(m \ "LoadBalancerName"), text(m \ "DNSName"),
+      Option(text(m \ "CreatedTime")).filter(_.nonEmpty).flatMap(t => scala.util.Try(java.time.Instant.parse(t).nn).toOption))
 
   private def targetGroupOf(m: Node): TargetGroup = TargetGroup(text(m \ "TargetGroupArn"), text(m \ "TargetGroupName"), text(m \ "Port").toIntOption.getOrElse(0))
 

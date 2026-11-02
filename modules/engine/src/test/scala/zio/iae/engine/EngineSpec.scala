@@ -119,6 +119,28 @@ object EngineSpec extends ZIOSpecDefault:
         readopt.changes.exists(c => c.address.kind == ResourceKind.Role && c.flags.contains(ChangeFlag.IamWidening)),
       )
     ,
+    test("an app no repo declares is found, its cleanup orphans what's left of it, and later deletes it"):
+      for
+        env      <- uniqueEnv
+        engine   <- engineWith(LinearHistory(Nil))
+        all      <- manifestOf(Bucket.readWrite(Uploads))
+        _        <- engine.converge(all, env, None)
+        apps     <- engine.apps(env)
+        today    <- Clock.localDateTime.map(_.toLocalDate.nn)
+        early    <- engine.cleanup(app, env, today.minusDays(14).nn)
+        orphan   <- engine.cleanup(app, env, today.minusDays(14).nn, abandoned = true)
+        _        <- engine.apply(orphan)
+        waiting  <- engine.cleanup(app, env, today.minusDays(14).nn, abandoned = true)
+        expired  <- engine.cleanup(app, env, today, abandoned = true)
+      yield assertTrue(
+        apps.contains(app),
+        early.isEmpty,
+        orphan.changes.map(c => (c.address.kind, c.change.productPrefix)).toSet == Set(ResourceKind.Bucket -> "Orphan", ResourceKind.Role -> "Orphan"),
+        orphan.changes.forall(_.risk == Risk.Low),
+        waiting.isEmpty,
+        expired.changes.map(c => (c.address.kind, c.change.productPrefix)).toSet == Set(ResourceKind.Bucket -> "Delete", ResourceKind.Role -> "Delete"),
+      )
+    ,
     test("an older commit can't undo a change made by a newer one"):
       val history = LinearHistory(List(sha('a'), sha('b')))
       for

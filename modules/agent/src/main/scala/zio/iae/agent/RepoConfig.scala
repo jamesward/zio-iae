@@ -32,7 +32,8 @@ final case class EnvAccount(planner: String, deployer: String, region: Option[St
 
 /** `.iae/config.json` of a managed repo. `identities` maps commit author emails to Slack user ids, so an author can't
   * approve their own change. `accounts` maps env names to their accounts; an env without one uses the agent's own
-  * account.
+  * account. Cleanup keeps orphans `orphanRetentionDays`, each service's newest `keepVersions` task definition
+  * revisions and each app's newest `keepImages` images.
   */
 final case class RepoConfig(
     apps: List[AppEntry],
@@ -43,6 +44,8 @@ final case class RepoConfig(
     accounts: Map[String, EnvAccount] = Map.empty,
     costLimits: Map[String, Double] = Map.empty,
     orphanRetentionDays: Int = 14,
+    keepVersions: Int = 5,
+    keepImages: Int = 10,
 ) derives Schema:
   def policy(text: String): PolicyConfig =
     PolicyConfig(text, slack.owners, (slack.owners :: slack.groups).toSet, production.toSet,

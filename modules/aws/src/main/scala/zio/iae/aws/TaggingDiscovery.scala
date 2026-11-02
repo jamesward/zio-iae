@@ -15,6 +15,12 @@ final case class TaggingDiscovery(tagging: TaggingClient) extends Discovery:
       .flatMap: found =>
         ZIO.foreach(found.toList)(r => discovered(app, env, r)).map(_.flatten)
 
+  override def apps(env: EnvName): IO[ProviderError, Set[AppName]] =
+    tagging
+      .resources(Map(TagKey.Managed.wire -> "true", TagKey.Env.wire -> env.value))
+      .runCollect
+      .mapBoth(failed(AppName("discovery"), env), _.flatMap(_.tags.get(TagKey.App.wire)).flatMap(AppName.from(_).toOption).toSet)
+
   private def discovered(app: AppName, env: EnvName, resource: TaggedResource): UIO[Option[Discovered]] =
     val parsed =
       for

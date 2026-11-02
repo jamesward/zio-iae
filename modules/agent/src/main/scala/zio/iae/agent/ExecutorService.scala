@@ -53,25 +53,23 @@ final case class ExecutorService(
       case (_, Some(cutoff))  => executeCleanup(request, cutoff)
       case _                  => executePlan(request)
 
-  /** A cleanup: planned here from the env's orphans, no newer than the deployed config's retention allows, judged by
-    * the policy deployed in the env as `origin = Cleanup`.
+  /** A cleanup: planned here from the env (orphans no newer than the deployed config's retention allows, old task
+    * definitions beyond what it keeps, and an app it no longer declares, if the app's resources come from this
+    * repo), judged by the policy deployed in the env as `origin = Cleanup`.
     */
   private def executeCleanup(request: ApplyRequest, cutoff: String): IO[String, Option[ApplyReport]] =
     for
       runtime  <- ZIO.fromOption(envs.find(_.env.value == request.env)).orElseFail(s"no env ${request.env}")
       app      <- ZIO.fromEither(AppName.from(request.app)).mapError(_.toString)
       before   <- ZIO.attempt(java.time.LocalDate.parse(cutoff).nn).orElseFail(s"$cutoff isn't a date")
-      deployed <- runtime.engine.deployed(List(app), runtime.env).mapError(_.message)
-      commit   <- ZIO.fromOption(deployed.filter(_.value == request.commit)).orElseFail(s"${request.commit.take(7)} isn't the commit deployed in ${request.env}")
-      _        <- runtime.workspace.sync.mapError(_.message)
-      (config, text) <- RepoConfig.loadAt(runtime.workspace, commit).mapError(_.message)
+      basis    <- Cleaning.basis(runtime, app).mapError(_.message).someOrFail(s"nothing of ${request.app} from this repo is deployed in ${request.env}")
+      _        <- ZIO.fail(s"${request.commit.take(7)} isn't the commit deployed in ${request.env}").unless(basis.commit.value == request.commit)
       today    <- Clock.localDateTime.map(_.toLocalDate.nn)
-      _        <- ZIO.fail(s"orphans since $before haven't been kept ${config.orphanRetentionDays} days")
-                    .when(before.isAfter(today.minusDays(config.orphanRetentionDays.toLong).nn))
-      plan     <- runtime.engine.cleanup(app, runtime.env, before).mapError(_.message)
+      _        <- ZIO.fail(s"orphans since $before haven't been kept ${basis.config.orphanRetentionDays} days").when(before.isAfter(basis.cutoff(today)))
+      plan     <- runtime.engine.cleanup(app, runtime.env, before, basis.config.keepVersions, basis.abandoned).mapError(_.message)
       report <- if plan.isEmpty then ZIO.none
                 else if plan.hash.value != request.plan then ZIO.fail(s"the cleanup is now ${plan.hash.short}, not ${request.plan.take(12)}")
-                else checked(runtime, plan, commit, Governance(config, text, None, deployed), Pipeline.agentAuthor, Origin.Cleanup, request.approval).map(Some(_))
+                else checked(runtime, plan, basis.commit, Governance(basis.config, basis.text, None, Some(basis.commit)), Pipeline.agentAuthor, Origin.Cleanup, request.approval).map(Some(_))
       _ <- inbox.send(InboxEvent.Tick).catchAll(e => ZIO.logWarning(s"executor: waking the agent: $e")).when(report.isDefined)
     yield report
 

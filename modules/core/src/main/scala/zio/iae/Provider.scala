@@ -35,11 +35,22 @@ trait ResourceDriver:
   /** Back to the version that was live before, if the kind can do that and has one. */
   def rollback(address: Address): IO[ProviderError, Option[PlannedChange]] = zio.ZIO.none
 
+  /** Removing old versions of the resource's deployment beyond the newest `keep`, never one that runs or is the
+    * rollback target: None if there's nothing to remove or the kind has no versions.
+    */
+  def prune(address: Address, keep: Int): IO[ProviderError, Option[PlannedChange]] = zio.ZIO.none
+
+  /** The artifacts (container images) the resource runs or would roll back to, which must be kept. */
+  def artifacts(address: Address): IO[ProviderError, List[String]] = zio.ZIO.succeed(Nil)
+
 /** A managed resource found in the cloud by its tags. */
 final case class Discovered(address: Address, commit: Option[CommitSha], orphanedSince: Option[LocalDate]) derives CanEqual
 
 trait Discovery:
   def managed(app: AppName, env: EnvName): IO[ProviderError, List[Discovered]]
+
+  /** The apps with managed resources in the env, whichever repo declares them (or none any more). */
+  def apps(env: EnvName): IO[ProviderError, Set[AppName]] = zio.ZIO.succeed(Set.empty)
 
 /** An alarm watching a deployed resource: a live service's gates (those of the version with the traffic, which keep
   * watching it after its canary), or a resource's default alarms (a queue's age and dead letters, a table's
@@ -97,3 +108,15 @@ trait Recommendations:
 
 object Recommendations:
   val none: Recommendations = (_, _) => zio.ZIO.succeed(Nil)
+
+/** How much a resource is used over a window, in words for people ("12.4 GB in 3,100 objects"), and whether it's
+  * idle: no requests, messages or reads at all.
+  */
+final case class ResourceUsage(address: Address, idle: Boolean, summary: String) derives CanEqual
+
+/** How much the managed resources are used, from the cloud's metrics. None for a kind it can't tell. */
+trait Activity:
+  def usage(address: Address, since: java.time.Instant): IO[ProviderError, Option[ResourceUsage]]
+
+object Activity:
+  val none: Activity = (_, _) => zio.ZIO.none

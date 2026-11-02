@@ -222,6 +222,39 @@ object AgentSpec extends ZIOSpecDefault:
           again    <- w.slack.threadTexts(channel, request.ts)
         yield assertTrue(replies.size == 1, replies.head.contains("turns on versioning"), again.size == 1)
     ,
+    test("cleanup orphans an app the config no longer declares, but not an app from another repo"):
+      ZIO.scoped:
+        for
+          w       <- world
+          staging  = w.envs.head
+          old      = AppName("old-app")
+          other    = AppName("their-app")
+          both     = configJson(w.envs(0).env, w.envs(1).env).replace(
+                       "\"apps\":[", "\"apps\":[{\"name\":\"old-app\",\"manifest\":[\"cat\",\".iae/old.json\"]},")
+          _       <- w.repo.commit(Map(".iae/config.json" -> both, ".iae/old.json" -> Bucket.readWrite(Uploads).manifest(old).toOption.get.toJson), "add old-app")
+          _       <- w.pipeline.reconcile(w.envs, 0)
+          _       <- w.repo.commit(Map(".iae/config.json" -> configJson(w.envs(0).env, w.envs(1).env)), "drop old-app")
+          kept    <- w.pipeline.reconcile(w.envs, 0)
+          stays   <- staging.engine.commits(old, staging.env)
+          // Another repo's app in the same account: applied at a commit this repo doesn't have.
+          theirs  <- ZIO.fromEither(Bucket.readWrite(Uploads).manifest(other)).mapError(_.toString)
+          _       <- staging.engine.converge(theirs, staging.env, Some(CommitSha.from("f" * 40).toOption.get)).mapError(_.message)
+          found   <- staging.engine.apps(staging.env).mapError(_.message)
+          job      = CleanupJob(List(staging), List(app), w.pipeline.cleanup)
+          _       <- job.sweep
+          posted  <- w.slack.posted(channel)
+          orphans <- staging.engine.cleanup(old, staging.env, java.time.LocalDate.now().nn.plusDays(1).nn).mapError(_.message)
+          ignored <- w.pipeline.cleanup(staging, other).mapError(_.message)
+        yield assertTrue(
+          kept.isInstanceOf[Outcome.Converged],
+          stays.nonEmpty,
+          found == Set(app, old, other),
+          posted.exists(m => m.text.startsWith("Applied") && m.text.contains(s"old-app/${staging.env.value}") && m.text.contains("orphan  Bucket uploads")),
+          !posted.exists(_.text.contains("their-app")),
+          // Orphaned today, so a cutoff of tomorrow would delete it.
+          orphans.changes.map(_.change.productPrefix).toSet == Set("Delete"),
+          ignored.isEmpty,
+        ),
     test("the reconcile loops promote a push from staging to prod on their own"):
       ZIO.scoped:
         for

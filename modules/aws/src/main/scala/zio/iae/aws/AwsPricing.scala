@@ -52,7 +52,7 @@ final case class AwsPricing(book: PriceBook, cloudwatch: CloudWatchClient, elb: 
         yield Some(CostDelta(before.amount, after.amount, after.exact && before.exact, (before.assumptions ++ after.assumptions).distinct))
       case Change.Delete(address) =>
         previous(address).map(_.map(c => CostDelta(c.amount, 0, c.exact, c.assumptions)))
-      case Change.Orphan(_, _) | Change.Rollback(_, _, _) => ZIO.none
+      case Change.Orphan(_, _) | Change.Rollback(_, _, _) | Change.Prune(_, _) => ZIO.none
 
   /** The monthly cost of a resource as the spec declares it. */
   def monthly(address: Address, spec: ResourceSpec, existing: Boolean): IO[ProviderError, Cost] =

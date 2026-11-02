@@ -38,4 +38,6 @@ object PlanText:
         (s"  ~ update  $target [${planned.risk}]${costOf(planned)}" :: fields.toList.map(f => s"      ${f.field}: ${f.from} -> ${f.to}")).mkString("\n")
       case Change.Orphan(_, since) => s"  - orphan  $target [${planned.risk}] (tagged iae:orphaned=$since, not deleted)"
       case Change.Delete(_)        => s"  ! delete  $target [${planned.risk}]${costOf(planned)}"
+      case Change.Prune(_, versions) =>
+        s"  x prune   $target [${planned.risk}] (${versions.size} old version(s) nothing runs or rolls back to: ${versions.map(v => v.split('/').last).mkString(", ")})"
       case Change.Rollback(_, from, to) => s"  < rollback $target [${planned.risk}]\n      version: $from -> $to (marked failed, not redeployed)"

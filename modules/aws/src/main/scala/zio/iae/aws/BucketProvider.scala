@@ -40,6 +40,7 @@ final case class BucketProvider(s3: S3Client, naming: BucketNaming) extends Prov
         case Change.Delete(_) =>
           s3.deleteBucket(name).catchSome { case S3Error.NoSuchBucket(_) => ZIO.unit }.mapError(failed(address, "delete"))
         case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
+        case Change.Prune(address, _) => ZIO.fail(ProviderError(address, "prune", "only a service has versions to prune"))
     effect.tapError(e => ZIO.logWarning(e.message))
 
   /** Brings an existing bucket to the spec. Reads before writing so it can be re-run safely. */
@@ -77,6 +78,7 @@ object BucketProvider:
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))
     case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
+    case Change.Prune(_, _) => Assessment(Risk.Low, Set.empty)
 
   private[aws] def desiredTags(address: Address, spec: BucketSpec): Map[String, String] =
     ManagedTags.identity(address, SpecHash.of(ResourceSpec.Bucket(spec)))

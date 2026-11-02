@@ -64,7 +64,7 @@ object AwsEngine:
     val attribution = CloudTrailAttribution(planner.get[DeployClients].cloudtrail, naming, Some("iae-deployer"))
     val pricing = AwsPricing(PriceBook.usEast1, deploy.cloudwatch, deploy.elb, naming)
     Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution, pricing, IamAccess(planner.get[IamClient]),
-      ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, PriceBook.usEast1))
+      ComputeOptimizerRecommendations(deploy.optimizer, watch.provider, found, PriceBook.usEast1), AwsActivity(deploy.cloudwatch, deploy.elb, planner.get[SqsClient], planner.get[DynamoClient], naming))
 
   /** The clients for one account's config. */
   def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =

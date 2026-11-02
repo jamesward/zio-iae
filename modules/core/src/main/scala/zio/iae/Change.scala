@@ -21,6 +21,11 @@ enum Change[+S] derives CanEqual:
     */
   case Rollback(address: Address, from: String, to: String)
 
+  /** Old versions of a resource's deployment that nothing runs or rolls back to any more (a service's task
+    * definition revisions beyond the newest few): removed. The resource itself is untouched.
+    */
+  case Prune(address: Address, versions: List[String])
+
   def address: Address
 
   def map[T](f: S => T): Change[T] = this match
@@ -29,6 +34,7 @@ enum Change[+S] derives CanEqual:
     case Orphan(address, since)        => Orphan(address, since)
     case Delete(address)               => Delete(address)
     case Rollback(address, from, to)   => Rollback(address, from, to)
+    case Prune(address, versions)      => Prune(address, versions)
 
 object Change:
   given [S: Schema]: Schema[Change[S]] = Schema.derived

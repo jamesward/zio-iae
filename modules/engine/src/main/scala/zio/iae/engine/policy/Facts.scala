@@ -67,6 +67,7 @@ object ChangeFacts:
         case Change.Orphan(_, _)         => ("Orphan", Nil)
         case Change.Delete(_)            => ("Delete", Nil)
         case Change.Rollback(_, _, _)    => ("Rollback", Nil)
+        case Change.Prune(_, _)          => ("Prune", Nil)
       ChangeFacts(
         ChangeId(s"$index:${planned.address.show}"),
         plan.env,

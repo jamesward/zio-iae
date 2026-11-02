@@ -104,9 +104,13 @@ object AgentApp extends ZIOAppDefault:
         triage      <- ZIO.foreach(model)(Triage.make(_, prs))
         security    <- ZIO.foreach(model)(ReviewFindings.make(_, "review-security", prs))
         costReview  <- ZIO.foreach(model)(ReviewFindings.make(_, "review-cost", prs))
+        cleanReview <- ZIO.foreach(model)(ReviewFindings.make(_, "review-cleanup", prs))
+        pushing      = config.apps.filter(_.pushesImage).map(_.name)
+        pruner       = Option.when(pushing.nonEmpty)(ImagePruner(EcrClient(AwsJsonClient(http, base)), pushing, config.keepImages, slack, config.slack.channel))
+        idle         = IdleReport(slack, self, config.slack.channel, cleanReview)
         monitor     <- Monitor.make(envs, config.apps.map(_.name), slack, self, config.slack.channel, config.slack.owners, triage, rollbacks = Some(pipeline.rollback))
         _           <- ZIO.logInfo(s"agent started for $repo ($branch): envs ${config.envs.map(_.value).mkString(", ")}")
-        _           <- Agent(reconcilers, InboxConsumer(sqs, QueueUrl(inboxUrl), branch, reconcilers, talk), every.minutes, Some(monitor), Some(CleanupJob(envs, config.apps.map(_.name), pipeline.cleanup)),
+        _           <- Agent(reconcilers, InboxConsumer(sqs, QueueUrl(inboxUrl), branch, reconcilers, talk), every.minutes, Some(monitor), Some(CleanupJob(envs, config.apps.map(_.name), pipeline.cleanup, idle = Some(idle), images = pruner)),
                         Some(SecurityJob(envs, config.apps.map(_.name), slack, self, config.slack.channel, security)),
                         Some(CostJob(envs, config.apps.map(_.name), slack, self, config.slack.channel, costReview))).run
       yield ()

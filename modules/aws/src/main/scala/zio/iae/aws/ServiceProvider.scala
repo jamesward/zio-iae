@@ -98,6 +98,24 @@ final case class ServiceProvider(
     case Change.Delete(_)       => Assessment(Risk.High, Set.empty)
     // Back to a version that was live (and approved) before.
     case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
+    // Revisions nothing runs or rolls back to.
+    case Change.Prune(_, _) => Assessment(Risk.Low, Set.empty)
+
+  /** The family's task definition revisions beyond the newest `keep` that neither color's ECS service runs: the live
+    * one and the one a rollback goes back to are always kept, however old.
+    */
+  def pruneFrom(address: Address, keep: Int): IO[ProviderError, Option[Change[ServiceSpec]]] =
+    val family = ServiceNaming.family(address)
+    (for
+      all   <- ecs.taskDefinitions(family).map(_.filter(_.contains(s"task-definition/$family:")))
+      inUse <- ZIO.foreach(Color.values.toList)(c => ecs.service(ServiceNaming.cluster(address), ServiceNaming.ecsService(address, c))).map(_.flatten.map(_.taskDefinition).toSet)
+      old    = all.drop(keep).filterNot(inUse.contains)
+    yield Option.when(old.nonEmpty)(Change.Prune(address, old.sortBy(EcsClient.revision))))
+      .mapError(failed(address, "list task definitions"))
+
+  /** The images the service runs and would roll back to. */
+  def images(address: Address): IO[ProviderError, List[String]] =
+    observe(address).map(_.toList.flatMap(o => List(o.tags.get(ImageTag), o.tags.get(PreviousImageTag)).flatten.filter(_.nonEmpty)).distinct)
 
   /** The rollback the service can make: from the live version to the one it replaced, if a deploy recorded one. */
   def rollbackFrom(address: Address): IO[ProviderError, Option[Change[ServiceSpec]]] =
@@ -128,6 +146,12 @@ final case class ServiceProvider(
         existing(address).flatMap(current => elb.tag(current.loadBalancer.arn, ManagedTags.orphaned(current.tags, since, ctx)).mapError(failed(address, "tag as orphaned")))
       case Change.Delete(_) => ZIO.fail(ProviderError(address, "delete", "services are orphaned, not deleted"))
       case Change.Rollback(_, _, _) => existing(address).flatMap(rollback(address, _, ctx))
+      case Change.Prune(_, versions) =>
+        // Checked again here: a deploy since the plan may have put one of them back in use.
+        ZIO.foreach(Color.values.toList)(c => ecs.service(ServiceNaming.cluster(address), ServiceNaming.ecsService(address, c)))
+          .map(_.flatten.map(_.taskDefinition).toSet)
+          .flatMap(inUse => ZIO.foreachDiscard(versions.filterNot(inUse.contains))(ecs.deregisterTaskDefinition))
+          .mapError(failed(address, "deregister task definitions"))
 
   private def create(address: Address, spec: ServiceSpec, ctx: ApplyContext): IO[ProviderError, Unit] =
     val tags = ManagedTags.converged(Map.empty, address, SpecHash.of(ResourceSpec.Service(spec.copy(image = None))), ctx)
@@ -397,6 +421,13 @@ object ServiceWatch:
 final case class ServiceDriver(provider: ServiceProvider) extends ResourceDriver:
   val kind: ResourceKind = ResourceKind.Service
 
+  override def prune(address: Address, keep: Int): IO[ProviderError, Option[PlannedChange]] =
+    provider.pruneFrom(address, keep).map(_.map: change =>
+      val assessment = provider.assess(change, None)
+      PlannedChange(change.map(ResourceSpec.Service(_)), assessment.risk, assessment.flags))
+
+  override def artifacts(address: Address): IO[ProviderError, List[String]] = provider.images(address)
+
   override def rollback(address: Address): IO[ProviderError, Option[PlannedChange]] =
     provider.rollbackFrom(address).map(_.map: change =>
       val assessment = provider.assess(change, None)
@@ -418,6 +449,7 @@ final case class ServiceDriver(provider: ServiceProvider) extends ResourceDriver
       case Change.Orphan(address, since)                              => Right(Change.Orphan(address, since))
       case Change.Delete(address)                                     => Right(Change.Delete(address))
       case Change.Rollback(address, from, to)                         => Right(Change.Rollback(address, from, to))
+      case Change.Prune(address, versions)                            => Right(Change.Prune(address, versions))
       case other                                                      => Left(ProviderError(other.address, "apply", "expected a service change"))
     ZIO.fromEither(typed).flatMap(provider.applyChange(_, context))
 

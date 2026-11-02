@@ -4,7 +4,7 @@ import io.floci.testcontainers.FlociContainer
 import zio.*
 import zio.http.{Client, Request, URL}
 import zio.iae.aws.client.*
-import zio.iae.testkit.FlociLayer
+import zio.iae.testkit.{FlociLayer, FlociRegistry}
 import zio.test.*
 
 /** The pieces a canary deploy is built from, on Floci: an ECS service behind blue/green target groups, an ALB
@@ -80,4 +80,18 @@ object DeployClientsSpec extends ZIOSpecDefault:
         again  <- ecr.ensureRepository(s"photo-$suffix", Map.empty)
         image  <- ecr.hasImage(s"photo-$suffix", "abc")
       yield assertTrue(uri.endsWith(s"photo-$suffix"), again == uri, !image),
+    test("an ECR repository's images are listed with their tags and push times, and deleted by digest"):
+      for
+        aws    <- ZIO.service[AwsConfig]
+        http   <- ZIO.service[Client]
+        suffix <- Random.nextIntBounded(100000)
+        ecr     = EcrClient(AwsJsonClient(http, aws))
+        repo    = s"iae/prune-$suffix"
+        _      <- ecr.ensureRepository(repo, Map.empty)
+        _      <- FlociRegistry.push(aws, "000000000000", FlociLayer.image, repo, "c1")
+        listed <- ecr.images(repo)
+        _      <- ecr.deleteImages(repo, listed.map(_.digest))
+        after  <- ecr.images(repo)
+        none   <- ecr.images(s"iae/missing-$suffix")
+      yield assertTrue(listed.map(_.tags) == List(List("c1")), listed.forall(_.pushedAt.isDefined), listed.forall(_.digest.startsWith("sha256:")), after.isEmpty, none.isEmpty),
   ).provideShared(FlociLayer.container, FlociLayer.awsConfig, Client.default) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom @@ TestAspect.timeout(5.minutes)
