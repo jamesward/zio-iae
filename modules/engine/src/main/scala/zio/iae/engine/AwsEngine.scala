@@ -21,9 +21,9 @@ object AwsEngine:
     Drivers(
       List(
         BucketDriver(BucketProvider(s3, naming)),
-        QueueDriver(QueueProvider(sqs)),
+        QueueDriver(QueueProvider(sqs, Some(deploys.cloudwatch))),
         SecretDriver(SecretProvider(secrets)),
-        TableDriver(TableProvider(dynamo)),
+        TableDriver(TableProvider(dynamo, Some(deploys.cloudwatch))),
         TopicDriver(TopicProvider(sns, sqs, context)),
         RoleDriver(RoleProvider(iam, naming, context)),
         ServiceDriver(ServiceProvider(deploys.ecs, deploys.elb, deploys.cloudwatch, deploys.ec2.defaultNetwork.mapError(_.message).either, context)),

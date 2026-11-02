@@ -31,7 +31,8 @@ object AwsContext:
 
 final case class ObservedQueue(url: QueueUrl, attributes: Map[String, String], tags: Map[String, String], deadLetterExists: Boolean)
 
-final case class QueueProvider(sqs: SqsClient) extends Provider[QueueSpec, ObservedQueue]:
+/** `cloudwatch` writes the queue's default alarms (§ `DefaultAlarms`); without it there are none. */
+final case class QueueProvider(sqs: SqsClient, cloudwatch: Option[CloudWatchClient] = None) extends Provider[QueueSpec, ObservedQueue]:
   import QueueProvider.*
 
   val kind: ResourceKind = ResourceKind.Queue
@@ -86,6 +87,7 @@ final case class QueueProvider(sqs: SqsClient) extends Provider[QueueSpec, Obser
           dlq  <- named(address, QueueNaming.deadLetter)
           urls <- ZIO.foreach(List(name, dlq))(sqs.queueUrl).mapError(failed(address, "observe"))
           _    <- ZIO.foreachDiscard(urls.flatten)(sqs.deleteQueue).mapError(failed(address, "delete"))
+          _    <- ZIO.foreachDiscard(cloudwatch)(DefaultAlarms.remove(_, address)).mapError(failed(address, "alarms"))
         yield ()
       case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
 
@@ -105,6 +107,7 @@ final case class QueueProvider(sqs: SqsClient) extends Provider[QueueSpec, Obser
       desired  = ManagedTags.converged(tags, address, SpecHash.of(ResourceSpec.Queue(spec)), context)
       _       <- sqs.tag(url, desired).mapError(failed(address, "tag"))
       _       <- sqs.untag(url, tags.keySet -- desired.keySet).mapError(failed(address, "untag"))
+      _       <- ZIO.foreachDiscard(cloudwatch)(DefaultAlarms.put(_, address, ResourceSpec.Queue(spec))).mapError(failed(address, "alarms"))
     yield ()
 
   private def deadLetterQueue(address: Address): IO[ProviderError, String] =

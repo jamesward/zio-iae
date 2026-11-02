@@ -6,11 +6,11 @@ import zio.iae.*
 import zio.iae.engine.policy.SlackGroup
 
 /** An alarm that went off on a live service. */
-final case class Alert(env: EnvName, app: AppName, alarm: ServiceAlarm):
+final case class Alert(env: EnvName, app: AppName, alarm: WatchedAlarm):
   def where: String = s"${app.value}/${env.value}"
 
   def headline: String =
-    s"the ${alarm.address.id.value} service's ${alarm.gate} alarm (`${alarm.alarm}`) went off" +
+    s"the ${alarm.address.id.value} ${alarm.address.kind.toString.toLowerCase}'s ${alarm.gate} alarm (`${alarm.alarm}`) went off" +
       alarm.image.fold("")(i => s", running `$i`") + alarm.commit.fold("")(c => s" from `${c.short}`")
 
 /** Investigates an alert and says what it found. `rollback` asks for the alerting service to go back to its previous
@@ -71,6 +71,8 @@ final case class Monitor(
   /** A rollback asked for in an alert's thread; while it waits on approvers it is asked again on each sweep. */
   def rollback(alert: Alert, runtime: EnvRuntime, thread: String): IO[String, String] =
     val key = (alert.env, alert.app, alert.alarm.address.id)
+    ZIO.fail(s"only a service can be rolled back; this alert is about a ${alert.alarm.address.kind.toString.toLowerCase}")
+      .when(alert.alarm.address.kind != ResourceKind.Service) *>
     ZIO.fromOption(rollbacks).orElseFail("rollbacks aren't available").flatMap: ask =>
       ask(runtime, alert.app, alert.alarm.address.id).mapError(_.message).flatMap: outcome =>
         val waiting = outcome.exists { case _: Outcome.WaitingForApproval => true; case _ => false }

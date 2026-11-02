@@ -66,7 +66,7 @@ final case class Executor(drivers: Drivers, commits: CommitOrder):
 
 final case class Engine(planner: Planner, executor: Executor, watch: Watch = Watch.none):
   /** The alarms watching the app's live services in the env. */
-  def alarms(app: AppName, env: EnvName): IO[EngineError, List[ServiceAlarm]] = watch.alarms(app, env).mapError(EngineError.Provider(_))
+  def alarms(app: AppName, env: EnvName): IO[EngineError, List[WatchedAlarm]] = watch.alarms(app, env).mapError(EngineError.Provider(_))
 
   def plan(manifest: Manifest, env: EnvName, target: Option[CommitSha], phase: Phase): IO[EngineError, Plan] =
     planner.plan(manifest, env, target, phase)

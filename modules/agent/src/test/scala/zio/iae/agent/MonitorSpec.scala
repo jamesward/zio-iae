@@ -23,13 +23,13 @@ object MonitorSpec extends ZIOSpecDefault:
   val address = Address(app, env, ResourceKind.Service, LogicalId("web"))
 
   def alarm(firing: Boolean) =
-    ServiceAlarm(address, "iae-photo-app-prod-web-green-5xx", "5xx", firing, Some("web:v2"), None)
+    WatchedAlarm(address, "iae-photo-app-prod-web-green-5xx", "5xx", firing, Some("web:v2"), None)
 
   object AnyOrder extends CommitOrder:
     def isAncestor(ancestor: CommitSha, descendant: CommitSha): IO[EngineError, Boolean] = ZIO.succeed(true)
 
   /** An engine that manages nothing and watches whatever the ref says. */
-  def runtime(alarms: Ref[List[ServiceAlarm]], workspace: GitWorkspace): EnvRuntime =
+  def runtime(alarms: Ref[List[WatchedAlarm]], workspace: GitWorkspace): EnvRuntime =
     val watch: Watch    = (_, _) => alarms.get
     val none: Discovery = (_, _) => ZIO.succeed(Nil)
     EnvRuntime(env, Engine.make(Drivers(Nil), none, AnyOrder, watch), workspace)

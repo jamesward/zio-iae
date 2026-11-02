@@ -38,15 +38,16 @@ final case class Discovered(address: Address, commit: Option[CommitSha], orphane
 trait Discovery:
   def managed(app: AppName, env: EnvName): IO[ProviderError, List[Discovered]]
 
-/** One of a live service's alarms: the gates of the version that has the traffic, which keep watching it after its
-  * canary. `gate` names it as a rollback would ("5xx", "latency", or the app's own alarm).
+/** An alarm watching a deployed resource: a live service's gates (those of the version with the traffic, which keep
+  * watching it after its canary), or a resource's default alarms (a queue's age and dead letters, a table's
+  * throttles). `gate` names it as an alert or rollback would ("5xx", "latency", "age", or the app's own alarm).
   */
-final case class ServiceAlarm(address: Address, alarm: String, gate: String, firing: Boolean, image: Option[String], commit: Option[CommitSha])
+final case class WatchedAlarm(address: Address, alarm: String, gate: String, firing: Boolean, image: Option[String], commit: Option[CommitSha])
     derives CanEqual
 
 /** What watches the managed resources once they're deployed. */
 trait Watch:
-  def alarms(app: AppName, env: EnvName): IO[ProviderError, List[ServiceAlarm]]
+  def alarms(app: AppName, env: EnvName): IO[ProviderError, List[WatchedAlarm]]
 
 object Watch:
   val none: Watch = (_, _) => zio.ZIO.succeed(Nil)

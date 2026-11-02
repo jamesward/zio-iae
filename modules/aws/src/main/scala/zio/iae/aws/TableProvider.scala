@@ -13,7 +13,8 @@ object TableNaming:
 
 final case class ObservedTable(table: DynamoTable, tags: Map[String, String])
 
-final case class TableProvider(dynamo: DynamoClient) extends Provider[TableSpec, ObservedTable]:
+/** `cloudwatch` writes the table's default alarms (§ `DefaultAlarms`); without it there are none. */
+final case class TableProvider(dynamo: DynamoClient, cloudwatch: Option[CloudWatchClient] = None) extends Provider[TableSpec, ObservedTable]:
   val kind: ResourceKind = ResourceKind.Table
 
   def observe(address: Address): IO[ProviderError, Option[ObservedTable]] =
@@ -55,7 +56,9 @@ final case class TableProvider(dynamo: DynamoClient) extends Provider[TableSpec,
       case Change.Orphan(_, since) =>
         existing(address).flatMap: current =>
           dynamo.tag(current.table.arn, ManagedTags.orphaned(current.tags, since, context)).mapError(failed(address, "tag as orphaned"))
-      case Change.Delete(_) => dynamo.delete(name).mapError(failed(address, "delete"))
+      case Change.Delete(_) =>
+        dynamo.delete(name).mapError(failed(address, "delete")) *>
+          ZIO.foreachDiscard(cloudwatch)(DefaultAlarms.remove(_, address)).mapError(failed(address, "alarms"))
       case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
 
   private def converge(address: Address, spec: TableSpec, context: ApplyContext): IO[ProviderError, Unit] =
@@ -64,6 +67,7 @@ final case class TableProvider(dynamo: DynamoClient) extends Provider[TableSpec,
       desired  = ManagedTags.converged(current.tags, address, SpecHash.of(ResourceSpec.Table(spec)), context)
       _       <- dynamo.tag(current.table.arn, desired).mapError(failed(address, "tag"))
       _       <- dynamo.untag(current.table.arn, current.tags.keySet -- desired.keySet).mapError(failed(address, "untag"))
+      _       <- ZIO.foreachDiscard(cloudwatch)(DefaultAlarms.put(_, address, ResourceSpec.Table(spec))).mapError(failed(address, "alarms"))
     yield ()
 
   private def existing(address: Address): IO[ProviderError, ObservedTable] =

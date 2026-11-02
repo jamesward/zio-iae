@@ -325,13 +325,26 @@ object ServiceProvider:
     val resource = arn.split(':').lastOption.getOrElse(arn)
     if after.isEmpty then resource else resource.stripPrefix(after)
 
-/** The alarms of each managed service's live color, found through discovery. */
+/** The alarms watching an app's managed resources, found through discovery: each service's live color, and the
+  * queues' and tables' default alarms.
+  */
 final case class ServiceWatch(provider: ServiceProvider, discovery: Discovery) extends Watch:
-  def alarms(app: AppName, env: EnvName): IO[ProviderError, List[ServiceAlarm]] =
+  def alarms(app: AppName, env: EnvName): IO[ProviderError, List[WatchedAlarm]] =
     discovery.managed(app, env).flatMap: found =>
-      ZIO.foreach(found.filter(_.address.kind == ResourceKind.Service))(d => live(d.address, d.commit)).map(_.flatten)
+      ZIO.foreach(found)(d => d.address.kind match
+        case ResourceKind.Service                     => live(d.address, d.commit)
+        case ResourceKind.Queue | ResourceKind.Table  => defaults(d.address, d.commit)
+        case _                                        => ZIO.succeed(Nil)
+      ).map(_.flatten)
 
-  private def live(address: Address, commit: Option[CommitSha]): IO[ProviderError, List[ServiceAlarm]] =
+  private def defaults(address: Address, commit: Option[CommitSha]): IO[ProviderError, List[WatchedAlarm]] =
+    (for
+      names  <- provider.cloudwatch.alarmNames(DefaultAlarms.prefix(address)).map(_.filter(DefaultAlarms.known(address, _)))
+      states <- provider.cloudwatch.states(names)
+    yield names.sorted.map(n => WatchedAlarm(address, n, DefaultAlarms.gate(address, n), states.get(n).contains(AlarmState.Alarm), None, commit)))
+      .mapError(e => ProviderError(address, "watch", e.message))
+
+  private def live(address: Address, commit: Option[CommitSha]): IO[ProviderError, List[WatchedAlarm]] =
     provider.observe(address).flatMap:
       case None => ZIO.succeed(Nil)
       case Some(current) =>
@@ -343,7 +356,7 @@ final case class ServiceWatch(provider: ServiceProvider, discovery: Discovery) e
           val gate = name.stripPrefix(prefix) match
             case s if s.startsWith("app-") => s.stripPrefix("app-")
             case s                         => s
-          ServiceAlarm(address, name, gate, states.get(name).contains(AlarmState.Alarm), current.tags.get(ServiceProvider.ImageTag), commit)
+          WatchedAlarm(address, name, gate, states.get(name).contains(AlarmState.Alarm), current.tags.get(ServiceProvider.ImageTag), commit)
         ).mapError(e => ProviderError(address, "watch", e.message))
 
 final case class ServiceDriver(provider: ServiceProvider) extends ResourceDriver:
