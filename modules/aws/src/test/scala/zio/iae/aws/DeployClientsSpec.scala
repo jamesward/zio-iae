@@ -61,8 +61,12 @@ object DeployClientsSpec extends ZIOSpecDefault:
         name    = s"errors-$suffix"
         _      <- cw.putAlarm(MetricAlarm(name, "iae/test", "Errors", Map("Service" -> s"web-$suffix"), "Sum", 10, 1, 1, "GreaterThanOrEqualToThreshold"))
         before <- cw.states(List(name))
-        _      <- cw.putMetric("iae/test", "Errors", 5, Map("Service" -> s"web-$suffix"))
-        after  <- cw.states(List(name)).repeat(Schedule.spaced(1.second) && Schedule.recurUntil[Map[String, AlarmState]](_.get(name).contains(AlarmState.Alarm)) && Schedule.recurs(30)).map(_._2)
+        // Published on every check, as errors keep coming: a single point can fall out of the period before Floci
+        // gets to evaluate it when it's busy.
+        publish = cw.putMetric("iae/test", "Errors", 5, Map("Service" -> s"web-$suffix"))
+        after  <- (publish *> cw.states(List(name)))
+                    .repeat(Schedule.spaced(1.second) && Schedule.recurUntil[Map[String, AlarmState]](_.get(name).contains(AlarmState.Alarm)) && Schedule.recurs(90))
+                    .map(_._2)
         _      <- cw.setState(name, AlarmState.Ok, "test")
         reset  <- cw.states(List(name))
       yield assertTrue(!before.get(name).contains(AlarmState.Alarm), after.get(name).contains(AlarmState.Alarm), reset.get(name).contains(AlarmState.Ok)),
