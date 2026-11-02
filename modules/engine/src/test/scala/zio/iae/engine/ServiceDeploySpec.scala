@@ -41,7 +41,12 @@ object ServiceDeploySpec extends ZIOSpecDefault:
         _        <- FlociRegistry.push(aws, "000000000000", "hashicorp/http-echo:1.0", s"iae/svc-app-${env.value}", "c1")
         _        <- engine.converge(manifest(port, List("-text=from-ecr"), s"$uri:c1"), env, None)
         served   <- get(http, ipOf(floci), port).repeat(Schedule.spaced(1.second) && Schedule.recurUntil[(Int, String)](_._2 == "from-ecr") && Schedule.recurs(60)).map(_._2)
-      yield assertTrue(served == (200, "from-ecr")),
+        watched  <- engine.alarms(app, env)
+      yield assertTrue(
+        served == (200, "from-ecr"),
+        watched.exists(a => a.alarm.endsWith("-health") && !a.firing && a.gate == "health"),
+        watched.exists(_.gate == "5xx"),
+      ),
     test("a version whose own alarm goes off is rolled back, and the rollback names the alarm"):
       for
         floci    <- ZIO.service[FlociContainer]

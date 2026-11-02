@@ -349,15 +349,39 @@ final case class ServiceWatch(provider: ServiceProvider, discovery: Discovery) e
       case None => ZIO.succeed(Nil)
       case Some(current) =>
         val prefix = ServiceNaming.alarmPrefix(address, current.active)
+        val image = current.tags.get(ServiceProvider.ImageTag)
         (for
           names  <- provider.cloudwatch.alarmNames(prefix)
           states <- provider.cloudwatch.states(names)
+          health <- healthOf(address, current, prefix, image, commit)
         yield names.sorted.map: name =>
           val gate = name.stripPrefix(prefix) match
             case s if s.startsWith("app-") => s.stripPrefix("app-")
             case s                         => s
-          WatchedAlarm(address, name, gate, states.get(name).contains(AlarmState.Alarm), current.tags.get(ServiceProvider.ImageTag), commit)
-        ).mapError(e => ProviderError(address, "watch", e.message))
+          WatchedAlarm(address, name, gate, states.get(name).contains(AlarmState.Alarm), image, commit)
+        ++ health.toList).mapError(e => ProviderError(address, "watch", e.message))
+
+  /** The live version's health, as an alarm of its own (`<prefix>health`) so the monitor raises and resolves it like
+    * the others: it goes off with fewer tasks running than wanted, or with targets the load balancer finds unhealthy.
+    * None before the service runs a version.
+    */
+  private def healthOf(address: Address, current: ObservedService, prefix: String, image: Option[String], commit: Option[CommitSha])
+      : IO[AwsError, Option[WatchedAlarm]] =
+    provider.ecs.service(ServiceNaming.cluster(address), ServiceNaming.ecsService(address, current.active)).flatMap:
+      case None => ZIO.none
+      case Some(service) =>
+        ZIO.foreach(current.group(current.active))(g => provider.elb.health(g.arn)).map(_.getOrElse(Nil)).map: targets =>
+          val (firing, gate) = ServiceWatch.health(service.runningCount, service.desiredCount, targets.count(_.state == "unhealthy"))
+          Some(WatchedAlarm(address, s"${prefix}health", gate, firing, image, commit))
+
+object ServiceWatch:
+  /** Whether a live service is degraded, and how to say so. */
+  def health(running: Int, desired: Int, unhealthy: Int): (Boolean, String) =
+    val short = running < desired
+    if !short && unhealthy == 0 then (false, "health")
+    else
+      val parts = Option.when(short)(s"$running of $desired tasks running").toList ++ Option.when(unhealthy > 0)(s"$unhealthy unhealthy target(s)")
+      (true, s"health (${parts.mkString(", ")})")
 
 final case class ServiceDriver(provider: ServiceProvider) extends ResourceDriver:
   val kind: ResourceKind = ResourceKind.Service

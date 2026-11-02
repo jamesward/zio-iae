@@ -10,8 +10,11 @@ final case class Alert(env: EnvName, app: AppName, alarm: WatchedAlarm):
   def where: String = s"${app.value}/${env.value}"
 
   def headline: String =
-    s"the ${alarm.address.id.value} ${alarm.address.kind.toString.toLowerCase}'s ${alarm.gate} alarm (`${alarm.alarm}`) went off" +
-      alarm.image.fold("")(i => s", running `$i`") + alarm.commit.fold("")(c => s" from `${c.short}`")
+    val what =
+      if Monitor.isHealth(alarm.alarm) then
+        s"the ${alarm.address.id.value} service is degraded without an alarm: ${alarm.gate.stripPrefix("health (").stripSuffix(")")} (`${alarm.alarm}`)"
+      else s"the ${alarm.address.id.value} ${alarm.address.kind.toString.toLowerCase}'s ${alarm.gate} alarm (`${alarm.alarm}`) went off"
+    what + alarm.image.fold("")(i => s", running `$i`") + alarm.commit.fold("")(c => s" from `${c.short}`")
 
 /** Investigates an alert and says what it found. `rollback` asks for the alerting service to go back to its previous
   * version, through the policy, and says what became of it.
@@ -40,6 +43,7 @@ final case class Monitor(
     every: Duration = 1.minute,
     rollbacks: Option[Rollbacks] = None,
     pending: Ref[Map[(EnvName, AppName, LogicalId), String]],
+    suspects: Ref[Set[String]],
 ):
   import Monitor.*
 
@@ -91,10 +95,19 @@ final case class Monitor(
   private def observe(alert: Alert, runtime: EnvRuntime): IO[AgentError, Unit] =
     open.updateZIO: known =>
       known.fold(rehydrate)(ZIO.succeed(_)).flatMap: current =>
-        (current.get(alert.alarm.alarm), alert.alarm.firing) match
-          case (None, true)         => raise(alert, runtime).map(o => Some(current + (alert.alarm.alarm -> o)))
-          case (Some(o), false)     => resolve(o, "the alarm is quiet again") *> pending.update(_ - ((alert.env, alert.app, alert.alarm.address.id))).as(Some(current - alert.alarm.alarm))
-          case _                    => ZIO.succeed(Some(current))
+        val name = alert.alarm.alarm
+        // A health problem has to last two sweeps: task counts dip while ECS replaces a task.
+        val settled = if !Monitor.isHealth(name) then ZIO.succeed(true) else suspects.modify(s => (s(name), s + name))
+        (current.get(name), alert.alarm.firing) match
+          case (None, true) =>
+            settled.flatMap: raised =>
+              if raised then raise(alert, runtime).map(o => Some(current + (name -> o))) else ZIO.succeed(Some(current))
+          case (Some(o), false) =>
+            suspects.update(_ - name) *>
+              resolve(o, if Monitor.isHealth(name) then "healthy again" else "the alarm is quiet again") *>
+              pending.update(_ - ((alert.env, alert.app, alert.alarm.address.id))).as(Some(current - name))
+          case (None, false) => suspects.update(_ - name).as(Some(current))
+          case _             => ZIO.succeed(Some(current))
 
   private def raise(alert: Alert, runtime: EnvRuntime): IO[AgentError, Opened] =
     for
@@ -147,6 +160,9 @@ object Monitor:
 
   def alarmOf(text: String): Option[String] = alarmName.findFirstMatchIn(text).map(_.group(1).nn)
 
+  /** The watch's health check of a live service, rather than a CloudWatch alarm. */
+  def isHealth(alarm: String): Boolean = alarm.endsWith("-health")
+
   /** What became of a rollback, for the model and the thread. */
   def describe(outcome: Option[Outcome]): String = outcome match
     case None                                      => "there is no previous version to roll back to"
@@ -174,5 +190,6 @@ object Monitor:
     for
       open    <- Ref.Synchronized.make(Option.empty[Map[String, Opened]])
       work    <- Queue.unbounded[(Alert, EnvRuntime, String)]
-      pending <- Ref.make(Map.empty[(EnvName, AppName, LogicalId), String])
-    yield Monitor(envs, apps, slack, self, channel, owners, triage, open, work, every, rollbacks, pending)
+      pending  <- Ref.make(Map.empty[(EnvName, AppName, LogicalId), String])
+      suspects <- Ref.make(Set.empty[String])
+    yield Monitor(envs, apps, slack, self, channel, owners, triage, open, work, every, rollbacks, pending, suspects)

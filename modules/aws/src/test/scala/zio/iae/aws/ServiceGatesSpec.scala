@@ -11,6 +11,14 @@ object ServiceGatesSpec extends ZIOSpecDefault:
   val group   = TargetGroup("arn:aws:elasticloadbalancing:us-east-1:1:targetgroup/iae-x-g/def", "iae-x-g", 80)
 
   def spec = suite("Service gates")(
+    test("a live service is degraded with fewer tasks than wanted or unhealthy targets"):
+      assertTrue(
+        ServiceWatch.health(2, 2, 0) == (false, "health"),
+        ServiceWatch.health(1, 2, 0) == (true, "health (1 of 2 tasks running)"),
+        ServiceWatch.health(2, 2, 1) == (true, "health (1 unhealthy target(s))"),
+        ServiceWatch.health(0, 2, 2) == (true, "health (0 of 2 tasks running, 2 unhealthy target(s))"),
+      )
+    ,
     test("by default only the 5xx count gates, at the spec's threshold"):
       val gates = ServiceProvider.gates(address, Color.Green, lb, group, CanarySpec(maxErrors = 5))
       assertTrue(

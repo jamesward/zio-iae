@@ -115,6 +115,31 @@ object MonitorSpec extends ZIOSpecDefault:
           thread.last == "Rollback: handed to the executor (plan rollback-web), which checks it again and rolls back.",
           again == 2,
         ),
+    test("a degraded service is raised once it lasts two sweeps, and resolved when healthy again"):
+      ZIO.scoped:
+        for
+          repo    <- TestRepo.make
+          ws       = repo.workspace(env)
+          health   = (firing: Boolean) =>
+                       List(WatchedAlarm(address, "iae-photo-app-prod-web-green-health", if firing then "health (1 of 2 tasks running)" else "health", firing, Some("web:v2"), None))
+          alarms  <- Ref.make(health(true))
+          slack   <- InMemorySlack.make(Map("platform-owners" -> Set("U_BOB")))
+          monitor <- Monitor.make(List(runtime(alarms, ws)), List(app), slack, slack.self, channel, owners, None)
+          _       <- monitor.sweep.mapError(_.message)
+          once    <- slack.posted(channel)
+          _       <- monitor.sweep.mapError(_.message)
+          twice   <- slack.posted(channel)
+          _       <- alarms.set(health(false))
+          _       <- monitor.sweep.mapError(_.message)
+          after   <- slack.posted(channel)
+          thread  <- slack.threadTexts(channel, after.head.ts)
+        yield assertTrue(
+          once.isEmpty,
+          twice.size == 1,
+          twice.head.text.contains("the web service is degraded without an alarm: 1 of 2 tasks running"),
+          after.head.text.startsWith("*Resolved*"),
+          thread.last.startsWith("Cleared: healthy again"),
+        ),
     test("an alert whose version loses the traffic (a rollback) is resolved, saying so"):
       ZIO.scoped:
         for
