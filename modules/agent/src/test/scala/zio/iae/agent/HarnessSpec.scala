@@ -20,8 +20,9 @@ object HarnessSpec extends ZIOSpecDefault:
   val uniqueEnv: UIO[EnvName] =
     ZIO.collectAll(List.fill(6)(Random.nextIntBounded(26).map(i => ('a' + i).toChar))).map(cs => EnvName.from("h" + cs.mkString).toOption.get)
 
+  /** Generous: in the full run, a dozen harnesses build in one Floci's CodeBuild at once. */
   def until[A](what: String)(check: IO[Any, Option[A]]): IO[String, A] =
-    check.orElseSucceed(None).repeat(Schedule.spaced(500.millis) && Schedule.recurUntil[Option[A]](_.isDefined)).map(_._2).timeout(90.seconds).flatMap:
+    check.orElseSucceed(None).repeat(Schedule.spaced(500.millis) && Schedule.recurUntil[Option[A]](_.isDefined)).map(_._2).timeout(3.minutes).flatMap:
       case Some(Some(a)) => ZIO.succeed(a)
       case _             => ZIO.fail(s"timed out waiting for $what")
 
