@@ -417,6 +417,7 @@ real numbers. The Environments panel shows the canary stepping through its weigh
 | Issue | How it's simulated |
 |---|---|
 | Bad deploy | Push a commit (from a patch shipped with the example) that makes the app return 500s for some requests; the canary's alarm fires and the engine rolls back |
+| Faulty canary | Fault controls per env make the version in canary answer 5xx, answer slowly or report failing uploads (the app's own metric); its 5xx, latency or app alarm rolls it back (`slow-deploy`, `failing-metric`) |
 | Production incident | Turn up the example app's fault rate or latency through its test-only fault endpoint, so real metrics trip real alarms; or force an alarm with `SetAlarmState` |
 | Build or test failure | Push a commit with a failing test or a compile error; `DiagnoseFailure` runs |
 | Gated change | Push an infra change the sample policy gates (a deletion in prod, IAM widening); approve or reject it in the Slack panel as different users, including one who isn't allowed to |
@@ -926,7 +927,7 @@ The provider creates:
 - an ALB;
 - blue and green ip target groups;
 - a listener with weighted forwarding;
-- a `HTTPCode_Target_5XX_Count` alarm per color.
+- per color, the alarms that gate its canary (below), written as the color deploys.
 
 Applying an `Update` deploys:
 
@@ -961,7 +962,30 @@ side by side across envs. So a canary baking in staging doesn't hold up a prod a
 waiting in its lane is dropped, since the agent asks again on each reconcile until the change is in. Without an
 executor, the deploy holds only its own env's reconcile.
 
-Still to come: latency and app-declared alarms.
+**Canary gates.** A step rolls back when any of the new color's alarms goes off during its bake:
+
+- **Errors:** the load balancer's `HTTPCode_Target_5XX_Count` for the color reaches `maxErrors` (default 1) in a
+  period.
+- **Latency** (optional, `latency = LatencyGate(millis)`): the color's `TargetResponseTime` goes over `millis` for the
+  statistic, `p99` by default (any CloudWatch statistic; percentiles go as extended statistics).
+- **The app's own alarms** (`alarms = List(AppAlarm(name, metric, threshold))`): a metric the app publishes reaches
+  the threshold, or with `below`, falls to it. Each version is judged on its own numbers:
+  - the containers get `IAE_METRICS_NAMESPACE` (`iae/<app>`), `IAE_SERVICE` and `IAE_COLOR`;
+  - the app publishes with the `Service` and `Color` dimensions;
+  - declaring such alarms grants the runtime role `cloudwatch:PutMetricData`, with a condition that keeps it to
+    the app's namespace (PutMetricData has no resource to scope to).
+  - That grant widens the role, so the built-in floor asks for an approver when alarms are first declared, in
+    every env. The harness scenarios approve the web service's first version for that reason.
+
+A color's alarms are written as the color deploys, before its tasks start, and alarms the spec no longer has are
+removed. A change to the gates therefore takes effect with the next version. A rollback names the alarm: "rolled
+back …: its uploads alarm went off at 50%".
+
+In the harness, the traffic generator publishes each color's 5xx count and response time, as an ALB would. Fault
+controls make the version in canary answer 5xx, answer slowly or report failing uploads, per env. The `slow-deploy`
+and `failing-metric` scenarios use them. Floci doesn't evaluate percentile statistics, so the example's latency
+gate uses `Average`. Floci can also take more than one period to evaluate a rewritten alarm, so a bake that expects
+an alarm should last at least one and a half periods.
 
 ### 5.10 Background jobs
 
@@ -1168,7 +1192,7 @@ and the "iae" GitHub App installed.
 | M2 ✅ | Engine: plan, change facts, verdict combination + built-in floor, idempotent apply, commit guard, tag discovery; `MessageQueue`, `Secret`, `Table`, `Topic`; IAM generation; `iae` CLI | `assertConverges` end-to-end on Floci for the example app, including crash/re-run |
 | M3 (in progress) | Agent process: webhook + SQS inbox ✅, per-env reconcilers ✅, manifests built in CodeBuild ✅, Slack approval requests + verification, notices, reminders, expiry and superseding ✅, rehydrate on restart ✅, `EvaluatePolicy` with `POLICY.md` (zio-bedrock structured output, tested with `ScriptedModel`; risk table without a model) + policy examples ✅, policy from the deployed commit ✅; env accounts through assumed planner and deployer roles ✅; local harness ✅ (`AppTest`, `FakeSlack` + web UI, push panel, a Floci per account, builds in Floci's CodeBuild, real model when configured, clock control, scenarios run from the UI and headlessly in `ScenarioSpec`); staging account | In the harness: a push converges staging, a gated change waits for ✅ from the right user, and an agent restart loses no approval ✅. Then the same on a real staging account |
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
-| M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; harness traffic generator ✅ and the `bad-deploy` scenario ✅ (fault controls to follow) | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
+| M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 | Monitor + drift jobs; `Triage` task | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
 | M7 | Cleanup, cost optimizer and security auditor jobs | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
