@@ -62,7 +62,8 @@ object AwsEngine:
     )
     // The pipeline's own calls come from the deployer role bootstrap creates in each env account.
     val attribution = CloudTrailAttribution(planner.get[DeployClients].cloudtrail, naming, Some("iae-deployer"))
-    Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution)
+    val pricing = AwsPricing(PriceBook.usEast1, deploy.cloudwatch, deploy.elb, naming)
+    Engine(Planner(driversOf(planner), found), zio.iae.engine.Executor(driversOf(deployer), commits), watch, attribution, pricing)
 
   /** The clients for one account's config. */
   def clientsFor(config: AwsConfig): ZIO[Client & Scope, AwsError, ZEnvironment[Clients]] =

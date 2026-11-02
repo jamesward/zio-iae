@@ -56,6 +56,18 @@ final case class CloudWatchClient(query: AwsQueryClient):
       call("DescribeAlarms", names.zipWithIndex.map((n, i) => s"AlarmNames.member.${i + 1}" -> n)).map: e =>
         (e \\ "MetricAlarms" \ "member").toList.flatMap(m => AlarmState.from((m \ "StateValue").text.trim).map((m \ "AlarmName").text.trim -> _)).toMap
 
+  /** A metric's statistic per period between two times: e.g. daily sums over the last 30 days. */
+  def statistics(namespace: String, metric: String, dimensions: Map[String, String], statistic: String, start: java.time.Instant, end: java.time.Instant, periodSeconds: Int)
+      : IO[AwsError, List[Double]] =
+    val dims = dimensions.toList.sorted.zipWithIndex.flatMap((kv, i) => List(s"Dimensions.member.${i + 1}.Name" -> kv._1, s"Dimensions.member.${i + 1}.Value" -> kv._2))
+    call(
+      "GetMetricStatistics",
+      List(
+        "Namespace" -> namespace, "MetricName" -> metric, "StartTime" -> start.toString, "EndTime" -> end.toString,
+        "Period" -> periodSeconds.toString, "Statistics.member.1" -> statistic,
+      ) ++ dims,
+    ).map(e => (e \\ "Datapoints" \ "member").toList.flatMap(m => (m \ statistic).text.trim.toDoubleOption))
+
   def setState(name: String, state: AlarmState, reason: String): IO[AwsError, Unit] =
     call("SetAlarmState", List("AlarmName" -> name, "StateValue" -> state.value, "StateReason" -> reason)).unit
 

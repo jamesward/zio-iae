@@ -9,7 +9,15 @@ object PlanText:
     val header = s"${plan.phase} plan ${plan.hash.short} for ${plan.app.value}/${plan.env.value}" +
       plan.target.fold(" (no commit)")(c => s" at ${c.short}")
     if plan.isEmpty then s"$header: nothing to change"
-    else (header :: plan.changes.map(line)).mkString("\n")
+    else (header :: plan.changes.map(line) ++ plan.costDelta.map(d => s"  cost: ${money(d)} a month (projected)").toList).mkString("\n")
+
+  /** A monthly cost change, signed: `+$43.20`, `-$1.50`, `$0.00`. */
+  def money(delta: Double): String =
+    val cents = math.round(delta * 100)
+    if cents == 0 then "$0.00" else f"${if cents > 0 then "+" else "-"}$$${math.abs(cents) / 100d}%.2f"
+
+  private def costOf(planned: PlannedChange): String =
+    planned.cost.fold("")(c => s" ${money(c.delta)}/month" + (if c.exact then "" else " (est.)"))
 
   def render(decision: PlanDecision): String =
     val reasons = decision.changes.flatMap(c => c.reasons.map(r => s"  ${c.change.value}: $r"))
@@ -25,9 +33,9 @@ object PlanText:
   def line(planned: PlannedChange): String =
     val target = s"${planned.address.kind} ${planned.address.id.value}"
     planned.change match
-      case Change.Create(_, _) => s"  + create  $target [${planned.risk}]"
+      case Change.Create(_, _) => s"  + create  $target [${planned.risk}]${costOf(planned)}"
       case Change.Update(_, _, fields) =>
-        (s"  ~ update  $target [${planned.risk}]" :: fields.toList.map(f => s"      ${f.field}: ${f.from} -> ${f.to}")).mkString("\n")
+        (s"  ~ update  $target [${planned.risk}]${costOf(planned)}" :: fields.toList.map(f => s"      ${f.field}: ${f.from} -> ${f.to}")).mkString("\n")
       case Change.Orphan(_, since) => s"  - orphan  $target [${planned.risk}] (tagged iae:orphaned=$since, not deleted)"
-      case Change.Delete(_)        => s"  ! delete  $target [${planned.risk}]"
+      case Change.Delete(_)        => s"  ! delete  $target [${planned.risk}]${costOf(planned)}"
       case Change.Rollback(_, from, to) => s"  < rollback $target [${planned.risk}]\n      version: $from -> $to (marked failed, not redeployed)"

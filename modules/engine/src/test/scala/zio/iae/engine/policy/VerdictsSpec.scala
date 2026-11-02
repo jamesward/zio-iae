@@ -29,6 +29,17 @@ object VerdictsSpec extends ZIOSpecDefault:
   val ownersOnce = Decision.Approve(1, Set(owners))
 
   def spec = suite("Verdicts")(
+    test("a change adding more than its env's cost limit needs an owner, whatever the policy says"):
+      val limited = policy.copy(costLimits = Map(prod -> 100d))
+      val pricey  = fact("0", prod).copy(monthlyCost = Some(250))
+      val cheap   = fact("1", prod).copy(monthlyCost = Some(40))
+      val elsewhere = fact("2", staging).copy(monthlyCost = Some(250))
+      assertTrue(
+        Floor(pricey, limited) == (ownersOnce, List("it adds $250.00 a month, over prod's limit of $100.00")),
+        Floor(cheap, limited)._1 == Decision.Auto,
+        Floor(elsewhere, limited)._1 == Decision.Auto,
+      )
+    ,
     test("the strictest decision wins and approvals combine"):
       assertTrue(
         Decision.strictest(Decision.Auto, Decision.Deny) == Decision.Deny,

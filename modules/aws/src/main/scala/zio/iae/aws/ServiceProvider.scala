@@ -188,7 +188,11 @@ final case class ServiceProvider(
                  previous = (current.tags.get(ImageTag), current.tags.get(TagKey.Spec.wire)) match
                               case (Some(i), Some(h)) if canary => Map(PreviousImageTag -> i, PreviousSpecTag -> h)
                               case _                            => Map.empty
-                 _ <- elb.tag(current.loadBalancer.arn, ManagedTags.converged(current.tags, address, hash, ctx) ++ Map(ColorTag -> next.toString, ImageTag -> image) ++ previous)
+                 capacity = AwsPricing.Capacity(spec.cpu, spec.memory, spec.count, gates.size).encode
+                 _ <- elb.tag(
+                        current.loadBalancer.arn,
+                        ManagedTags.converged(current.tags, address, hash, ctx) ++ Map(ColorTag -> next.toString, ImageTag -> image, CapacityTag -> capacity) ++ previous,
+                      )
                yield ()
     yield ()).mapError:
       case AwsError.InvalidRequest(detail) => ProviderError(address, "deploy", detail) // a rollback or a precondition
@@ -307,6 +311,9 @@ object ServiceProvider:
       )
     errors :: latency.toList ++ own
 
+  /** How many alarms gate one color's canary under these settings. */
+  def gateCount(canary: CanarySpec): Int = 1 + canary.latency.size + canary.alarms.size
+
   /** Where the app's containers publish their own metrics, and as which version. */
   def metricsEnvironment(address: Address, color: Color): Map[String, String] =
     Map("IAE_METRICS_NAMESPACE" -> Service.metricsNamespace(address.app), "IAE_SERVICE" -> address.id.value, "IAE_COLOR" -> color.toString)
@@ -315,6 +322,8 @@ object ServiceProvider:
   val ImageTag  = "iae:image"
   val FailedTag = "iae:failed"
   /** The version the live one replaced, which a rollback returns to; empty once rolled back. */
+  /** What the live version runs (`cpu/memory/count/gates`), for its cost. */
+  val CapacityTag      = "iae:capacity"
   val PreviousImageTag = "iae:previous-image"
   val PreviousSpecTag  = "iae:previous-spec-hash"
 

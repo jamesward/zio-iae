@@ -54,6 +54,8 @@ final case class ChangeFacts(
     origin: Origin,
     author: Option[String],
     at: Instant,
+    /** The projected change in monthly cost, in USD, when the change has an estimate. */
+    monthlyCost: Option[Double] = None,
 ) derives Schema, CanEqual
 
 object ChangeFacts:
@@ -75,4 +77,5 @@ object ChangeFacts:
         if planned.flags.contains(ChangeFlag.Drift) && origin == Origin.Human then Origin.Drift else origin,
         author,
         at,
+        planned.cost.map(c => math.round(c.delta * 100) / 100d),
       )

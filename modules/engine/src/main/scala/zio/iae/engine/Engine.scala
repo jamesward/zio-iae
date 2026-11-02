@@ -64,7 +64,13 @@ final case class Executor(drivers: Drivers, commits: CommitOrder):
           commits.isAncestor(t, last).flatMap(newer => ZIO.fail(EngineError.Guarded(address, last, t)).when(newer))
         case _ => ZIO.unit
 
-final case class Engine(planner: Planner, executor: Executor, watch: Watch = Watch.none, attribution: Attribution = Attribution.none):
+final case class Engine(
+    planner: Planner,
+    executor: Executor,
+    watch: Watch = Watch.none,
+    attribution: Attribution = Attribution.none,
+    pricing: Pricing = Pricing.none,
+):
   /** Who changed a resource since a time, by its write calls other than the pipeline's. */
   def changedBy(address: Address, since: java.time.Instant): IO[EngineError, List[ChangedBy]] =
     attribution.changes(address, since).mapError(EngineError.Provider(_))
@@ -73,7 +79,16 @@ final case class Engine(planner: Planner, executor: Executor, watch: Watch = Wat
   def alarms(app: AppName, env: EnvName): IO[EngineError, List[WatchedAlarm]] = watch.alarms(app, env).mapError(EngineError.Provider(_))
 
   def plan(manifest: Manifest, env: EnvName, target: Option[CommitSha], phase: Phase): IO[EngineError, Plan] =
-    planner.plan(manifest, env, target, phase)
+    planner.plan(manifest, env, target, phase).flatMap(costed)
+
+  /** Each change with its projected monthly cost. An estimate that fails is left out, never fails the plan. */
+  private def costed(plan: Plan): UIO[Plan] =
+    ZIO
+      .foreach(plan.changes): c =>
+        pricing.estimate(c)
+          .catchAll(e => ZIO.logWarning(s"estimating the cost of ${c.address.show}: ${e.message}").as(None))
+          .map(cost => c.copy(cost = cost))
+      .map(changes => plan.copy(changes = changes))
 
   def apply(plan: Plan): IO[EngineError, ApplyReport] = executor.apply(plan)
 

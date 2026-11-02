@@ -52,5 +52,12 @@ enum ChangeFlag derives Schema, CanEqual:
 final case class Assessment(risk: Risk, flags: Set[ChangeFlag]) derives CanEqual
 
 /** A change to one resource of any kind, as the engine plans, shows and applies it. */
-final case class PlannedChange(change: Change[ResourceSpec], risk: Risk, flags: Set[ChangeFlag]) derives Schema, CanEqual:
+/** A change's projected monthly cost in USD, before and after it, and how it was worked out: `exact` when the spec
+  * fixes it (a service's tasks), otherwise estimated from usage, with the assumptions that went into it.
+  */
+final case class CostDelta(before: Double, after: Double, exact: Boolean, assumptions: List[String] = Nil) derives Schema, CanEqual:
+  def delta: Double = after - before
+
+final case class PlannedChange(change: Change[ResourceSpec], risk: Risk, flags: Set[ChangeFlag], cost: Option[CostDelta] = None)
+    derives Schema, CanEqual:
   def address: Address = change.address

@@ -41,9 +41,11 @@ final case class RepoConfig(
     slack: SlackSettings,
     identities: Map[String, String] = Map.empty,
     accounts: Map[String, EnvAccount] = Map.empty,
+    costLimits: Map[String, Double] = Map.empty,
 ) derives Schema:
   def policy(text: String): PolicyConfig =
-    PolicyConfig(text, slack.owners, (slack.owners :: slack.groups).toSet, production.toSet)
+    PolicyConfig(text, slack.owners, (slack.owners :: slack.groups).toSet, production.toSet,
+      costLimits.flatMap((env, limit) => EnvName.from(env).toOption.map(_ -> limit)))
 
 object RepoConfig:
   val path       = ".iae/config.json"

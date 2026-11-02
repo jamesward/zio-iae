@@ -52,6 +52,13 @@ trait Watch:
 object Watch:
   val none: Watch = (_, _) => zio.ZIO.succeed(Nil)
 
+/** What a planned change will cost: its monthly cost before and after. None when the kind has no cost model. */
+trait Pricing:
+  def estimate(change: PlannedChange): IO[ProviderError, Option[CostDelta]]
+
+object Pricing:
+  val none: Pricing = _ => zio.ZIO.none
+
 /** A change made to a resource, as the cloud's audit log recorded it: what, by whom, and when. */
 final case class ChangedBy(action: String, by: String, at: java.time.Instant) derives CanEqual
 

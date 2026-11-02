@@ -64,7 +64,7 @@ object Pipeline:
 
   /** The service a rollback plan rolls back. */
   def rolledBack(plan: Plan): Option[LogicalId] =
-    plan.changes.collectFirst { case PlannedChange(Change.Rollback(address, _, _), _, _) => address.id }
+    plan.changes.collectFirst { case PlannedChange(Change.Rollback(address, _, _), _, _, _) => address.id }
 
 final case class Pipeline(
     manifests: ManifestSource,

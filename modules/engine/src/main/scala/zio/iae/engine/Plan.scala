@@ -38,7 +38,12 @@ final case class Plan(
     phase: Phase,
     changes: List[PlannedChange],
 ) derives Schema, CanEqual:
-  def hash: ContentHash         = ContentHash.of(this)
+  /** What approvals and the executor match on. Costs are left out: usage-based ones drift between two plannings of the
+    * same changes.
+    */
+  def hash: ContentHash         = ContentHash.of(copy(changes = changes.map(_.copy(cost = None))))
+  /** The plan's projected monthly cost change, if any change has an estimate. */
+  def costDelta: Option[Double] = Option.when(changes.exists(_.cost.isDefined))(changes.flatMap(_.cost).map(_.delta).sum)
   def isEmpty: Boolean          = changes.isEmpty
   def maxRisk: Option[Risk]     = changes.map(_.risk).maxOption
   def toJson: String            = JsonCodec.jsonEncoder(Schema[Plan]).encodeJson(this, Some(0)).toString

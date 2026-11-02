@@ -27,7 +27,8 @@ final case class ChangeVerdict(change: ChangeId, decision: Decision, clauses: Li
 /** The policy's settings that code relies on: the owners group, the groups verdicts may name, and which envs are
   * production for the built-in floor.
   */
-final case class PolicyConfig(text: String, owners: SlackGroup, groups: Set[SlackGroup], production: Set[EnvName])
+/** `costLimits`: per env, the monthly cost a single change may add (USD) before it needs an owner. */
+final case class PolicyConfig(text: String, owners: SlackGroup, groups: Set[SlackGroup], production: Set[EnvName], costLimits: Map[EnvName, Double] = Map.empty)
 
 final case class ChangeDecision(change: ChangeId, decision: Decision, reasons: List[String]) derives Schema, CanEqual
 
@@ -70,6 +71,9 @@ object Floor:
       case Subject.AgentDeployment => (owners, List("changes to the agent's own deployment always need an owner"))
       case Subject.Resource(_, _, _) if fact.risk == Risk.Critical && policy.production.contains(fact.env) =>
         (owners, List("critical changes in production always need an owner"))
+      case Subject.Resource(_, _, _) if fact.monthlyCost.exists(added => policy.costLimits.get(fact.env).exists(added > _)) =>
+        val limit = policy.costLimits(fact.env)
+        (owners, List(f"it adds $$${fact.monthlyCost.get}%.2f a month, over ${fact.env.value}'s limit of $$$limit%.2f"))
       case Subject.Resource(_, _, _) => (Decision.Auto, Nil)
 
 /** A policy without an LLM: the default risk table from the spec. Used by the CLI and in tests. */
