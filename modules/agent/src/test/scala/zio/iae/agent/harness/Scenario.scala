@@ -242,12 +242,23 @@ object Scenario:
   private def withService(id: Service.Id & Singleton): Map[String, String] =
     Map(Harness.manifest -> (Bucket.readWrite(Harness.Uploads) ++ Service.run(id)).manifest(Harness.app).toOption.get.toJson)
 
+  /** v1 of the web service, everywhere. Its alarms let the app publish metrics, which widens its role, so an approver
+    * approves it in each env.
+    */
+  private val webGoesLive: List[Step] = List(
+    Step.Push("add the web service (v1)", "add the web service", _ => ZIO.succeed(withService(Web))),
+    approvalIn(0),
+    Step.React("U_ALICE", "white_check_mark"),
+    appliedIn(0, Some("U_ALICE")),
+    approvalIn(1),
+    Step.React("U_ALICE", "white_check_mark"),
+    appliedIn(1, Some("U_ALICE")),
+  )
+
   val badDeploy = Scenario(
     "bad-deploy",
     "A web service goes live everywhere; then a version that answers 500s is rolled back by its canary in staging and never reaches prod.",
-    List(
-      Step.Push("add the web service (v1)", "add the web service", _ => ZIO.succeed(withService(Web))),
-      appliedIn(1),
+    webGoesLive ++ List(
       Step.Push("deploy v2, which answers 500", "deploy v2", _ => ZIO.succeed(withService(WebBad))),
       Step.WaitFor("the canary in env 1 to roll back", (h, text) => text.contains("rolled back") && text.contains(s"${Harness.app.value}/${env(h, 0)}")),
     ),
@@ -257,9 +268,7 @@ object Scenario:
   private def faultyDeploy(name: String, fault: Fault, alarm: String) = Scenario(
     name,
     s"A web service goes live everywhere; then v2's canary in staging ${fault.describe}, and its $alarm alarm rolls it back.",
-    List(
-      Step.Push("add the web service (v1)", "add the web service", _ => ZIO.succeed(withService(Web))),
-      appliedIn(1),
+    webGoesLive ++ List(
       Step.InjectFault(0, fault, on = true),
       Step.Push("deploy v2", "deploy v2", _ => ZIO.succeed(withService(WebV2))),
       Step.WaitFor(
