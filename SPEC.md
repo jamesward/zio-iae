@@ -677,7 +677,7 @@ Approvers are the @infra-approvers Slack group. Owners are @platform-owners.
 `Deploy`, `Rollback`, `Cleanup`); risk; derived flags (`iamWidening`, `publicAccess`, `encryptionChange`,
 `dataLoss`); **origin** (`Human` for commits authored by people, `Agent` for commits the agent authored, `Alert`,
 `Drift`, `Cleanup`, `Cost` and `Security` for changes the background jobs propose, §5.10); the projected monthly cost
-change (§5.5.1, planned); author; current date and time. PR
+change (§5.5.1); author; current date and time. PR
 descriptions, commit messages, Slack text and logs are not included, so they can't argue for a weaker verdict.
 
 Risk classes, assigned by providers with these defaults (a provider can raise a specific change's risk):
@@ -723,7 +723,7 @@ the policy can gate on it.
   and never fails a plan.
 - **The plan hash leaves costs out,** since usage-based estimates drift between the agent's plan and the
   executor's.
-- **`AwsPricing`** prices from a bundled us-east-1 `PriceBook` of public list prices:
+- **`AwsPricing`** prices from a `PriceBook` of the env's region's on-demand prices (`LivePrices`):
   - a service: tasks (vCPU and GB × count × 730 h), the load balancer (hours plus an assumed one LCU) and its alarms
     on both colors. An update compares with the size the live version recorded (`iae:capacity` on the load
     balancer).
@@ -734,10 +734,16 @@ the policy can gate on it.
   - a new resource has no usage yet, which its assumptions say.
 - **Where it shows:** the plan text shows each change's cost (`+$43.20/month (est.)`) and the total ("cost: +$…
   a month (projected)"), so approval requests carry it. Facts carry `monthlyCost`.
+- **The prices:** `LivePrices` reads each unit of the book (Fargate vCPU and GB, ALB hours and LCUs, CloudWatch
+  alarms, S3 storage and Intelligent-Tiering, SQS, SNS, DynamoDB requests, Secrets Manager) from the Price List API
+  (`GetProducts` by region code and usage type), taking the first paid tier past any free one. It's read once a day;
+  a unit it can't read keeps the bundled us-east-1 price, and a failed read uses the bundled book for an hour.
+  `PriceListFake` in `iae-testkit`, as Floci has no Price List API.
 - **The limit:** `costLimits` per env in `.iae/config.json` puts a change that adds more than the limit to an owner,
-  whatever the policy text says.
-- **Not yet:** the Price List API (the bundled book is the fallback the spec calls for), the plan-level limit (it
-  is per change for now), and calibration against Cost Explorer.
+  whatever the policy text says, and also a plan whose changes together add more than it (the floor's plan-level
+  rule, checked by the executor too).
+- **Calibration:** the weekly bill (§5.10, cost optimizer) shows what the app cost in the last 30 days beside what
+  `Pricing.monthly` projects for its resources now, and says when they're more than 25% apart.
 
 **Verdict.** `EvaluatePolicy` uses zio-bedrock structured output (`.as[PolicyVerdict]`), one verdict per change:
 
@@ -840,7 +846,9 @@ The engine's checks, made with its own Slack token and never trusting the agent:
 
 - The request message was posted by the iae bot user and its footer carries the plan hash.
 - The recomputed plan is covered by the request: same target manifest hash, and its changes are a subset of the
-  requested changes. A subset is allowed so a crashed apply can finish without re-approval, since the changes
+  requested changes. A change is named by its kind, its address and a hash of its content, so a request for one
+  update of a resource doesn't cover a different update of it (a drift revert after a plan made while an apply was
+  half done, say). A subset is allowed so a crashed apply can finish without re-approval, since the changes
   already made drop out of the recomputed plan. Anything outside the set (drift, a newer commit) makes the request
   stale and a new one is posted.
 - `reactions.get` shows ✅ from at least `n` distinct users who are members of each required group
@@ -1125,8 +1133,28 @@ default, while old images and task definitions can be `Auto` if the user's polic
   the deployed config's retention.
 - **Harness:** the `cleanup` scenario orphans a bucket, moves the clock two weeks ahead, and the deletion applies
   after an approver approves it.
-- **Not yet:** the other candidates (resources of apps no repo declares, idle resources, old images and task
-  definitions) and `ReviewCleanup`'s grouping and context.
+- **Old task definitions:** the same plan prunes each live service's task definition revisions beyond the newest
+  `keepVersions` (default 5) that neither color's ECS service runs (`Change.Prune`, low risk: deregistered). The
+  apply checks again what's in use, in case a deploy put one back.
+- **Abandoned apps:** an app with managed resources in the env (`Discovery.apps`) that the branch head's config no
+  longer declares is cleaned up too, but only if its resources were applied from this repo (one of their
+  `iae:commit`s is on the branch). Another repo's apps in the same account are left alone. Its plan orphans what
+  isn't orphaned yet ("`old-app` isn't declared … any more"), which starts its retention; the deletions follow later,
+  through the policy again. The head's config decides, since the push that drops an app applies nothing to it, so the
+  deployed config may still name it.
+- **Old images:** images in the repositories iae keeps (`iae/<app>`, in the agent's account) are the builds' output,
+  not an env's infrastructure, so pruning them is the agent's own housekeeping (`ImagePruner`), with no plan or policy.
+  It deletes an image only when no env runs it or would roll back to it (`Engine.artifacts`), it isn't among the newest
+  `keepImages` (default 10), and it was pushed before the oldest image in use, so a build waiting to be deployed is
+  never touched. With nothing deployed it deletes nothing. What it deleted is posted.
+- **Context:** the cleanup request names each resource with how much it's used (`Activity`, from 30 days of
+  CloudWatch metrics: "no messages sent in 30 days", "1.2 GB in 40 objects").
+- **Idle resources:** resources nothing used in 30 days (no messages sent, no reads or writes, no requests) are
+  reported once per set, with `ReviewCleanup`'s review in the thread. A resource is only idle when it's older than
+  the window (its creation time from SQS, DynamoDB or the load balancer); topics (SNS doesn't say when one was made)
+  and buckets (request metrics are off by default) are never called idle. Removing one is a change to the `Infra`
+  declaration, which the review's pull request, if it opens one, makes.
+- **Not yet:** idle buckets and topics.
 
 **Cost optimizer.** Daily data collection, weekly report:
 
@@ -1153,7 +1181,19 @@ rule), with the expected savings in the description. It then goes through the no
 - **Task sizes:** a `ServiceSpec` whose CPU and memory aren't a Fargate task size is refused in the manifest. Floci,
   like AWS, rejects one at deploy.
 - **Testing:** `ComputeOptimizerFake` in `iae-testkit`, since Floci doesn't emulate Compute Optimizer.
-- **Not yet:** Cost Explorer totals by `iae:app`/`iae:env`, Cost Anomaly events, and storage-pattern findings.
+- **The bill:** once a week `CostJob` posts what the app cost in the env over the last 30 days (Cost Explorer's
+  `GetCostAndUsage` filtered by the `iae:app` and `iae:env` tags, by service), beside the projection (§5.5.1), and
+  says when they're more than 25% apart. The ISO week names the message, so a restart doesn't repeat it.
+- **Anomalies:** `GetAnomalies` (polled hourly rather than an EventBridge rule, which needs no extra wiring) posts each
+  anomaly in an env's account once: how much more than expected, on what, since when, and its root causes. Anomalies
+  are per account, not per app; envs sharing an account share them.
+- **Storage:** a bucket with 50 GB or more in S3 Standard and no Intelligent-Tiering is reported with the change
+  that fixes it (`BucketSpec(lifecycle = Some(Lifecycle(tieringAfterDays = Some(0))))`) and an estimated saving (half
+  its data at the infrequent tier, less the monitoring fee per object). `Lifecycle` is new in `BucketSpec`: tiering,
+  expiry and old-version expiry as iae-owned lifecycle rules (`iae-tiering`, `iae-expire`, `iae-noncurrent`). Changing
+  expiry touches data retention, so it's critical with `dataLoss`.
+- **Testing:** `CostExplorerFake` in `iae-testkit`; storage advice runs on Floci with the metrics S3 would publish.
+- **Not yet:** DynamoDB capacity-mode fit (`TableSpec` only has on-demand), and anomalies by app.
 
 **Security auditor.** Continuous, plus a weekly report. Sources, all scoped to `iae:managed` resources:
 
@@ -1180,8 +1220,24 @@ dependency and rebuild. The PRs go through the normal pipeline and policy (`orig
   `Bucket.readWrite`), which goes through the pipeline and policy.
 - **Testing:** Floci implements Access Advisor but records no usage, so with a zero-day window every permission of a
   new role is unused, which the test checks.
-- **Not yet:** Security Hub, GuardDuty and Inspector findings, Access Analyzer's external access, and the
-  engine's own configuration checks.
+- **Findings (every 15 minutes):** `Engine.securityFindings` (`AwsFindings`) gathers, for an app's resources in an env:
+  - the engine's own checks: a bucket without S3 Block Public Access fully on (high), a queue not encrypted at
+    rest (medium), a service whose load balancer serves plain HTTP (medium; `ServiceSpec` has no certificate yet);
+  - Security Hub's active findings on resources with the app's `iae:app` and `iae:env` tags;
+  - GuardDuty's findings (medium and up) that name one of the app's resources;
+  - Access Analyzer's findings on the app's resources shared outside the account (medium) or publicly (high).
+
+  A finding Security Hub already has from GuardDuty or Access Analyzer is kept once. A service not enabled in the
+  account is skipped, said in the log.
+- **Images:** `ImageScans` adds Inspector's high and critical vulnerabilities in the images an env runs or would roll
+  back to, from iae's ECR repositories in the agent's account.
+- **Reporting:** findings of medium severity and up are posted once per set ("*Security* `app/env`: 3 finding(s)"),
+  most severe first, with `ReviewSecurity`'s review in the thread. GuardDuty's high-severity findings are threats:
+  each is posted at once ("*Security threat* …"), mentioning the owners, and iae changes nothing for it.
+- **Testing:** `SecurityFake` in `iae-testkit` serves Security Hub, GuardDuty, Inspector and Access Analyzer; the
+  engine's own checks run on Floci. The services are REST-JSON, through `AwsRestJsonClient`.
+- **Not yet:** TLS on a service's load balancer (a certificate in `ServiceSpec`), logging checks, and Inspector's
+  findings on the tasks running in env accounts.
 
 ### 5.11 Credentials and trust boundary
 
@@ -1368,7 +1424,7 @@ and the "iae" GitHub App installed.
 | M4 (in progress) | zio-bedrock tasks: `ExplainPlan` ✅, `DiagnoseFailure` with fix PRs through a GitHub App ✅, `Converse` with read-only tools ✅; agent-authored PRs (fix PRs ✅; merging its own PRs when the policy allows to follow); `ScriptedModel` tests ✅; Audit Manager evidence (IAE-CM-1 and IAE-CM-3 per apply ✅); executor split (deterministic: plan, floor and approvals re-checked) ✅; prod account | A failing build produces a diagnosis and a fix PR; a prod change with approval produces evidence for IAE-CM-1..4 |
 | M5 (in progress) | `Service` + ALB canary + auto-rollback ✅; builds that push images to ECR ✅; per-env executor lanes ✅; latency and app-declared canary alarms ✅; harness traffic generator ✅, fault controls ✅ and the `bad-deploy`, `slow-deploy` and `failing-metric` scenarios ✅ | The "bad deploy" scenario rolls back automatically, in the harness and in staging |
 | M6 ✅ (locally) | Monitor ✅ (service gates, queue and table default alarms, health without an alarm) + drift reporting with CloudTrail attribution and policy-gated revert ✅; `Triage` task ✅ with policy-gated rollback through the executor ✅ | A synthetic alarm results in a rollback or a fix PR; a hand change is reported and reverted under policy |
-| M7 (in progress) | Cleanup job (orphans past retention) ✅; cost optimizer (Compute Optimizer right-sizing report + `ReviewCost`) ✅; security auditor (unused permissions + `ReviewSecurity`) ✅; cost projection on plans (§5.5.1) ✅ (bundled prices; Price List API to follow) | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
+| M7 ✅ (locally) | Cleanup job (orphans past retention, old task definitions, abandoned apps, old images, idle resources + `ReviewCleanup`) ✅; cost optimizer (right-sizing, storage, the bill beside projections, anomalies + `ReviewCost`) ✅; security auditor (unused permissions, own checks, Security Hub, GuardDuty, Inspector, Access Analyzer, threats escalated + `ReviewSecurity`) ✅; cost projection on plans with Price List prices and a plan-level limit (§5.5.1) ✅ | Orphans and old images are proposed for cleanup; a weekly cost report with at least one right-sizing PR; an unused permission becomes a PR narrowing the capability |
 
 ---
 
