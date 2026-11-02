@@ -96,6 +96,17 @@ final case class ServiceProvider(
     case Change.Update(_, _, _) => Assessment(Risk.Low, Set.empty) // a deploy, gated by its canary
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.High, Set.empty)
+    // Back to a version that was live (and approved) before.
+    case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
+
+  /** The rollback the service can make: from the live version to the one it replaced, if a deploy recorded one. */
+  def rollbackFrom(address: Address): IO[ProviderError, Option[Change[ServiceSpec]]] =
+    observe(address).map: observed =>
+      for
+        current  <- observed
+        previous <- current.tags.get(PreviousImageTag).filter(_.nonEmpty)
+        _        <- current.tags.get(PreviousSpecTag).filter(_.nonEmpty)
+      yield Change.Rollback(address, current.tags.getOrElse(ImageTag, "(unknown)"), previous)
 
   def applyChange(change: Change[ServiceSpec], ctx: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -116,6 +127,7 @@ final case class ServiceProvider(
       case Change.Orphan(_, since) =>
         existing(address).flatMap(current => elb.tag(current.loadBalancer.arn, ManagedTags.orphaned(current.tags, since, ctx)).mapError(failed(address, "tag as orphaned")))
       case Change.Delete(_) => ZIO.fail(ProviderError(address, "delete", "services are orphaned, not deleted"))
+      case Change.Rollback(_, _, _) => existing(address).flatMap(rollback(address, _, ctx))
 
   private def create(address: Address, spec: ServiceSpec, ctx: ApplyContext): IO[ProviderError, Unit] =
     val tags = ManagedTags.converged(Map.empty, address, SpecHash.of(ResourceSpec.Service(spec.copy(image = None))), ctx)
@@ -172,7 +184,11 @@ final case class ServiceProvider(
                for
                  old <- ecs.service(cluster, ServiceNaming.ecsService(address, live))
                  _   <- ecs.updateService(cluster, ServiceNaming.ecsService(address, live), None, Some(0)).when(canary && old.isDefined)
-                 _ <- elb.tag(current.loadBalancer.arn, ManagedTags.converged(current.tags, address, hash, ctx) ++ Map(ColorTag -> next.toString, ImageTag -> image))
+                 // What this version replaced, so an alert can roll back to it.
+                 previous = (current.tags.get(ImageTag), current.tags.get(TagKey.Spec.wire)) match
+                              case (Some(i), Some(h)) if canary => Map(PreviousImageTag -> i, PreviousSpecTag -> h)
+                              case _                            => Map.empty
+                 _ <- elb.tag(current.loadBalancer.arn, ManagedTags.converged(current.tags, address, hash, ctx) ++ Map(ColorTag -> next.toString, ImageTag -> image) ++ previous)
                yield ()
     yield ()).mapError:
       case AwsError.InvalidRequest(detail) => ProviderError(address, "deploy", detail) // a rollback or a precondition
@@ -203,6 +219,39 @@ final case class ServiceProvider(
       .timeoutFail(AwsError.InvalidRequest(s"$name didn't start $count task(s) within ${waitTimeout.render}"))(waitTimeout)
       .withClock(Clock.ClockLive)
       .unit
+
+  /** Puts the previous version back: its color (scaled to zero after the last canary, with its task definition) is
+    * started again and given all the traffic, the live one is stopped, and the live spec is marked failed so the
+    * reconcile doesn't deploy it again ("push a fix"). The previous version then counts as deployed.
+    */
+  private def rollback(address: Address, current: ObservedService, ctx: ApplyContext): IO[ProviderError, Unit] =
+    val live = current.active
+    val back = live.other
+    (for
+      image     <- ZIO.fromOption(current.tags.get(PreviousImageTag).filter(_.nonEmpty)).orElseFail(AwsError.InvalidRequest("there is no previous version to roll back to"))
+      spec      <- ZIO.fromOption(current.tags.get(PreviousSpecTag).flatMap(SpecHash.from)).orElseFail(AwsError.InvalidRequest("the previous version's spec isn't recorded"))
+      backGroup <- ZIO.fromOption(current.group(back)).orElseFail(AwsError.InvalidRequest(s"no $back target group"))
+      liveGroup <- ZIO.fromOption(current.group(live)).orElseFail(AwsError.InvalidRequest(s"no $live target group"))
+      cluster    = ServiceNaming.cluster(address)
+      liveName   = ServiceNaming.ecsService(address, live)
+      backName   = ServiceNaming.ecsService(address, back)
+      count     <- ecs.service(cluster, liveName).map(_.map(_.desiredCount).filter(_ > 0).getOrElse(1))
+      _         <- ecs.service(cluster, backName).someOrFail(AwsError.InvalidRequest(s"the previous version's service $backName is gone"))
+      _         <- ecs.updateService(cluster, backName, None, Some(count))
+      _         <- running(cluster, backName, backGroup, count)
+      listener  <- elb.listeners(current.loadBalancer.arn).flatMap(ls => ZIO.fromOption(ls.headOption).orElseFail(AwsError.InvalidRequest("no listener")))
+      _         <- elb.setWeights(listener.arn, Map(backGroup.arn -> 100, liveGroup.arn -> 0))
+      _         <- ecs.updateService(cluster, liveName, None, Some(0))
+      failed     = current.tags.getOrElse(TagKey.Spec.wire, "")
+      _ <- elb.tag(
+             current.loadBalancer.arn,
+             ManagedTags.converged(current.tags, address, spec, ctx) ++
+               Map(ColorTag -> back.toString, ImageTag -> image, FailedTag -> failed, PreviousImageTag -> "", PreviousSpecTag -> ""),
+           )
+      _ <- ZIO.logWarning(s"${address.show}: rolled back to $image")
+    yield ()).mapError:
+      case AwsError.InvalidRequest(detail) => ProviderError(address, "rollback", detail)
+      case other                           => ProviderError(address, "rollback", other.message)
 
   /** Writes the color's gates as the spec has them, removes the ones it no longer has, and starts them all quiet. */
   private def armed(address: Address, color: Color, gates: List[Gate], image: String): IO[AwsError, Unit] =
@@ -265,6 +314,9 @@ object ServiceProvider:
   val ColorTag  = "iae:color"
   val ImageTag  = "iae:image"
   val FailedTag = "iae:failed"
+  /** The version the live one replaced, which a rollback returns to; empty once rolled back. */
+  val PreviousImageTag = "iae:previous-image"
+  val PreviousSpecTag  = "iae:previous-spec-hash"
 
   /** CloudWatch's dimension values: the part of the ARN after `loadbalancer/` for a load balancer, and after the
     * account for a target group (`targetgroup/name/id`).
@@ -297,6 +349,11 @@ final case class ServiceWatch(provider: ServiceProvider, discovery: Discovery) e
 final case class ServiceDriver(provider: ServiceProvider) extends ResourceDriver:
   val kind: ResourceKind = ResourceKind.Service
 
+  override def rollback(address: Address): IO[ProviderError, Option[PlannedChange]] =
+    provider.rollbackFrom(address).map(_.map: change =>
+      val assessment = provider.assess(change, None)
+      PlannedChange(change.map(ResourceSpec.Service(_)), assessment.risk, assessment.flags))
+
   def plan(address: Address, desired: ResourceSpec): IO[ProviderError, Option[PlannedChange]] =
     desired match
       case ResourceSpec.Service(spec) =>
@@ -312,6 +369,7 @@ final case class ServiceDriver(provider: ServiceProvider) extends ResourceDriver
       case Change.Update(address, ResourceSpec.Service(spec), fields) => Right(Change.Update(address, spec, fields))
       case Change.Orphan(address, since)                              => Right(Change.Orphan(address, since))
       case Change.Delete(address)                                     => Right(Change.Delete(address))
+      case Change.Rollback(address, from, to)                         => Right(Change.Rollback(address, from, to))
       case other                                                      => Left(ProviderError(other.address, "apply", "expected a service change"))
     ZIO.fromEither(typed).flatMap(provider.applyChange(_, context))
 

@@ -46,6 +46,7 @@ final case class RoleProvider(iam: IamClient, buckets: BucketNaming, context: Aw
       if widening then Assessment(Risk.High, Set(ChangeFlag.IamWidening)) else Assessment(Risk.Medium, Set.empty)
     case Change.Orphan(_, _) => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)    => Assessment(Risk.High, Set.empty)
+    case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
 
   def applyChange(change: Change[RoleSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -65,6 +66,7 @@ final case class RoleProvider(iam: IamClient, buckets: BucketNaming, context: Aw
           iam.roleTags(name).flatMap(tags => iam.tagRole(name, ManagedTags.orphaned(tags, since, context))).mapError(failed(address, "tag as orphaned"))
         case Change.Delete(_) =>
           (iam.deleteInlinePolicy(name, policyName) *> iam.deleteRole(name)).mapError(failed(address, "delete"))
+        case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
 
   private def converge(address: Address, name: RoleName, spec: RoleSpec, context: ApplyContext): IO[ProviderError, Unit] =
     for

@@ -64,6 +64,7 @@ object ChangeFacts:
         case Change.Update(_, _, fields) => ("Update", fields.toList.map(_.field))
         case Change.Orphan(_, _)         => ("Orphan", Nil)
         case Change.Delete(_)            => ("Delete", Nil)
+        case Change.Rollback(_, _, _)    => ("Rollback", Nil)
       ChangeFacts(
         ChangeId(s"$index:${planned.address.show}"),
         plan.env,

@@ -14,6 +14,14 @@ final case class Planner(drivers: Drivers, discovery: Discovery):
       case Phase.Contract => contract(manifest, env)
     changes.map(Plan(manifest.app, env, target, ContentHash.of(manifest), phase, _))
 
+  /** Back to the version a resource ran before: a plan with that one change, or none if there's nothing to go back
+    * to. It isn't for a commit: the resources keep the commit they record.
+    */
+  def rollback(address: Address): IO[EngineError, Plan] =
+    drivers(address.kind)
+      .flatMap(_.rollback(address).mapError(EngineError.Provider(_)))
+      .map(change => Plan(address.app, address.env, None, ContentHash.of(s"rollback ${address.show}"), Phase.Expand, change.toList))
+
   private def expand(manifest: Manifest, env: EnvName): IO[EngineError, List[PlannedChange]] =
     ZIO
       .foreach(manifest.resources.sortBy(_.kind.ordinal)): decl =>
@@ -64,6 +72,9 @@ final case class Engine(planner: Planner, executor: Executor, watch: Watch = Wat
     planner.plan(manifest, env, target, phase)
 
   def apply(plan: Plan): IO[EngineError, ApplyReport] = executor.apply(plan)
+
+  /** The plan that puts a resource back to the version it ran before; empty if there's none. */
+  def rollback(address: Address): IO[EngineError, Plan] = planner.rollback(address)
 
   /** The newest commit any of the apps' managed resources in the env were changed by (their `iae:commit` tags), or
     * None before the first apply. Commits on diverged branches can't be ordered and fail.

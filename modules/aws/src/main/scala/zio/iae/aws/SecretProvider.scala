@@ -32,6 +32,7 @@ final case class SecretProvider(secrets: SecretsClient) extends Provider[SecretS
     case Change.Update(_, _, _) => Assessment(Risk.Low, Set.empty)
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))
+    case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
 
   def applyChange(change: Change[SecretSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -49,6 +50,7 @@ final case class SecretProvider(secrets: SecretsClient) extends Provider[SecretS
           _       <- secrets.tag(name, ManagedTags.orphaned(current.tags, since, context)).mapError(failed(address, "tag as orphaned"))
         yield ()
       case Change.Delete(_) => secrets.delete(name).mapError(failed(address, "delete"))
+      case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
 
   private def converge(address: Address, spec: SecretSpec, context: ApplyContext): IO[ProviderError, Unit] =
     val name = SecretNaming.physical(address)

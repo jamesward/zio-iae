@@ -16,6 +16,11 @@ enum Change[+S] derives CanEqual:
   case Orphan(address: Address, since: LocalDate)
   case Delete(address: Address)
 
+  /** Back to the version that was live before (`to`), away from the live one (`from`), which is marked failed so it
+    * isn't deployed again. Not planned from a manifest: asked for when an alert points at the live version.
+    */
+  case Rollback(address: Address, from: String, to: String)
+
   def address: Address
 
   def map[T](f: S => T): Change[T] = this match
@@ -23,6 +28,7 @@ enum Change[+S] derives CanEqual:
     case Update(address, spec, fields) => Update(address, f(spec), fields)
     case Orphan(address, since)        => Orphan(address, since)
     case Delete(address)               => Delete(address)
+    case Rollback(address, from, to)   => Rollback(address, from, to)
 
 object Change:
   given [S: Schema]: Schema[Change[S]] = Schema.derived

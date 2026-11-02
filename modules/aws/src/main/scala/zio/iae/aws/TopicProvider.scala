@@ -39,6 +39,7 @@ final case class TopicProvider(sns: SnsClient, sqs: SqsClient, context: AwsConte
     case Change.Update(_, _, _) => Assessment(Risk.Medium, Set.empty)
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.High, Set.empty)
+    case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
 
   def applyChange(change: Change[TopicSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -51,6 +52,7 @@ final case class TopicProvider(sns: SnsClient, sqs: SqsClient, context: AwsConte
         val arn = TopicNaming.arn(this.context, address)
         sns.tags(arn).flatMap(tags => sns.tag(arn, ManagedTags.orphaned(tags, since, context))).mapError(failed(address, "tag as orphaned"))
       case Change.Delete(_) => sns.deleteTopic(TopicNaming.arn(this.context, address)).mapError(failed(address, "delete"))
+      case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
 
   private def converge(address: Address, spec: TopicSpec, applying: ApplyContext): IO[ProviderError, Unit] =
     val arn = TopicNaming.arn(context, address)

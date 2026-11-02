@@ -67,6 +67,7 @@ final case class QueueProvider(sqs: SqsClient) extends Provider[QueueSpec, Obser
     case Change.Update(_, _, _) => Assessment(Risk.Medium, Set.empty)
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))
+    case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
 
   def applyChange(change: Change[QueueSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -86,6 +87,7 @@ final case class QueueProvider(sqs: SqsClient) extends Provider[QueueSpec, Obser
           urls <- ZIO.foreach(List(name, dlq))(sqs.queueUrl).mapError(failed(address, "observe"))
           _    <- ZIO.foreachDiscard(urls.flatten)(sqs.deleteQueue).mapError(failed(address, "delete"))
         yield ()
+      case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
 
   /** Creates or updates the dead-letter queue first, so the main queue's redrive policy can point at it. */
   private def converge(address: Address, spec: QueueSpec, context: ApplyContext): IO[ProviderError, Unit] =

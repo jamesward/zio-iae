@@ -67,6 +67,35 @@ object ServiceDeploySpec extends ZIOSpecDefault:
         names.toSet == Set(s"iae-svc-app-${env.value}-web-green-5xx", s"iae-svc-app-${env.value}-web-green-app-uploads",
           s"iae-svc-app-${env.value}-web-blue-5xx", s"iae-svc-app-${env.value}-web-blue-app-uploads"),
       ),
+    test("a rollback puts the previous version back, marks the live one failed, and can't be repeated"):
+      for
+        floci    <- ZIO.service[FlociContainer]
+        http     <- ZIO.service[Client]
+        clients  <- ZIO.environment[AwsEngine.Clients]
+        engine    = AwsEngine.make(BucketNaming(None), clients, clients, AnyOrder)
+        env      <- EngineSpec.uniqueEnv
+        port     <- Random.nextIntBounded(1000).map(16000 + _)
+        address   = Address(app, env, ResourceKind.Service, LogicalId("web"))
+        serving   = (text: String) => get(http, ipOf(floci), port).repeat(Schedule.spaced(1.second) && Schedule.recurUntil[(Int, String)](_._2 == text) && Schedule.recurs(60)).map(_._2)
+        _        <- engine.converge(manifest(port, List("-text=v1")), env, None)
+        none     <- engine.rollback(address)
+        _        <- serving("v1")
+        v2        = manifest(port, List("-text=v2"))
+        _        <- engine.converge(v2, env, None)
+        _        <- serving("v2")
+        plan     <- engine.rollback(address)
+        _        <- engine.apply(plan)
+        back     <- serving("v1")
+        again    <- engine.converge(v2, env, None).either
+        after    <- engine.rollback(address)
+      yield assertTrue(
+        none.isEmpty,
+        plan.changes.map(_.change.productPrefix) == List("Rollback"),
+        PlanText.render(plan).contains("rollback Service web"),
+        back == (200, "v1"),
+        again.left.exists(_.message.contains("push a fix")),
+        after.isEmpty,
+      ),
     test("a service is created and live, deployed again by canary, and a bad version is rolled back and not retried"):
       for
         floci    <- ZIO.service[FlociContainer]

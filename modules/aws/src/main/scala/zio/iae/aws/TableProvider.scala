@@ -36,6 +36,7 @@ final case class TableProvider(dynamo: DynamoClient) extends Provider[TableSpec,
     case Change.Update(_, _, _) => Assessment(Risk.Medium, Set.empty)
     case Change.Orphan(_, _)    => Assessment(Risk.Low, Set.empty)
     case Change.Delete(_)       => Assessment(Risk.Critical, Set(ChangeFlag.DataLoss))
+    case Change.Rollback(_, _, _) => Assessment(Risk.Low, Set.empty)
 
   def applyChange(change: Change[TableSpec], context: ApplyContext): IO[ProviderError, Unit] =
     val address = change.address
@@ -55,6 +56,7 @@ final case class TableProvider(dynamo: DynamoClient) extends Provider[TableSpec,
         existing(address).flatMap: current =>
           dynamo.tag(current.table.arn, ManagedTags.orphaned(current.tags, since, context)).mapError(failed(address, "tag as orphaned"))
       case Change.Delete(_) => dynamo.delete(name).mapError(failed(address, "delete"))
+      case Change.Rollback(address, _, _) => ZIO.fail(ProviderError(address, "rollback", "only a service can be rolled back"))
 
   private def converge(address: Address, spec: TableSpec, context: ApplyContext): IO[ProviderError, Unit] =
     for

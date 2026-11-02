@@ -29,6 +29,9 @@ trait ResourceDriver:
   /** The commit that last changed the resource, if it exists and records one. */
   def lastCommit(address: Address): IO[ProviderError, Option[CommitSha]]
 
+  /** Back to the version that was live before, if the kind can do that and has one. */
+  def rollback(address: Address): IO[ProviderError, Option[PlannedChange]] = zio.ZIO.none
+
 /** A managed resource found in the cloud by its tags. */
 final case class Discovered(address: Address, commit: Option[CommitSha], orphanedSince: Option[LocalDate]) derives CanEqual
 
